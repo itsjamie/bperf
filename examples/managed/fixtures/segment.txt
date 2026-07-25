@@ -1,0 +1,8 @@
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+The quick brown fox jumps over the lazy dog. Browser benchmark fixture.
+Streaming input stays benchmark-owned while the parser consumes a real URL.
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+The quick brown fox jumps over the lazy dog. Browser benchmark fixture.
+Streaming input stays benchmark-owned while the parser consumes a real URL.

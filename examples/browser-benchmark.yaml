@@ -1,0 +1,63 @@
+schema_version: 1
+
+benchmark:
+  id: browser-operation-benchmark
+  subject: browser-operation-adapter
+
+workloads:
+  - id: checkout-flow
+    trace_file: fixtures/checkout-flow/actions.jsonl
+    verifier:
+      command:
+        - node
+        - fixtures/checkout-flow/verify.mjs
+      timeout_seconds: 30
+      identity_files:
+        - fixtures/checkout-flow/verify.mjs
+
+browser:
+  engines:
+    - chromium
+    - firefox
+    - webkit
+  mode: headless
+  viewport:
+    width: 1440
+    height: 900
+  locale: en-US
+  timezone: UTC
+  color_scheme: light
+  cache: cold
+  network:
+    policy: local-only
+  fresh_profile_per_trial: true
+
+captures:
+  cpu_profile: true
+  js_heap: true
+
+trials:
+  mode: auto
+  randomize_order: true
+  schedule_seed: 730241
+  warmup_samples: 3
+  pilot_samples: 10
+  min_final_samples: 20
+  max_final_samples: 100
+
+statistics:
+  confidence: 0.95
+  bootstrap_samples: 10000
+  primary_metrics:
+    - workload.wall_ms
+    - browser.cpu_profile.active_ms
+    - browser.js_heap.live_bytes
+  minimum_effect_pct:
+    workload.wall_ms: 5.0
+    browser.cpu_profile.active_ms: 5.0
+    browser.js_heap.live_bytes: 5.0
+  correctness:
+    minimum_success_rate: 0.95
+    max_regression_percentage_points: 1.0
+  cross_engine_policy: strict_all
+  protected_metric_max_regression_pct: 3.0

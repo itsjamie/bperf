@@ -1,0 +1,16 @@
+schema_version: 1
+id: browser-operation-smoke-candidate
+subject: browser-operation-adapter
+
+implementation:
+  files:
+    - ../../examples/benchmarks/variants/candidate.mjs
+    - ../../examples/benchmarks/variants/server.mjs
+
+adapter:
+  command:
+    - node
+    - ../../examples/benchmarks/variants/candidate.mjs
+  ready:
+    protocol: stdio-json
+    timeout_seconds: 15

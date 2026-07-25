@@ -1,0 +1,1 @@
+{"samples":{"stackTraces":[{"timestamp":0.001,"stackFrames":[{"name":"parse","url":"http://127.0.0.1:4317/fixture.js","line":4,"column":1},{"name":"root","url":"","line":0,"column":0}]},{"timestamp":0.003,"stackFrames":[{"name":"parse","url":"http://127.0.0.1:4317/fixture.js","line":4,"column":1},{"name":"root","url":"","line":0,"column":0}]}]}}

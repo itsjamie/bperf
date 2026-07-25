@@ -1,0 +1,16 @@
+schema_version: 1
+id: browser-operation-main
+subject: browser-operation-adapter
+
+implementation:
+  files:
+    - benchmarks/variants/baseline.mjs
+    - benchmarks/variants/server.mjs
+
+adapter:
+  command:
+    - node
+    - benchmarks/variants/baseline.mjs
+  ready:
+    protocol: stdio-json
+    timeout_seconds: 15

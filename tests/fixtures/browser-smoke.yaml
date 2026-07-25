@@ -1,0 +1,63 @@
+schema_version: 1
+
+benchmark:
+  id: browser-operation-smoke
+  subject: browser-operation-adapter
+
+workloads:
+  - id: parse-fragment
+    trace_file: ../../examples/fixtures/checkout-flow/actions.jsonl
+    verifier:
+      command:
+        - node
+        - ../../examples/fixtures/checkout-flow/verify.mjs
+      timeout_seconds: 30
+      identity_files:
+        - ../../examples/fixtures/checkout-flow/verify.mjs
+
+browser:
+  engines:
+    - chromium
+    - firefox
+    - webkit
+  mode: headless
+  viewport:
+    width: 1280
+    height: 720
+  locale: en-US
+  timezone: UTC
+  color_scheme: light
+  cache: cold
+  network:
+    policy: local-only
+  fresh_profile_per_trial: true
+
+captures:
+  cpu_profile: true
+  js_heap: true
+
+trials:
+  mode: 1
+  randomize_order: false
+  schedule_seed: 730241
+  warmup_samples: 0
+  pilot_samples: 0
+  min_final_samples: 1
+  max_final_samples: 1
+
+statistics:
+  confidence: 0.95
+  bootstrap_samples: 1000
+  primary_metrics:
+    - workload.wall_ms
+    - browser.cpu_profile.active_ms
+    - browser.js_heap.live_bytes
+  minimum_effect_pct:
+    workload.wall_ms: 5.0
+    browser.cpu_profile.active_ms: 5.0
+    browser.js_heap.live_bytes: 5.0
+  correctness:
+    minimum_success_rate: 0.0
+    max_regression_percentage_points: 100.0
+  cross_engine_policy: strict_all
+  protected_metric_max_regression_pct: 100.0

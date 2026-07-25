@@ -1,0 +1,8 @@
+# Disposable output from the cross-engine feasibility spike.
+/prototype/engine-capture-spike/artifacts/
+/prototype-*.json
+/target/
+/dist/
+/.bperf/
+/sidecar/node_modules/
+/tests/e2e/fixtures/

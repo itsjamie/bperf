@@ -1,0 +1,28 @@
+{
+  "name": "@bperf/playwright-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned Playwright adapter for the bperf Rust core",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/itsjamie/bperf.git"
+  },
+  "type": "module",
+  "scripts": {
+    "check": "npm run typecheck && npm test",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "esbuild": "0.28.1",
+    "playwright": "1.61.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=24.12.0"
+  }
+}

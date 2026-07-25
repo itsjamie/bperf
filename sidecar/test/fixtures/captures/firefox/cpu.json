@@ -1,0 +1,1 @@
+{"meta":{"interval":1,"processType":0},"threads":[{"name":"GeckoMain","pid":1,"tid":1,"samples":{"schema":{"stack":0,"time":1},"data":[[1,0],[1,2],[1,5]]},"stackTable":{"schema":{"prefix":0,"frame":1},"data":[[null,0],[0,1]]},"frameTable":{"schema":{"location":0},"data":[[0],[1]]},"stringTable":["root","http://127.0.0.1:4317/fixture.js"]}],"processes":[]}

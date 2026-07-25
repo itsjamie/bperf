@@ -1,0 +1,1 @@
+{"nodes":[{"id":1,"callFrame":{"functionName":"(root)","url":"","lineNumber":0,"columnNumber":0},"children":[2]},{"id":2,"callFrame":{"functionName":"parse","url":"http://127.0.0.1:4317/fixture.js","lineNumber":10,"columnNumber":2}}],"samples":[2,2],"timeDeltas":[1000,2000]}

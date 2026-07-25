@@ -1,0 +1,16 @@
+schema_version: 1
+id: browser-operation-smoke-baseline
+subject: browser-operation-adapter
+
+implementation:
+  files:
+    - ../../examples/benchmarks/variants/baseline.mjs
+    - ../../examples/benchmarks/variants/server.mjs
+
+adapter:
+  command:
+    - node
+    - ../../examples/benchmarks/variants/baseline.mjs
+  ready:
+    protocol: stdio-json
+    timeout_seconds: 15

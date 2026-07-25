@@ -1,0 +1,16 @@
+schema_version: 1
+id: browser-operation-optimized
+subject: browser-operation-adapter
+
+implementation:
+  files:
+    - benchmarks/variants/candidate.mjs
+    - benchmarks/variants/server.mjs
+
+adapter:
+  command:
+    - node
+    - benchmarks/variants/candidate.mjs
+  ready:
+    protocol: stdio-json
+    timeout_seconds: 15
