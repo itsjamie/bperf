@@ -2,27 +2,34 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use bperf_browser::lab::{BenchmarkInspection, BrowserLab, Engine};
+use bperf_decision::{
+    baseline,
+    comparison::{self, ComparisonOutcome, ComparisonReport},
+    lineage::{self, CycleRecord},
+};
+use bperf_measurement::{
+    manifest::{BenchmarkManifest, VariantDescriptor},
+    sampling::RunBudget,
+    store::MeasurementSet,
+};
+use bperf_runtime::installation::{RuntimeInstallation, node_path as path_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tempfile::{NamedTempFile, tempdir_in};
 
-use crate::{
-    baseline,
-    browser_lab::Engine,
-    comparison::{self, ComparisonOutcome, ComparisonReport},
-    lineage::{self, CycleRecord},
-    manifest::{BenchmarkManifest, VariantDescriptor},
-    measurement::{self as measurement_store, MeasurementSet},
-    runner::{self, MeasureOptions, SamplingMode},
-    sampling::RunBudget,
-    sidecar_runtime::{SidecarInstallation, node_path as path_value},
-};
+use crate::runner::{self, MeasureOptions, SamplingMode};
 
 const STANDARD_TRIAL_POLICY: TrialPolicy = TrialPolicy {
     warmup_samples: 0,
@@ -64,11 +71,13 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
         .clone()
         .or_else(|| std::env::var_os("BPERF_NODE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("node"));
+    let sidecar = runtime_installation(execution.sidecar.as_deref())?;
     let inputs = materialize(
         &options.benchmark,
         &execution.state_root,
         &execution.object_root,
         &node,
+        &sidecar,
         STANDARD_TRIAL_POLICY,
     )?;
     let measurement = runner::run(MeasureOptions {
@@ -79,8 +88,7 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
             cohort: None,
         },
         artifact_root: execution.artifact_root,
-        node: Some(node),
-        sidecar: execution.sidecar,
+        runtime: sidecar.clone(),
     })?;
     let comparison = compare_current(
         &measurement,
@@ -138,11 +146,13 @@ fn confirm_with_policy(
         .clone()
         .or_else(|| std::env::var_os("BPERF_NODE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("node"));
+    let sidecar = runtime_installation(execution.sidecar.as_deref())?;
     let inputs = materialize(
         &options.benchmark,
         &execution.state_root,
         &execution.object_root,
         &node,
+        &sidecar,
         trial_policy,
     )?;
     let original = MeasurementSet::open(target.candidate_measurement_path())?;
@@ -179,8 +189,7 @@ fn confirm_with_policy(
             cohort: Some(format!("confirmation:{}", target.cycle_id())),
         },
         artifact_root: execution.artifact_root,
-        node: Some(node),
-        sidecar: execution.sidecar,
+        runtime: sidecar.clone(),
     })?;
     let comparison = comparison::run(comparison::CompareOptions {
         candidate_root: measurement.measurement_root().to_owned(),
@@ -409,7 +418,7 @@ fn record_measurement_index(options: MeasurementIndexOptions<'_>) -> Result<Path
         measurement_summary,
         comparison_path: options.comparison_path,
     };
-    measurement_store::write_immutable(
+    write_immutable(
         &index_path,
         format!("{}\n", serde_json::to_string_pretty(&record)?).as_bytes(),
     )?;
@@ -460,6 +469,7 @@ fn materialize(
     state_root: &Path,
     object_root: &Path,
     node: &Path,
+    sidecar: &RuntimeInstallation,
     trial_policy: TrialPolicy,
 ) -> Result<MaterializedInputs> {
     let root = fs::canonicalize(std::env::current_dir()?)
@@ -482,7 +492,6 @@ fn materialize(
         .with_context(|| format!("failed to create {}", generated_root.display()))?;
     let generated_root = fs::canonicalize(&generated_root)?;
     let fixture_lock = generated_root.join("fixture-lock.json");
-    let sidecar = SidecarInstallation::discover()?;
 
     let description = describe(
         &root,
@@ -490,7 +499,7 @@ fn materialize(
         &fixture_lock,
         &object_root,
         node,
-        &sidecar,
+        sidecar,
     )?;
     validate_description(&description)?;
     write_inputs(
@@ -498,10 +507,16 @@ fn materialize(
         &benchmark,
         &generated_root,
         node,
-        &sidecar,
+        sidecar,
         &description,
         trial_policy,
     )
+}
+
+fn runtime_installation(configured: Option<&Path>) -> Result<RuntimeInstallation> {
+    configured.map_or_else(RuntimeInstallation::discover, |root| {
+        RuntimeInstallation::from_root(root.to_owned())
+    })
 }
 
 fn absolute_directory(path: &Path) -> Result<PathBuf> {
@@ -522,13 +537,372 @@ fn describe(
     fixture_lock: &Path,
     object_root: &Path,
     node: &Path,
-    sidecar: &SidecarInstallation,
+    sidecar: &RuntimeInstallation,
 ) -> Result<ManagedDescription> {
+    let mut browser_lab = BrowserLab::start(sidecar.clone())?;
+    let discovery = discover_managed_benchmark(
+        root,
+        benchmark,
+        fixture_lock,
+        object_root,
+        node,
+        sidecar,
+        &mut browser_lab,
+    );
+    let shutdown = browser_lab.finish();
+    match (discovery, shutdown) {
+        (Ok(description), Ok(())) => Ok(description),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.context("managed discovery adapters failed to close")),
+        (Err(error), Err(shutdown)) => Err(error.context(format!(
+            "managed discovery adapters also failed to close: {shutdown:#}"
+        ))),
+    }
+}
+
+const BENCHMARK_HOST_PROTOCOL_VERSION: u32 = 2;
+const BENCHMARK_HOST_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserDescription {
+    id: String,
+    cases: Vec<ManagedCase>,
+    fixtures: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedFixtures {
+    fixture_files: Vec<PathBuf>,
+    fixture_lock: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkHostReady {
+    protocol_version: u32,
+    url: String,
+    source_files: Vec<PathBuf>,
+}
+
+struct BenchmarkHostProcess {
+    child: Child,
+    url: String,
+    source_files: Vec<PathBuf>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl BenchmarkHostProcess {
+    fn start(
+        root: &Path,
+        benchmark: &Path,
+        fixture_lock: &Path,
+        node: &Path,
+        sidecar: &RuntimeInstallation,
+    ) -> Result<Self> {
+        let host = sidecar.benchmark_host();
+        let mut child = Command::new(node)
+            .arg("--disable-warning=ExperimentalWarning")
+            .arg(path_value(&host))
+            .arg("host")
+            .arg(path_value(benchmark))
+            .arg("--root")
+            .arg(path_value(root))
+            .arg("--lock")
+            .arg(path_value(fixture_lock))
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start benchmark host with Node executable {}",
+                    node.display()
+                )
+            })?;
+
+        let readiness = (|| -> Result<(BenchmarkHostReady, Arc<Mutex<Vec<String>>>)> {
+            let stdout = child
+                .stdout
+                .take()
+                .context("benchmark host stdout was unavailable")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("benchmark host stderr was unavailable")?;
+            let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+            let captured_lines = Arc::clone(&stderr_lines);
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                    eprintln!("[benchmark-host] {line}");
+                    if let Ok(mut lines) = captured_lines.lock() {
+                        lines.push(line);
+                    }
+                }
+            });
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let mut line = String::new();
+                let result = BufReader::new(stdout)
+                    .read_line(&mut line)
+                    .map(|count| (count, line));
+                let _ = sender.send(result);
+            });
+            let line = match receiver.recv_timeout(BENCHMARK_HOST_READY_TIMEOUT) {
+                Ok(Ok((0, _))) => {
+                    let status = child.try_wait().ok().flatten();
+                    bail!("benchmark host closed before readiness (status: {status:?})")
+                }
+                Ok(Ok((_, line))) => line,
+                Ok(Err(error)) => {
+                    return Err(error).context("failed to read benchmark host readiness");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => bail!(
+                    "benchmark host did not become ready within {:?}",
+                    BENCHMARK_HOST_READY_TIMEOUT
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("benchmark host readiness reader stopped")
+                }
+            };
+            let ready: BenchmarkHostReady = serde_json::from_str(&line)
+                .context("benchmark host emitted invalid readiness JSON")?;
+            if ready.protocol_version != BENCHMARK_HOST_PROTOCOL_VERSION {
+                bail!(
+                    "benchmark host protocol mismatch: expected {}, received {}",
+                    BENCHMARK_HOST_PROTOCOL_VERSION,
+                    ready.protocol_version
+                );
+            }
+            if ready.url.trim().is_empty() {
+                bail!("benchmark host readiness URL is empty");
+            }
+            if ready.source_files.is_empty() {
+                bail!("benchmark host resolved no source files");
+            }
+            Ok((ready, stderr_lines))
+        })();
+        let (ready, stderr_lines) = match readiness {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            child,
+            url: ready.url,
+            source_files: ready.source_files,
+            stderr_lines,
+        })
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn source_files(&self) -> &[PathBuf] {
+        &self.source_files
+    }
+}
+
+impl Drop for BenchmarkHostProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Ok(lines) = self.stderr_lines.lock()
+            && !lines.is_empty()
+        {
+            eprintln!(
+                "[benchmark-host] stopped after reporting {} diagnostic line(s)",
+                lines.len()
+            );
+        }
+    }
+}
+
+fn discover_managed_benchmark(
+    root: &Path,
+    benchmark: &Path,
+    fixture_lock: &Path,
+    object_root: &Path,
+    node: &Path,
+    sidecar: &RuntimeInstallation,
+    browser_lab: &mut BrowserLab,
+) -> Result<ManagedDescription> {
+    let temporary = tempdir_in(
+        fixture_lock
+            .parent()
+            .context("fixture lock has no parent directory")?,
+    )
+    .context("failed to create managed discovery scratch directory")?;
+    let unresolved_lock = temporary.path().join("unresolved-fixture-lock.json");
+
+    let (unresolved_description, mut source_files) = {
+        let host = BenchmarkHostProcess::start(root, benchmark, &unresolved_lock, node, sidecar)?;
+        let description =
+            inspect_description_in_every_engine(browser_lab, host.url(), "unresolved")?;
+        (
+            description,
+            BTreeSet::from_iter(host.source_files().iter().cloned()),
+        )
+    };
+
+    let mut description_file =
+        NamedTempFile::new_in(temporary.path()).context("failed to create description file")?;
+    serde_json::to_writer(&mut description_file, &unresolved_description)
+        .context("failed to serialize the browser-owned benchmark description")?;
+    let resolved = resolve_fixtures(
+        root,
+        benchmark,
+        fixture_lock,
+        object_root,
+        node,
+        sidecar,
+        description_file.path(),
+    )?;
+
+    {
+        let host = BenchmarkHostProcess::start(root, benchmark, fixture_lock, node, sidecar)?;
+        source_files.extend(host.source_files().iter().cloned());
+        let resolved_description =
+            inspect_description_in_every_engine(browser_lab, host.url(), "resolved")?;
+        if resolved_description != unresolved_description {
+            bail!("fixture resolution changed the managed benchmark description");
+        }
+
+        let parsed: BrowserDescription = serde_json::from_value(resolved_description.clone())
+            .context("browser returned an invalid managed benchmark description")?;
+        if parsed.fixtures.len() != resolved.fixture_files.len() {
+            bail!(
+                "fixture resolver returned {} files for {} browser fixtures",
+                resolved.fixture_files.len(),
+                parsed.fixtures.len()
+            );
+        }
+        exercise_every_case(
+            browser_lab,
+            host.url(),
+            &resolved_description,
+            &parsed.cases,
+        )?;
+        Ok(ManagedDescription {
+            schema_version: 1,
+            benchmark_id: parsed.id,
+            cases: parsed.cases,
+            source_files: source_files.into_iter().collect(),
+            fixture_files: resolved.fixture_files,
+            fixture_lock: resolved.fixture_lock,
+        })
+    }
+}
+
+fn inspect_description_in_every_engine(
+    browser_lab: &mut BrowserLab,
+    target_url: &str,
+    pass: &str,
+) -> Result<Value> {
+    let mut common: Option<(Engine, Value)> = None;
+    for engine in Engine::ALL {
+        let inspection = browser_lab
+            .inspect_benchmark(engine, target_url, None)
+            .with_context(|| format!("{engine} failed the {pass} managed discovery pass"))?;
+        if inspection.result.is_some() {
+            bail!("{engine} returned a case result during the {pass} description pass");
+        }
+        merge_description(&mut common, engine, inspection.description, pass)?;
+    }
+    common
+        .map(|(_, description)| description)
+        .context("managed discovery inspected no engines")
+}
+
+fn merge_description(
+    common: &mut Option<(Engine, Value)>,
+    engine: Engine,
+    description: Value,
+    pass: &str,
+) -> Result<()> {
+    if let Some((reference_engine, reference)) = common {
+        if reference != &description {
+            bail!(
+                "{engine} described the managed benchmark differently from {reference_engine} during the {pass} pass"
+            );
+        }
+    } else {
+        *common = Some((engine, description));
+    }
+    Ok(())
+}
+
+fn exercise_every_case(
+    browser_lab: &mut BrowserLab,
+    target_url: &str,
+    description: &Value,
+    cases: &[ManagedCase],
+) -> Result<()> {
+    for case in cases {
+        for engine in Engine::ALL {
+            let inspection = browser_lab
+                .inspect_benchmark(engine, target_url, Some(&case.id))
+                .with_context(|| {
+                    format!(
+                        "{engine} failed managed discovery for benchmark case {}",
+                        case.id
+                    )
+                })?;
+            validate_case_inspection(engine, case, description, inspection)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_case_inspection(
+    engine: Engine,
+    case: &ManagedCase,
+    description: &Value,
+    inspection: BenchmarkInspection,
+) -> Result<()> {
+    if &inspection.description != description {
+        bail!(
+            "{engine} changed the managed benchmark description while exercising {}",
+            case.id
+        );
+    }
+    let actual = inspection
+        .result
+        .with_context(|| format!("{engine} returned no result for benchmark case {}", case.id))?;
+    if &actual != case.expectation.expected() {
+        bail!(
+            "{engine} returned an unexpected result for benchmark case {}: expected {}, received {}",
+            case.id,
+            case.expectation.expected(),
+            actual
+        );
+    }
+    Ok(())
+}
+
+fn resolve_fixtures(
+    root: &Path,
+    benchmark: &Path,
+    fixture_lock: &Path,
+    object_root: &Path,
+    node: &Path,
+    sidecar: &RuntimeInstallation,
+    description_file: &Path,
+) -> Result<ResolvedFixtures> {
     let host = sidecar.benchmark_host();
     let output = Command::new(node)
         .arg("--disable-warning=ExperimentalWarning")
         .arg(path_value(&host))
-        .arg("describe")
+        .arg("resolve")
         .arg(path_value(benchmark))
         .arg("--root")
         .arg(path_value(root))
@@ -536,16 +910,19 @@ fn describe(
         .arg(path_value(fixture_lock))
         .arg("--cache")
         .arg(path_value(object_root))
+        .arg("--description")
+        .arg(path_value(description_file))
+        .current_dir(root)
         .output()
         .with_context(|| {
             format!(
-                "failed to describe benchmark with Node executable {}",
+                "failed to resolve benchmark fixtures with Node executable {}",
                 node.display()
             )
         })?;
     if !output.status.success() {
         bail!(
-            "benchmark description failed with {}{}",
+            "benchmark fixture resolution failed with {}{}",
             output.status,
             if output.stderr.is_empty() {
                 String::new()
@@ -556,7 +933,7 @@ fn describe(
     }
     serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
-            "benchmark host {} emitted an invalid description",
+            "benchmark host {} emitted invalid fixture resolution",
             host.display()
         )
     })
@@ -601,7 +978,7 @@ fn write_inputs(
     benchmark_module: &Path,
     generated_root: &Path,
     node: &Path,
-    sidecar: &SidecarInstallation,
+    sidecar: &RuntimeInstallation,
     description: &ManagedDescription,
     trial_policy: TrialPolicy,
 ) -> Result<MaterializedInputs> {
@@ -701,12 +1078,7 @@ fn write_inputs(
     write_json(&benchmark_path, &benchmark)?;
 
     let mut implementation_files = BTreeSet::from([path_value(benchmark_module)]);
-    implementation_files.extend(
-        sidecar
-            .identity_files()?
-            .iter()
-            .map(|file| path_value(file)),
-    );
+    implementation_files.extend(sidecar.identity_files().iter().map(|file| path_value(file)));
     implementation_files.extend(description.source_files.iter().map(|file| path_value(file)));
     let variant = json!({
         "schema_version": 1,
@@ -760,6 +1132,26 @@ fn write_generated(path: &Path, content: &[u8]) -> Result<()> {
     fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
+    if path.exists() {
+        let existing =
+            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        if existing == content {
+            return Ok(());
+        }
+        bail!("refusing to overwrite immutable index {}", path.display());
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -767,7 +1159,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::measurement::MeasurementSet;
+    use bperf_measurement::store::MeasurementSet;
 
     #[cfg(windows)]
     #[test]
@@ -780,6 +1172,57 @@ mod tests {
             path_value(Path::new(r"\\?\UNC\server\share\benchmark.ts")),
             r"\\server\share\benchmark.ts"
         );
+    }
+
+    #[test]
+    fn managed_discovery_rejects_engine_description_mismatches() {
+        let mut common = None;
+        let description = json!({"id": "parser", "cases": [], "fixtures": []});
+        merge_description(
+            &mut common,
+            Engine::Chromium,
+            description.clone(),
+            "unresolved",
+        )
+        .unwrap();
+        merge_description(&mut common, Engine::Firefox, description, "unresolved").unwrap();
+
+        let error = merge_description(
+            &mut common,
+            Engine::Webkit,
+            json!({"id": "different", "cases": [], "fixtures": []}),
+            "unresolved",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("webkit"));
+        assert!(error.contains("chromium"));
+    }
+
+    #[test]
+    fn managed_discovery_rejects_wrong_case_results() {
+        let description = json!({
+            "id": "parser",
+            "cases": [{
+                "id": "small",
+                "expectation": {"kind": "exact", "value": 42}
+            }],
+            "fixtures": []
+        });
+        let case = ManagedCase {
+            id: "small".to_owned(),
+            expectation: ManagedExpectation::Exact { value: json!(42) },
+        };
+        validate_case_inspection(
+            Engine::Webkit,
+            &case,
+            &description,
+            BenchmarkInspection {
+                description: description.clone(),
+                result: Some(json!(43)),
+            },
+        )
+        .unwrap_err();
     }
 
     #[test]
@@ -858,20 +1301,19 @@ mod tests {
     #[test]
     #[ignore = "requires Node and all three Playwright browsers"]
     fn managed_benchmark_satisfies_every_engine_contract() {
-        let node = PathBuf::from(
-            std::env::var_os("BPERF_NODE")
-                .expect("set BPERF_NODE to the Node executable used by the sidecar"),
-        );
+        let node = PathBuf::from(std::env::var_os("BPERF_NODE").unwrap_or_else(|| "node".into()));
         let temporary = tempdir().unwrap();
         let benchmark = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")
             .join("managed")
             .join("fragment-parser.bench.ts");
+        let sidecar = RuntimeInstallation::discover().unwrap();
         let inputs = materialize(
             &benchmark,
             &temporary.path().join("managed"),
             &temporary.path().join("objects"),
             &node,
+            &sidecar,
             TrialPolicy {
                 warmup_samples: 0,
                 pilot_samples: 2,
@@ -896,8 +1338,7 @@ mod tests {
                 cohort: None,
             },
             artifact_root: measurement_root.clone(),
-            node: Some(node.clone()),
-            sidecar: None,
+            runtime: RuntimeInstallation::discover().unwrap(),
         })
         .unwrap();
 
@@ -923,7 +1364,7 @@ mod tests {
         assert!((3..=6).contains(&sampling.selected_final_trials));
         assert_eq!(
             measurement
-                .schedule
+                .schedule()
                 .trials
                 .iter()
                 .map(|trial| trial.engine)

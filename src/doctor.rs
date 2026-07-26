@@ -5,15 +5,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use bperf_browser::lab::{BrowserLab, CaptureEvidence, Engine};
+use bperf_runtime::installation::RuntimeInstallation;
 use serde::Serialize;
-
-use crate::browser_lab::{BrowserLab, BrowserLabConfig, CaptureEvidence, Engine};
 
 pub struct DoctorOptions {
     pub engines: Vec<Engine>,
     pub artifact_root: PathBuf,
-    pub node: Option<PathBuf>,
-    pub sidecar: Option<PathBuf>,
+    pub runtime: RuntimeInstallation,
     pub json: bool,
 }
 
@@ -29,14 +28,7 @@ pub fn run(options: DoctorOptions) -> Result<()> {
     let run_root = fs::canonicalize(&run_root)
         .with_context(|| format!("failed to resolve {}", run_root.display()))?;
 
-    let mut lab_config = BrowserLabConfig::discover()?;
-    if let Some(node) = options.node {
-        lab_config = lab_config.with_node(node);
-    }
-    if let Some(sidecar) = options.sidecar {
-        lab_config = lab_config.with_sidecar(sidecar);
-    }
-    let mut browser_lab = BrowserLab::start(lab_config)?;
+    let mut browser_lab = BrowserLab::start(options.runtime)?;
     let mut results = Vec::with_capacity(options.engines.len());
 
     for engine in options.engines {
@@ -48,7 +40,7 @@ pub fn run(options: DoctorOptions) -> Result<()> {
 
     browser_lab.finish()?;
     let summary = DoctorSummary {
-        schema_version: 1,
+        schema_version: 2,
         run_id,
         verdict: "supported",
         artifact_root: run_root.to_string_lossy().into_owned(),

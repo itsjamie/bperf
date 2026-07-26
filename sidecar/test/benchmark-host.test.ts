@@ -11,6 +11,10 @@ async function withTemporaryProject(
 ): Promise<void> {
   const root = fs.mkdtempSync(path.join(process.cwd(), prefix));
   try {
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({ private: true, type: "module" }),
+    );
     await action(root);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -23,9 +27,13 @@ test("managed host serves transformed modules and ranged fixtures", async () => 
     const fixtureBody = Buffer.from("0123456789");
     const bodyPath = path.join(root, "fixture-body");
     const lockPath = path.join(root, "fixture-lock.json");
-    const descriptor = {
+    const browserDescriptor = {
       source: "./segment.txt",
       response: { contentType: "text/plain" },
+    };
+    const lockDescriptor = {
+      response: { contentType: "text/plain" },
+      source: "./segment.txt",
     };
     fs.writeFileSync(
       benchmark,
@@ -38,7 +46,7 @@ test("managed host serves transformed modules and ranged fixtures", async () => 
         schema_version: 1,
         fixtures: [
           {
-            descriptor,
+            descriptor: lockDescriptor,
             body_path: bodyPath,
             sha256: "unused-by-host",
             size_bytes: fixtureBody.length,
@@ -63,7 +71,10 @@ test("managed host serves transformed modules and ranged fixtures", async () => 
       assert.doesNotMatch(moduleSource, /: number/);
 
       const url = new URL("/__bperf/fixture", host.origin);
-      url.searchParams.set("descriptor", JSON.stringify(descriptor));
+      url.searchParams.set(
+        "descriptor",
+        JSON.stringify(browserDescriptor),
+      );
       const fixtureResponse = await fetch(url, {
         headers: { range: "bytes=2-5" },
       });

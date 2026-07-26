@@ -144,8 +144,31 @@ function frozenJson(value: JsonValue): JsonValue {
   return value;
 }
 
-function fixtureKey(descriptor: FixtureDescriptor): string {
-  return JSON.stringify(descriptor);
+export function fixtureKey(descriptor: FixtureDescriptor): string {
+  const response = descriptor.response;
+  const stream = response?.stream;
+  return JSON.stringify({
+    source: descriptor.source,
+    ...(response
+      ? {
+          response: {
+            ...(response.contentType !== undefined
+              ? { contentType: response.contentType }
+              : {}),
+            ...(stream
+              ? {
+                  stream: {
+                    chunkSize: stream.chunkSize,
+                    ...(stream.intervalMs !== undefined
+                      ? { intervalMs: stream.intervalMs }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+  });
 }
 
 function fixtureResponse(value: unknown): FixtureResponse | undefined {

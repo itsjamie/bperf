@@ -2,7 +2,7 @@
   "name": "@bperf/playwright-sidecar",
   "version": "0.1.0",
   "private": true,
-  "description": "Pinned Playwright adapter for the bperf Rust core",
+  "description": "Pinned Playwright registry and TypeScript benchmark host for bperf",
   "license": "MIT",
   "repository": {
     "type": "git",

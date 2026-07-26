@@ -38,21 +38,45 @@ fn plan(benchmark: &Path, variant: &Path, artifact_root: &Path) -> (Value, PathB
 }
 
 fn complete_measurement(root: &Path, value: f64, environment: &str) {
-    let runtime_node = format!("v24-{environment}");
+    let os_release = format!("test-{environment}");
     let identity_source = format!(
         concat!(
             "{{",
             "\"bperf_version\":\"0.1.0\",",
-            "\"browser_lab_protocol_version\":9,",
-            "\"runtime\":{{",
-            "\"node\":{},",
-            "\"playwright\":\"1.61.1\",",
-            "\"platform\":\"win32\",",
+            "\"browser_lab_protocol_version\":12,",
+            "\"host\":{{",
+            "\"platform\":\"windows\",",
             "\"arch\":\"x64\",",
-            "\"os_release\":\"test\",",
+            "\"os_release\":{},",
             "\"cpu_model\":\"test\",",
             "\"logical_cpus\":8,",
             "\"total_memory_bytes\":16000000000",
+            "}},",
+            "\"adapters\":{{",
+            "\"chromium\":{{",
+            "\"kind\":\"rust-chromium\",",
+            "\"playwright\":\"1.61.1\",",
+            "\"chromium_revision\":\"1228\",",
+            "\"executable_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+            "\"protocol_version\":1,",
+            "\"browser_workload_version\":1",
+            "}},",
+            "\"firefox\":{{",
+            "\"kind\":\"rust-firefox\",",
+            "\"playwright\":\"1.61.1\",",
+            "\"firefox_revision\":\"1532\",",
+            "\"executable_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+            "\"protocol_version\":1,",
+            "\"browser_workload_version\":1",
+            "}},",
+            "\"webkit\":{{",
+            "\"kind\":\"rust-webkit\",",
+            "\"playwright\":\"1.61.1\",",
+            "\"webkit_revision\":\"test\",",
+            "\"executable_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",",
+            "\"protocol_version\":1,",
+            "\"browser_workload_version\":1",
+            "}}",
             "}},",
             "\"browsers\":{{",
             "\"chromium\":{{\"executable_path\":\"chromium\",\"version\":\"1\"}},",
@@ -61,10 +85,10 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "}}",
             "}}"
         ),
-        serde_json::to_string(&runtime_node).unwrap()
+        serde_json::to_string(&os_release).unwrap()
     );
     let mut environment_digest = Sha256::new();
-    environment_digest.update(b"bperf-browser-environment-v1\0");
+    environment_digest.update(b"bperf-browser-environment-v4\0");
     environment_digest.update(identity_source.as_bytes());
     let environment_fingerprint = format!("{:x}", environment_digest.finalize());
     let identity: Value = serde_json::from_str(&identity_source).unwrap();
@@ -91,7 +115,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
     fs::write(
         root.join("environment.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 5,
             "recorded_at_unix_ms": 1,
             "fingerprint": environment_fingerprint,
             "identity": identity,

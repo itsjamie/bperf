@@ -27,8 +27,8 @@ These checks do not launch browsers:
 
 ```text
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 npm --prefix sidecar run check
 ```
 
@@ -42,6 +42,13 @@ large diagnostic artifacts:
 
 ```text
 cargo test every_engine_satisfies_the_capture_contract -- --ignored --exact
+cargo test --test browser_contract chromium_doctor_does_not_spawn_node -- --ignored --exact
+cargo test --test browser_contract firefox_doctor_does_not_spawn_node -- --ignored --exact
+cargo test --test browser_contract webkit_doctor_does_not_spawn_node -- --ignored --exact
+cargo test -p bperf-browser chromium::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+cargo test -p bperf-browser firefox::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+cargo test -p bperf-browser webkit::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+cargo test -p bperf-browser lab::tests::retained_lanes_keep_one_root_pid_and_shutdown_all_contained_processes -- --ignored --exact
 cargo test --test measurement_contract variants_can_be_measured_and_compared_on_every_engine -- --ignored --exact
 cargo test managed_benchmark_satisfies_every_engine_contract -- --ignored
 ```
@@ -56,6 +63,22 @@ A capture change is not complete until every requested artifact succeeds on
 all three engines. Do not add a shared path that silently supports only
 Chromium or only the engines exposed through a public Playwright protocol
 session.
+
+Run the direct Chromium, Firefox, and WebKit gates on every platform targeted
+by the release.
+`crates/bperf-browser/src/browser_process.rs` owns platform launch and
+process-tree cleanup;
+`crates/bperf-browser/src/artifacts.rs` owns artifact identity and the common Speedscope
+viewer schema;
+`crates/bperf-browser/src/chromium.rs`, `firefox.rs`, `firefox_rdp.rs`, and
+`webkit.rs`
+own their engine protocols and native capture formats.
+`sidecar/src/benchmark-host.ts` may bundle and serve benchmarks but must not
+launch a browser.
+
+The TypeScript runtime contains no browser adapter or capture transport. The
+retained-PID gate must show one healthy root per engine, and successful shutdown
+must prove that its process group or Job Object contains no active process.
 
 ## Design changes
 

@@ -1,25 +1,15 @@
-mod artifact_retention;
-mod baseline;
 mod benchmark_runtime;
-mod browser_lab;
-mod comparison;
 mod doctor;
-mod environment;
-mod lineage;
 mod managed_benchmark;
-mod manifest;
-mod measurement;
 mod runner;
-mod sampling;
-mod schedule;
-mod sidecar_runtime;
-
-const MEASUREMENT_SCHEMA_VERSION: u32 = 4;
 
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
-use browser_lab::Engine;
+use bperf_browser::lab::Engine;
+use bperf_decision::{baseline, comparison, lineage};
+use bperf_measurement::{sampling, store as measurement};
+use bperf_runtime::installation::RuntimeInstallation;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -89,11 +79,7 @@ struct DoctorArgs {
     #[arg(long, default_value = ".bperf/doctor")]
     artifact_dir: PathBuf,
 
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled sidecar entrypoint.
+    /// Override the runtime directory used to locate pinned Playwright browsers.
     #[arg(long)]
     sidecar: Option<PathBuf>,
 
@@ -153,11 +139,7 @@ struct MeasureArgs {
     #[arg(long, default_value = ".bperf/measurements")]
     artifact_dir: PathBuf,
 
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled sidecar entrypoint.
+    /// Override the runtime directory used to locate pinned Playwright browsers.
     #[arg(long)]
     sidecar: Option<PathBuf>,
 
@@ -233,7 +215,7 @@ struct ExecutionArgs {
     #[arg(long)]
     node: Option<PathBuf>,
 
-    /// Override the bundled sidecar entrypoint.
+    /// Override the bundled benchmark runtime directory.
     #[arg(long)]
     sidecar: Option<PathBuf>,
 }
@@ -291,7 +273,24 @@ struct HistoryArgs {
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
-    format: lineage::HistoryFormat,
+    format: HistoryFormatArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HistoryFormatArg {
+    Text,
+    Json,
+    AgentContext,
+}
+
+impl From<HistoryFormatArg> for lineage::HistoryFormat {
+    fn from(format: HistoryFormatArg) -> Self {
+        match format {
+            HistoryFormatArg::Text => Self::Text,
+            HistoryFormatArg::Json => Self::Json,
+            HistoryFormatArg::AgentContext => Self::AgentContext,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -379,8 +378,10 @@ fn main() -> Result<ExitCode> {
             let options = doctor::DoctorOptions {
                 engines: args.engine.engines(),
                 artifact_root: args.artifact_dir,
-                node: args.node,
-                sidecar: args.sidecar,
+                runtime: args.sidecar.map_or_else(
+                    RuntimeInstallation::discover,
+                    RuntimeInstallation::from_root,
+                )?,
                 json: args.json,
             };
             doctor::run(options)?;
@@ -410,8 +411,10 @@ fn main() -> Result<ExitCode> {
                 variant: args.variant,
                 sampling: runner::SamplingMode::Fixed(args.final_samples),
                 artifact_root: args.artifact_dir,
-                node: args.node,
-                sidecar: args.sidecar,
+                runtime: args.sidecar.map_or_else(
+                    RuntimeInstallation::discover,
+                    RuntimeInstallation::from_root,
+                )?,
             })?;
             outcome.report("measure", args.json)?;
             Ok(ExitCode::SUCCESS)
@@ -449,7 +452,7 @@ fn main() -> Result<ExitCode> {
             lineage::history(lineage::HistoryOptions {
                 benchmark_id: args.benchmark_id,
                 root: args.lineage_dir,
-                format: args.format,
+                format: args.format.into(),
             })?;
             Ok(ExitCode::SUCCESS)
         }

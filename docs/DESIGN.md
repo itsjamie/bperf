@@ -359,10 +359,14 @@ are captured around one execution rather than scheduled as independent streams.
 
 ## Native browser adapters
 
-Automation is shared through Playwright. Profiling is engine-specific:
+All engines use builds pinned by the sidecar's Playwright package. Rust owns
+each browser process and native capture adapter. Playwright WebKit is not the
+installed Safari application.
 
 | Concern | Chromium | Firefox | WebKit |
 |---|---|---|---|
+| Adapter owner | Rust | Rust | Rust |
+| Automation | CDP remote-debugging pipe | Juggler pipe | Inspector pipe to patched WebKit |
 | CPU | CDP `Profiler` | Gecko Profiler through RDP | Web Inspector `ScriptProfiler` |
 | JavaScript heap | CDP `HeapProfiler` | RDP `MemoryActor` | Web Inspector `Heap` |
 | Flamegraph | V8 samples to Speedscope | Gecko tables to Speedscope | Inspector samples to Speedscope |
@@ -374,9 +378,29 @@ The Firefox adapter reads the `.fxsnapshot` core-dump framing and sums every
 node's shallow size in the live heap graph. Protocol memory-report buckets are
 not substituted for the snapshot metric.
 
-WebKit remains the adapter-maintenance hotspot. Playwright has no public WebKit
-equivalent of `newCDPSession`, so bperf owns a pinned, version-tested inspector
-bridge. A mismatch must fail preflight rather than skip the capture.
+The Rust Chromium adapter owns its CDP sessions, target attachment, request
+interception, V8 capture sequencing, and normalization. The Rust Firefox
+adapter owns its Juggler sessions, RDP actors, Gecko profile normalization, and
+`.fxsnapshot` lifecycle. The Rust WebKit adapter owns its pinned private
+inspector bridge. They share only process containment, Playwright installation
+discovery, browser-workload policy, immutable artifact description, and
+Speedscope document construction. The capture-artifact module also prepares the
+engine's three contained output paths, replaces stale files, and returns a
+complete validated descriptor set. Each adapter still decides which native
+payload, samples, and frames belong in an artifact; engine protocol concepts
+stay inside the adapter. A mismatch closes the retained lane and fails
+preflight or the current attempt; no adapter falls back to Node.
+Shutdown succeeds only after the owned Unix process group is absent or the
+Windows Job Object reports zero active processes. The live contract also proves
+that repeated captures keep one root PID for each healthy retained lane.
+
+One versioned JavaScript workload source owns setup, adaptive batch selection,
+result stability, timing, settling, the runtime anchor, and the doctor probe.
+Every Rust adapter embeds it, so those semantics are not reimplemented per
+engine.
+
+[ADR 0007](adr/0007-rust-browser-adapters.md) records the unified Rust
+ownership decision and retirement of the former TypeScript capture path.
 
 Checked-in golden captures exercise each native parser and Speedscope
 normalizer in the fast suite. The ignored real-browser contract tests prove the
@@ -485,8 +509,11 @@ and sampled CPU without changing version strings.
 
 Every measurement set carries:
 
-- exact Node, Playwright, operating-system, CPU, protocol, and browser-build
-  identity;
+- one Rust-captured host identity;
+- exact browser identity for each engine;
+- exact per-engine adapter identity: executable digest, Playwright version,
+  pinned revision, and adapter protocol version for Chromium, Firefox, and
+  WebKit;
 - 31 fresh observations of a versioned JavaScript CPU anchor in every engine.
 
 The comparator bootstraps the historical-to-fresh median anchor change for each
@@ -590,49 +617,75 @@ inventing an optimization cycle. It remains available for advanced workflows.
 
 ```mermaid
 flowchart LR
-    CALLER["Agent, human, or CI"] --> CLI["CLI and managed workflow"]
-    BENCH["TypeScript benchmark"] --> HOST["Benchmark host"]
+    CALLER["Agent, human, or CI"] --> CLI["bperf application"]
+    BENCH["TypeScript benchmark"] --> HOST["Node benchmark host"]
     FIXTURES["Fixture objects and lock"] --> HOST
-    HOST --> RUNTIME["Benchmark runtime"]
-    CLI --> MEASURE["Measurement and sampling"]
-    RUNTIME --> MEASURE
-    MEASURE --> LAB["Browser laboratory"]
-    LAB --> CHROMIUM["Chromium adapter"]
-    LAB --> FIREFOX["Firefox adapter"]
-    LAB --> WEBKIT["WebKit adapter"]
-    MEASURE --> ENV["Runtime identity and anchors"]
+    HOST --> CLI
+    CLI --> DECISION["bperf-decision"]
+    CLI --> MEASURE["bperf-measurement"]
+    CLI --> LAB["bperf-browser"]
+    CLI --> INSTALL["bperf-runtime"]
+    DECISION --> MEASURE
+    DECISION --> LAB
+    MEASURE --> LAB
+    LAB --> INSTALL
+    LAB --> CHROMIUM_ADAPTER["Rust Chromium adapter"]
+    CHROMIUM_ADAPTER --> CHROMIUM["Chromium"]
+    LAB --> FIREFOX_ADAPTER["Rust Firefox adapter"]
+    FIREFOX_ADAPTER --> FIREFOX["Firefox"]
+    LAB --> WEBKIT_ADAPTER["Rust WebKit adapter"]
+    WEBKIT_ADAPTER --> WEBKIT["WebKit"]
     MEASURE --> SET["Immutable measurement set"]
-    ENV --> SET
     SET --> RETENTION["Artifact retention"]
-    SET --> COMPARE["Independent comparison"]
+    DECISION --> COMPARE["Independent comparison"]
     BASELINE["Baseline registry"] --> COMPARE
-    SET --> LINEAGE["Optimization lineage"]
+    DECISION --> LINEAGE["Optimization lineage"]
     COMPARE --> LINEAGE
     LINEAGE --> BASELINE
 ```
 
-The important module boundaries are organized by the knowledge they hide:
+The Cargo graph is one-way. Each public Module has an explicit Interface and
+hides knowledge that would otherwise spread through the application:
 
-| Boundary | What it owns |
+| Crate / Module | Interface and hidden knowledge |
 |---|---|
-| `managed_benchmark` | The common `run` and `confirm` workflows, generated private inputs, comparison attachment, and cycle recording. |
-| `benchmark-host` | Loading a user benchmark in every engine, resolving and serving fixtures, and reporting the bundled project source graph. |
+| `bperf` application | `doctor`, `run`, and `confirm` orchestration. It composes the library Interfaces but is not a dependency of them. |
+| `bperf-runtime::installation` | Validated runtime discovery, benchmark-host identity, pinned browser selection, Playwright version, and Node-safe paths. Release layout, cache conventions, and registry parsing stay private. |
+| `bperf-browser::lab` | Engine-neutral configurations and evidence, retained lane lifecycle, complete capture validation, and managed benchmark inspection. |
+| `bperf-browser::artifacts` | Complete artifact-set and file validation. Construction helpers and Speedscope representation stay crate-private. |
+| Private browser Modules | Chromium CDP, Firefox Juggler/RDP, WebKit inspector protocol, native formats, workload injection, and process containment. |
+| `bperf-measurement::manifest` | Benchmark and variant definitions. |
+| `bperf-measurement::schedule` | Deterministic fixed and adaptive trial schedules. |
+| `bperf-measurement::sampling` | Pilot stopping, batch selection, final-count sizing, and immutable sampling decisions. |
+| `bperf-measurement::store` | One-variant measurement-set preparation, resumption, evidence recording, frozen workloads, environment records, and finalization. Persistence paths and immutable-write mechanics stay private. |
+| `bperf-measurement::retention` | Representative artifact selection and resumable payload cleanup. |
+| `bperf-decision::environment` | Host and adapter identity plus versioned per-engine runtime anchors. |
+| `bperf-decision::comparison` | Compatibility checks, independent statistics, guardrails, and strict engine-level verdict folding. |
+| `bperf-decision::baseline` | Append-only current-baseline references. |
+| `bperf-decision::lineage` | Content-addressed source states, deltas, cycles, confirmations, and promotions. |
+| `managed_benchmark` | The common `run` and `confirm` workflows, two-pass cross-engine discovery, generated private inputs, comparison attachment, and cycle recording. |
+| `benchmark-host` | Browser-independent benchmark bundling, fixture resolution and serving, and reporting the bundled project source graph. |
 | `project-modules` | TypeScript, package, CommonJS, alias, and browser-bundle resolution. |
 | `benchmark_runtime` | The prepared workload and verifier contract used by the measurement engine. |
-| `measurement` | One-variant measurement-set persistence, validation, and finalization. |
-| `sampling` | Pilot stopping, batch selection, final-count sizing, and immutable sampling decisions. |
 | `runner` | Resumable progression of pending attempts into terminal trial evidence. |
-| `browser_lab` | Retained lane lifecycle and validation of engine-neutral capture evidence. |
-| Private engine adapters | Native protocol sequencing, formats, cleanup, and Speedscope normalization for one engine. |
-| `environment` | Exact runtime identity, baseline age, and versioned per-engine anchors. |
-| `comparison` | Compatibility checks, independent statistics, guardrails, and strict engine-level verdict folding. |
-| `artifact_retention` | Representative selection and resumable payload cleanup. |
-| `baseline` | Append-only current-baseline references. |
-| `lineage` | Content-addressed source states, deltas, cycles, confirmations, and promotions. |
 
 Different layers expose different abstractions. The Rust core receives
 validated capture evidence, not browser protocol objects. The benchmark author
 supplies a domain operation, not generated YAML or a transport endpoint.
+
+Managed discovery serves the unresolved bundle and compares descriptions from
+Chromium, Firefox, and WebKit. After fixture resolution locks the inputs,
+it serves the resolved bundle, compares descriptions again, and exercises every
+case in a fresh context on every engine. The Node host does not launch browsers.
+The packaged Node runtime contains only that host, the benchmark authoring
+module, the project bundler, package manifests, and the pinned Playwright
+registry.
+
+Capture protocol 12, benchmark-host protocol 2, environment schema 5, and
+doctor schema 2 identify this ownership model. The measurement schema is
+unchanged because trials, metrics, artifacts, and scheduling retain their
+existing shape. Environment records from former Node-owned browser adapters
+are rejected with a remeasurement error.
 
 ## CLI
 

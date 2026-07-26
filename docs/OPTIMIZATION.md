@@ -133,9 +133,11 @@ independently:
 A non-stable anchor makes performance evidence inconclusive for that engine.
 It does not excuse a correctness failure.
 
-Exact Node, Playwright, operating-system, CPU, protocol, and browser-build
-identity is a separate compatibility gate. Baseline age is reported and warns
+Exact host, per-engine browser, and per-engine adapter identity is a separate
+compatibility gate. Every engine identifies its Rust adapter protocol, pinned
+Playwright revision, and executable digest. Baseline age is reported and warns
 after seven days, but age alone does not override a stable fresh anchor.
+Measurements created by former Node-owned browser adapters must be remeasured.
 
 [ADR 0001](adr/0001-runtime-validity.md) records why bperf uses anchors and
 independent confirmation instead of reconstructing old source inside the

@@ -41,6 +41,9 @@ Chromium, Firefox, and WebKit are one contract:
 - Historical comparisons check a fresh runtime anchor in every engine before
   trusting the old baseline.
 
+`webkit` means Playwright's pinned, patched WebKit build. It does not automate
+the Safari application installed by macOS.
+
 This is not a general page-load tester. It is for deterministic browser
 workloads whose result can prove that the same work still happened.
 
@@ -68,7 +71,8 @@ On Linux, Playwright may also require operating-system packages. Its
 packages.
 
 `doctor --engine all` is the capability gate. Run it on a new machine or after
-changing Node, Playwright, or the installed browsers.
+changing Playwright or the installed browsers. Every doctor launches its browser
+directly from Rust; the Node runtime is not part of browser capture.
 
 To create and install an optimized build for the current platform:
 
@@ -78,9 +82,12 @@ bperf --version
 ```
 
 The packaging script builds the locked Cargo release and installs the
-versioned TypeScript sidecar under Cargo's user `bin` directory. The sidecar
-runs directly in Node; there is no transpiled JavaScript tree. The bundle also
-contains the documentation, examples, license, and `bperf-agent-loop` skill.
+versioned TypeScript sidecar under Cargo's user `bin` directory. Node bundles
+and hosts TypeScript benchmarks but does not launch browsers. Rust reads the
+sidecar's pinned Playwright registry and directly launches and captures
+Chromium, Firefox, and WebKit. The sidecar runs directly in Node; there is no
+transpiled JavaScript tree. The bundle also contains the documentation,
+examples, license, and `bperf-agent-loop` skill.
 
 ## Write a benchmark
 

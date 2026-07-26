@@ -8,34 +8,17 @@ import http, {
 } from "node:http";
 import path from "node:path";
 import { once } from "node:events";
-import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
-  chromium,
-  firefox,
-  webkit,
-  type Browser,
-  type BrowserType,
-  type Page,
-} from "playwright";
-
-import type {
-  BrowserBenchmarkDescription,
-  FixtureDescriptor,
+  fixtureKey,
+  type BrowserBenchmarkDescription,
+  type FixtureDescriptor,
 } from "./browser-benchmark.ts";
-import type { EngineId } from "./contract.ts";
 import {
   openBrowserProject,
   type BrowserProject,
 } from "./project-modules.ts";
-import { enforceNetworkPolicy } from "./trial-workload.ts";
-
-const browserTypes = {
-  chromium,
-  firefox,
-  webkit,
-} satisfies Record<EngineId, BrowserType>;
 
 const browserSdkPath = fileURLToPath(
   new URL("./browser-benchmark.ts", import.meta.url),
@@ -55,15 +38,6 @@ interface FixtureLockEntry {
 interface FixtureLock {
   schema_version: 1;
   fixtures: FixtureLockEntry[];
-}
-
-export interface ManagedBenchmarkDescription {
-  schema_version: 1;
-  benchmark_id: string;
-  cases: BrowserBenchmarkDescription["cases"];
-  source_files: string[];
-  fixture_files: string[];
-  fixture_lock: string;
 }
 
 export interface BenchmarkHostOptions {
@@ -97,14 +71,14 @@ if (benchmark.default !== globalThis.__bperfDefinition) {
 }
 
 function readFixtureLock(filePath: string | undefined): Map<string, FixtureLockEntry> {
-  if (!filePath) return new Map();
+  if (!filePath || !fs.existsSync(filePath)) return new Map();
   const value = JSON.parse(fs.readFileSync(filePath, "utf8")) as FixtureLock;
   if (value.schema_version !== 1 || !Array.isArray(value.fixtures)) {
     throw new Error(`invalid fixture lock: ${filePath}`);
   }
   return new Map(
     value.fixtures.map((entry) => [
-      JSON.stringify(entry.descriptor),
+      fixtureKey(entry.descriptor),
       entry,
     ]),
   );
@@ -114,7 +88,7 @@ function pinnedFixture(
   lock: Map<string, FixtureLockEntry>,
   descriptor: FixtureDescriptor,
 ): FixtureLockEntry | undefined {
-  const entry = lock.get(JSON.stringify(descriptor));
+  const entry = lock.get(fixtureKey(descriptor));
   if (!entry?.source_url) return undefined;
   const body = fs.readFileSync(entry.body_path);
   if (
@@ -187,7 +161,15 @@ async function serveFixture(
   requestUrl: URL,
 ): Promise<void> {
   const descriptor = requestUrl.searchParams.get("descriptor");
-  const entry = descriptor ? lock.get(descriptor) : undefined;
+  let key: string | undefined;
+  try {
+    key = descriptor
+      ? fixtureKey(JSON.parse(descriptor) as FixtureDescriptor)
+      : undefined;
+  } catch {
+    key = undefined;
+  }
+  const entry = key ? lock.get(key) : undefined;
   if (!entry) {
     response.writeHead(404).end("Unknown benchmark fixture");
     return;
@@ -311,135 +293,6 @@ export async function startBenchmarkHost(
   };
 }
 
-async function inspectInEveryEngine(
-  origin: string,
-  exerciseCases = false,
-): Promise<BrowserBenchmarkDescription> {
-  let shared: BrowserBenchmarkDescription | undefined;
-  for (const [engine, browserType] of Object.entries(browserTypes)) {
-    const browser = await browserType.launch({ headless: true });
-    try {
-      const description = await withBenchmarkPage(
-        browser,
-        origin,
-        (_page, description) => description,
-      );
-      if (shared && !isDeepStrictEqual(shared, description)) {
-        throw new Error(
-          `${engine} registered a different benchmark definition`,
-        );
-      }
-      if (exerciseCases) {
-        for (const benchmarkCase of description.cases) {
-          await withBenchmarkPage(
-            browser,
-            origin,
-            async (page, isolatedDescription) => {
-              if (!isDeepStrictEqual(description, isolatedDescription)) {
-                throw new Error(
-                  `${engine} changed its benchmark definition between cases`,
-                );
-              }
-              await exerciseBenchmarkCase(page, benchmarkCase, engine);
-            },
-          );
-        }
-      }
-      shared = description;
-    } catch (error) {
-      throw new Error(`${engine} benchmark discovery failed`, {
-        cause: error,
-      });
-    } finally {
-      await browser.close({
-        reason: "bperf benchmark discovery complete",
-      });
-    }
-  }
-  if (!shared) {
-    throw new Error("benchmark discovery returned no engine descriptions");
-  }
-  return shared;
-}
-
-async function withBenchmarkPage<Result>(
-  browser: Browser,
-  origin: string,
-  action: (
-    page: Page,
-    description: BrowserBenchmarkDescription,
-  ) => Result | Promise<Result>,
-): Promise<Result> {
-  const context = await browser.newContext();
-  try {
-    await enforceNetworkPolicy(context);
-    const page = await context.newPage();
-    const loadFailures: string[] = [];
-    page.on("pageerror", (error) => {
-      loadFailures.push(error.message);
-    });
-    page.on("response", (response) => {
-      if (response.status() >= 400) {
-        loadFailures.push(
-          `HTTP ${response.status()} loading ${response.url()}`,
-        );
-      }
-    });
-    await page.goto(origin, { waitUntil: "load" });
-    try {
-      await page.waitForFunction(
-        () => Boolean(globalThis.__bperfDescription && globalThis.__bperf),
-        undefined,
-        { timeout: 10_000 },
-      );
-    } catch (cause) {
-      const details = loadFailures.length
-        ? `: ${loadFailures.join("; ")}`
-        : "";
-      throw new Error(`benchmark page did not register${details}`, {
-        cause,
-      });
-    }
-    const description = await page.evaluate(
-      () => globalThis.__bperfDescription,
-    );
-    if (!description) {
-      throw new Error("browser returned no benchmark description");
-    }
-    return await action(page, description);
-  } finally {
-    await context.close();
-  }
-}
-
-async function exerciseBenchmarkCase(
-  page: Page,
-  benchmarkCase: BrowserBenchmarkDescription["cases"][number],
-  engine: string,
-): Promise<void> {
-  const operations = [{ case_id: benchmarkCase.id }];
-  const results = await page.evaluate(async (values) => {
-    const adapter = globalThis.__bperf;
-    if (!adapter) {
-      throw new Error("benchmark page adapter was not installed");
-    }
-    await adapter.prepare(values);
-    const results = [];
-    for (const value of values) {
-      results.push(await adapter.run(value));
-    }
-    await adapter.settle();
-    return results;
-  }, operations);
-  if (!isDeepStrictEqual(results[0], benchmarkCase.expectation.value)) {
-    throw new Error(
-      `${engine} case ${JSON.stringify(benchmarkCase.id)} returned ${
-        JSON.stringify(results[0])
-      }; expected ${JSON.stringify(benchmarkCase.expectation.value)}`,
-    );
-  }
-}
-
 function sha256(body: Buffer): string {
   return crypto.createHash("sha256").update(body).digest("hex");
 }
@@ -514,27 +367,21 @@ async function acquireFixture(
   };
 }
 
-export async function describeBenchmark(
+export async function resolveBenchmarkFixtures(
   options: BenchmarkHostOptions & {
     fixtureLock: string;
     fixtureCache: string;
   },
-): Promise<ManagedBenchmarkDescription> {
+  description: BrowserBenchmarkDescription,
+): Promise<{
+  fixture_files: string[];
+  fixture_lock: string;
+}> {
   const project = openBrowserProject(options.root);
-  const root = project.root;
   const benchmark = project.resolveFile(
     options.benchmark,
     "benchmark module",
   );
-  const discoveryHost = await startBenchmarkHost({ root, benchmark });
-  let description: BrowserBenchmarkDescription;
-  let discoverySources: string[];
-  try {
-    description = await inspectInEveryEngine(discoveryHost.origin);
-    discoverySources = [...discoveryHost.sourceFiles];
-  } finally {
-    await discoveryHost.close();
-  }
 
   const existing = fs.existsSync(options.fixtureLock)
     ? readFixtureLock(options.fixtureLock)
@@ -560,53 +407,26 @@ export async function describeBenchmark(
     options.fixtureLock,
     `${JSON.stringify(lock, null, 2)}\n`,
   );
-
-  const resolvedHost = await startBenchmarkHost({
-    root,
-    benchmark,
-    fixtureLock: options.fixtureLock,
-  });
-  try {
-    const resolvedDescription = await inspectInEveryEngine(
-      resolvedHost.origin,
-      true,
-    );
-    if (!isDeepStrictEqual(description, resolvedDescription)) {
-      throw new Error(
-        "benchmark definition changed after fixtures were resolved",
-      );
-    }
-    return {
-      schema_version: 1,
-      benchmark_id: description.id,
-      cases: description.cases,
-      source_files: [
-        ...new Set([
-          ...discoverySources,
-          ...resolvedHost.sourceFiles,
-        ]),
-      ].sort(),
-      fixture_files: entries.map((entry) => entry.body_path).sort(),
-      fixture_lock: fs.realpathSync(options.fixtureLock),
-    };
-  } finally {
-    await resolvedHost.close();
-  }
+  return {
+    fixture_files: entries.map((entry) => entry.body_path).sort(),
+    fixture_lock: fs.realpathSync(options.fixtureLock),
+  };
 }
 
 interface ParsedArguments {
-  mode: "describe" | "serve";
+  mode: "host" | "resolve" | "serve";
   benchmark: string;
   root: string;
   fixtureLock: string;
   fixtureCache?: string;
+  description?: string;
 }
 
 function parseArguments(values: string[]): ParsedArguments {
   const [mode, benchmark, ...rest] = values;
-  if (!["describe", "serve"].includes(mode) || !benchmark) {
+  if (!["host", "resolve", "serve"].includes(mode) || !benchmark) {
     throw new Error(
-      "usage: benchmark-host.ts <describe|serve> <benchmark> --root <path> --lock <path> [--cache <path>]",
+      "usage: benchmark-host.ts <host|resolve|serve> <benchmark> --root <path> --lock <path> [--cache <path>] [--description <path>]",
     );
   }
   const options = new Map<string, string>();
@@ -631,22 +451,33 @@ function parseArguments(values: string[]): ParsedArguments {
     ...(options.get("cache")
       ? { fixtureCache: options.get("cache") }
       : {}),
+    ...(options.get("description")
+      ? { description: options.get("description") }
+      : {}),
   };
 }
 
 async function main(): Promise<void> {
   const options = parseArguments(process.argv.slice(2));
-  if (options.mode === "describe") {
-    if (!options.fixtureCache) {
-      throw new Error("benchmark description requires --cache");
+  if (options.mode === "resolve") {
+    if (!options.fixtureCache || !options.description) {
+      throw new Error(
+        "fixture resolution requires --cache and --description",
+      );
     }
-    const description = await describeBenchmark({
-      root: options.root,
-      benchmark: options.benchmark,
-      fixtureLock: options.fixtureLock,
-      fixtureCache: options.fixtureCache,
-    });
-    process.stdout.write(`${JSON.stringify(description)}\n`);
+    const description = JSON.parse(
+      fs.readFileSync(options.description, "utf8"),
+    ) as BrowserBenchmarkDescription;
+    const resolved = await resolveBenchmarkFixtures(
+      {
+        root: options.root,
+        benchmark: options.benchmark,
+        fixtureLock: options.fixtureLock,
+        fixtureCache: options.fixtureCache,
+      },
+      description,
+    );
+    process.stdout.write(`${JSON.stringify(resolved)}\n`);
     return;
   }
 
@@ -657,8 +488,9 @@ async function main(): Promise<void> {
   });
   process.stdout.write(
     `${JSON.stringify({
-      protocol_version: 1,
+      protocol_version: 2,
       url: `${host.origin}/`,
+      source_files: [...host.sourceFiles].sort(),
     })}\n`,
   );
   const close = async () => {

@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -15,15 +15,13 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn measure(benchmark: &Path, variant: &Path, root: &Path, node: &Path) -> Value {
+fn measure(benchmark: &Path, variant: &Path, root: &Path) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_bperf"))
         .arg("measure")
         .arg(benchmark)
         .arg(variant)
         .arg("--artifact-dir")
         .arg(root)
-        .arg("--node")
-        .arg(node)
         .arg("--json")
         .output()
         .expect("run bperf measure");
@@ -40,25 +38,19 @@ fn measure(benchmark: &Path, variant: &Path, root: &Path, node: &Path) -> Value 
 /// matrix; unit tests use protocol fixtures and never substitute one engine for
 /// another.
 #[test]
-#[ignore = "requires the pinned Node sidecar and all three Playwright browsers"]
+#[ignore = "requires the pinned runtime and all three Playwright browsers"]
 fn variants_can_be_measured_and_compared_on_every_engine() {
-    let node = PathBuf::from(
-        env::var_os("BPERF_NODE")
-            .expect("set BPERF_NODE to the Node executable used by the sidecar"),
-    );
     let directory = tempdir().expect("create measurement artifact directory");
     let benchmark = fixture("browser-smoke.yaml");
     let baseline = measure(
         &benchmark,
         &fixture("variant-baseline.yaml"),
         directory.path(),
-        &node,
     );
     let candidate = measure(
         &benchmark,
         &fixture("variant-candidate.yaml"),
         directory.path(),
-        &node,
     );
 
     for summary in [&baseline, &candidate] {

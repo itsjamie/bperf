@@ -79,7 +79,7 @@ export function startVariant(configuration) {
     }
     process.stdout.write(
       `${JSON.stringify({
-        protocol_version: 1,
+        protocol_version: 2,
         url: `http://127.0.0.1:${address.port}/`,
       })}\n`,
     );

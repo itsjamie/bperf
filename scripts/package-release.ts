@@ -43,16 +43,21 @@ run(process.platform === "win32" ? "cargo.exe" : "cargo", [
 ]);
 
 await rm(bundle, { recursive: true, force: true });
-await mkdir(path.join(bundle, "sidecar"), { recursive: true });
+await mkdir(path.join(bundle, "sidecar", "src"), { recursive: true });
 await copyFile(
   path.join(repository, "target", "release", executableName),
   path.join(bundle, executableName),
 );
-await cp(
-  path.join(repository, "sidecar", "src"),
-  path.join(bundle, "sidecar", "src"),
-  { recursive: true },
-);
+for (const name of [
+  "benchmark-host.ts",
+  "browser-benchmark.ts",
+  "project-modules.ts",
+]) {
+  await copyFile(
+    path.join(repository, "sidecar", "src", name),
+    path.join(bundle, "sidecar", "src", name),
+  );
+}
 for (const name of ["package.json", "package-lock.json"]) {
   await copyFile(
     path.join(repository, "sidecar", name),
@@ -121,12 +126,23 @@ await writeFile(
   path.join(bundle, "BUILD.json"),
   `${JSON.stringify(
     {
-      schema_version: 1,
+      schema_version: 2,
       name: "bperf",
       version,
       platform: process.platform,
       architecture: process.arch,
       node: ">=24.12.0",
+      browser_adapters: {
+        chromium: "rust-chromium",
+        firefox: "rust-firefox",
+        webkit: "rust-webkit",
+      },
+      protocols: {
+        capture: 12,
+        benchmark_host: 2,
+        environment_schema: 5,
+        doctor_schema: 2,
+      },
       executable_sha256: executableSha256,
     },
     null,
