@@ -43,7 +43,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
         concat!(
             "{{",
             "\"bperf_version\":\"0.1.0\",",
-            "\"browser_lab_protocol_version\":12,",
+            "\"browser_lab_protocol_version\":13,",
             "\"host\":{{",
             "\"platform\":\"windows\",",
             "\"arch\":\"x64\",",
@@ -58,7 +58,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "\"playwright\":\"1.61.1\",",
             "\"chromium_revision\":\"1228\",",
             "\"executable_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
-            "\"protocol_version\":1,",
+            "\"protocol_version\":2,",
             "\"browser_workload_version\":1",
             "}},",
             "\"firefox\":{{",
@@ -66,7 +66,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "\"playwright\":\"1.61.1\",",
             "\"firefox_revision\":\"1532\",",
             "\"executable_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
-            "\"protocol_version\":1,",
+            "\"protocol_version\":2,",
             "\"browser_workload_version\":1",
             "}},",
             "\"webkit\":{{",
@@ -74,7 +74,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "\"playwright\":\"1.61.1\",",
             "\"webkit_revision\":\"test\",",
             "\"executable_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",",
-            "\"protocol_version\":1,",
+            "\"protocol_version\":2,",
             "\"browser_workload_version\":1",
             "}}",
             "}},",
@@ -115,7 +115,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
     fs::write(
         root.join("environment.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 5,
+            "schema_version": 6,
             "recorded_at_unix_ms": 1,
             "fingerprint": environment_fingerprint,
             "identity": identity,
@@ -144,6 +144,11 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             let path = artifact_dir.join(name);
             fs::write(&path, &bytes).unwrap();
             artifacts.push(serde_json::json!({
+                "capture_scope": if trial["engine"] == "firefox" {
+                    "browser-context"
+                } else {
+                    "page"
+                },
                 "kind": kind,
                 "path": path
                     .strip_prefix(root)
@@ -157,7 +162,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
         }
         lines.push(
             serde_json::to_string(&serde_json::json!({
-                "schema_version": 4,
+                "schema_version": 5,
                 "measurement_set_id": measurement_set_id,
                 "trial_id": trial["trial_id"],
                 "attempt": 1,

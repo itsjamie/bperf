@@ -28,7 +28,8 @@ use crate::{
         RUNTIME_ANCHOR_EXPRESSION, SETTLE_EXPRESSION, VERSION as BROWSER_WORKLOAD_VERSION,
         WORKLOAD_READY_EXPRESSION, WorkloadScript, bootstrap_source, decode_batch_size,
         decode_runtime_anchor, decode_workload, default_browser_config, installed_expression,
-        is_allowed_adapter_url, is_allowed_trial_url,
+        is_allowed_adapter_url, is_allowed_trial_url, is_benchmark_code_url,
+        location_contains_benchmark_code,
     },
     firefox_rdp::{FirefoxDebugSession, FirefoxHeapSnapshotFiles, free_port},
     lab::{
@@ -38,7 +39,7 @@ use crate::{
     },
 };
 
-pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1224,7 +1225,7 @@ fn target_window_ids(profile: &GeckoProfile, target_url: &str) -> HashSet<u64> {
     profile
         .pages
         .iter()
-        .filter(|page| page.url == target_url)
+        .filter(|page| is_benchmark_code_url(&page.url) || page.url == target_url)
         .map(|page| page.inner_window_id)
         .collect()
 }
@@ -1271,7 +1272,11 @@ fn stack_belongs_to_target(
         })
         .and_then(Value::as_u64);
     let result = inner_window_id.is_some_and(|id| target_window_ids.contains(&id))
-        || location.is_some_and(|location| location.contains(target_url))
+        || location.is_some_and(|location| {
+            location.contains(target_url)
+                || location_contains_benchmark_code(location)
+                || benchmark_worker_entry(location)
+        })
         || prefix
             .map(|prefix| {
                 stack_belongs_to_target(
@@ -1288,6 +1293,12 @@ fn stack_belongs_to_target(
     visiting.remove(&stack_index);
     cache.insert(stack_index, result);
     Ok(result)
+}
+
+fn benchmark_worker_entry(location: &str) -> bool {
+    location
+        .strip_prefix("WorkerThreadPrimaryRunnable::Run ")
+        .is_some_and(|script| script.starts_with('/') || location_contains_benchmark_code(script))
 }
 
 fn finish_capture_artifacts(
@@ -1649,6 +1660,24 @@ globalThis.__bperf = {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn gecko_worker_entry_attribution_accepts_only_benchmark_owned_scripts() {
+        for location in [
+            "WorkerThreadPrimaryRunnable::Run /worker.js",
+            "WorkerThreadPrimaryRunnable::Run http://localhost:4317/worker.js",
+            "WorkerThreadPrimaryRunnable::Run blob:http://127.0.0.1:4317/id",
+        ] {
+            assert!(benchmark_worker_entry(location), "{location}");
+        }
+        for location in [
+            "WorkerThreadPrimaryRunnable::Run resource://gre/modules/worker.js",
+            "WorkerThreadPrimaryRunnable::Run https://example.com/worker.js",
+            "DOM Worker",
+        ] {
+            assert!(!benchmark_worker_entry(location), "{location}");
+        }
     }
 
     #[test]

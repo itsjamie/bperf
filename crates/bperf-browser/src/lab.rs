@@ -19,7 +19,7 @@ use crate::{
     webkit::WebKitAdapter,
 };
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 const RUNTIME_ANCHOR_WORKLOAD: &str = "javascript_cpu_v1";
 const RUNTIME_ANCHOR_SAMPLES: usize = 31;
 const RUNTIME_ANCHOR_MAX_BATCH_SIZE: u32 = 64;
@@ -370,6 +370,9 @@ pub enum ArtifactKind {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ArtifactEvidence {
+    /// Stable trial-local label grouping the native CPU, heap, and flamegraph
+    /// files produced by one engine capture scope.
+    pub capture_scope: String,
     pub kind: ArtifactKind,
     pub path: String,
     pub size_bytes: u64,
@@ -819,7 +822,7 @@ mod tests {
             let fixture: GoldenCapture =
                 serde_json::from_slice(&fs::read(fixture_root.join("capture.json")).unwrap())
                     .unwrap();
-            assert_eq!(fixture.schema_version, 1);
+            assert_eq!(fixture.schema_version, 2);
             assert_eq!(fixture.engine, engine);
             validate_artifacts(engine, &fixture_root, &fixture.artifacts).unwrap();
         }
@@ -835,6 +838,7 @@ mod tests {
             let bytes = format!("artifact-{name}").into_bytes();
             fs::write(root.join(name), &bytes).unwrap();
             artifacts.push(ArtifactEvidence {
+                capture_scope: crate::artifacts::default_capture_scope(engine).to_owned(),
                 kind,
                 path: name.to_owned(),
                 size_bytes: bytes.len() as u64,
@@ -1026,7 +1030,7 @@ mod tests {
             &evidence,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid artifact set"));
+        assert!(error.to_string().contains("artifact scope"));
     }
 
     #[test]
@@ -1035,7 +1039,7 @@ mod tests {
         let mut evidence = valid_evidence(directory.path(), Engine::Chromium);
         evidence.artifacts.pop();
         let error = validate_evidence(Engine::Chromium, directory.path(), &evidence).unwrap_err();
-        assert!(error.to_string().contains("invalid artifact set"));
+        assert!(error.to_string().contains("artifact scope"));
     }
 
     #[test]

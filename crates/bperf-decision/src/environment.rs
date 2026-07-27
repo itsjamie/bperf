@@ -16,7 +16,7 @@ use bperf_measurement::store::MeasurementSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -160,7 +160,7 @@ fn read_path(path: &std::path::Path) -> Result<EnvironmentRecord> {
         .unwrap_or(0);
     if schema != u64::from(SCHEMA_VERSION) {
         bail!(
-            "unsupported environment schema {schema}; expected {SCHEMA_VERSION}; measurements made with former Node-owned browser adapters must be remeasured"
+            "unsupported environment schema {schema}; expected {SCHEMA_VERSION}; measurements made with earlier browser capture contracts must be remeasured"
         );
     }
     let record: EnvironmentRecord = serde_json::from_value(value).with_context(|| {
@@ -420,8 +420,8 @@ mod tests {
     use super::read_path;
 
     #[test]
-    fn former_node_browser_environments_require_remeasurement() {
-        for schema_version in [2, 3, 4] {
+    fn earlier_browser_environments_require_remeasurement() {
+        for schema_version in [2, 3, 4, 5] {
             let directory = tempdir().unwrap();
             let path = directory.path().join("environment.json");
             fs::write(
@@ -435,7 +435,7 @@ mod tests {
             .unwrap();
 
             let error = read_path(&path).unwrap_err().to_string();
-            assert!(error.contains("former Node-owned browser adapters"));
+            assert!(error.contains("earlier browser capture contracts"));
             assert!(error.contains("remeasured"));
         }
     }

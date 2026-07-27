@@ -18,8 +18,8 @@ use crate::{
     store::{MeasurementSet, TrialResult, write_immutable},
 };
 
-const SCHEMA_VERSION: u32 = 1;
-const POLICY: &str = "representative_per_workload_engine_v1";
+const SCHEMA_VERSION: u32 = 2;
+const POLICY: &str = "representative_per_workload_engine_scope_v2";
 const MANIFEST_NAME: &str = "artifact-retention.json";
 const CPU_METRIC: &str = "browser.cpu_profile.active_ms";
 const HEAP_METRIC: &str = "browser.js_heap.live_bytes";
@@ -165,14 +165,14 @@ fn build_manifest_from(
                 continue;
             }
             let cpu = representative(&results, CPU_METRIC)?;
-            selections.push(selection(
+            selections.extend(selections_for_kind(
                 workload_id,
                 *engine,
                 cpu,
                 CPU_METRIC,
                 ArtifactKind::CpuProfile,
             )?);
-            selections.push(selection(
+            selections.extend(selections_for_kind(
                 workload_id,
                 *engine,
                 cpu,
@@ -180,7 +180,7 @@ fn build_manifest_from(
                 ArtifactKind::Flamegraph,
             )?);
             let heap = representative(&results, HEAP_METRIC)?;
-            selections.push(selection(
+            selections.extend(selections_for_kind(
                 workload_id,
                 *engine,
                 heap,
@@ -190,11 +190,18 @@ fn build_manifest_from(
         }
     }
     selections.sort_by(|left, right| {
-        (&left.workload_id, left.engine.as_str(), left.artifact.kind).cmp(&(
-            &right.workload_id,
-            right.engine.as_str(),
-            right.artifact.kind,
-        ))
+        (
+            &left.workload_id,
+            left.engine.as_str(),
+            &left.artifact.capture_scope,
+            left.artifact.kind,
+        )
+            .cmp(&(
+                &right.workload_id,
+                right.engine.as_str(),
+                &right.artifact.capture_scope,
+                right.artifact.kind,
+            ))
     });
 
     let retained_artifacts = selections.len();
@@ -347,31 +354,34 @@ struct Representative<'a> {
     observed: f64,
 }
 
-fn selection(
+fn selections_for_kind(
     workload_id: &str,
     engine: Engine,
     representative: Representative<'_>,
     metric: &str,
     kind: ArtifactKind,
-) -> Result<RetainedArtifact> {
+) -> Result<Vec<RetainedArtifact>> {
     let result = representative.result;
-    let artifact = result
+    let artifacts = result
         .artifacts
         .iter()
-        .find(|artifact| artifact.kind == kind)
+        .filter(|artifact| artifact.kind == kind)
         .cloned()
-        .with_context(|| format!("trial {} has no {kind:?} artifact", result.trial_id))?;
-
-    Ok(RetainedArtifact {
-        workload_id: workload_id.to_owned(),
-        engine,
-        trial_id: result.trial_id.clone(),
-        attempt: result.attempt,
-        representative_metric: metric.to_owned(),
-        median_value: representative.median,
-        observed_value: representative.observed,
-        artifact,
-    })
+        .map(|artifact| RetainedArtifact {
+            workload_id: workload_id.to_owned(),
+            engine,
+            trial_id: result.trial_id.clone(),
+            attempt: result.attempt,
+            representative_metric: metric.to_owned(),
+            median_value: representative.median,
+            observed_value: representative.observed,
+            artifact,
+        })
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        bail!("trial {} has no {kind:?} artifact", result.trial_id);
+    }
+    Ok(artifacts)
 }
 
 fn validate_retained_files(root: &Path, manifest: &ArtifactRetention) -> Result<()> {
@@ -531,6 +541,19 @@ mod tests {
             assert_eq!(selection.median_value, 11.0);
             assert_eq!(selection.observed_value, 11.0);
         }
+        for engine in [Engine::Chromium, Engine::Webkit] {
+            for kind in [
+                ArtifactKind::CpuProfile,
+                ArtifactKind::JsHeap,
+                ArtifactKind::Flamegraph,
+            ] {
+                assert!(manifest.selections.iter().any(|selection| {
+                    selection.engine == engine
+                        && selection.artifact.capture_scope == "worker-1"
+                        && selection.artifact.kind == kind
+                }));
+            }
+        }
         MeasurementSet::open(&root).unwrap();
 
         let mut changed = manifest.clone();
@@ -558,35 +581,43 @@ mod tests {
     }
 
     fn synthetic_artifacts(root: &Path, trial_id: &str, engine: Engine) -> Vec<ArtifactEvidence> {
-        [
-            ArtifactKind::CpuProfile,
-            ArtifactKind::JsHeap,
-            ArtifactKind::Flamegraph,
-        ]
-        .iter()
-        .copied()
-        .map(|kind| {
-            let name = match kind {
-                ArtifactKind::CpuProfile => "cpu",
-                ArtifactKind::JsHeap => "heap",
-                ArtifactKind::Flamegraph => "flamegraph",
-            };
-            let relative = PathBuf::from("artifacts")
-                .join(trial_id)
-                .join(format!("{name}.txt"));
-            let path = root.join(&relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let bytes = format!("{trial_id}-{engine}-{name}").into_bytes();
-            fs::write(&path, &bytes).unwrap();
-            ArtifactEvidence {
-                kind,
-                path: relative.to_string_lossy().replace('\\', "/"),
-                size_bytes: bytes.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
-                format: "synthetic".to_owned(),
-            }
-        })
-        .collect()
+        let scopes: &[&str] = if engine == Engine::Firefox {
+            &["browser-context"]
+        } else {
+            &["page", "worker-1"]
+        };
+        scopes
+            .iter()
+            .flat_map(|scope| {
+                [
+                    ArtifactKind::CpuProfile,
+                    ArtifactKind::JsHeap,
+                    ArtifactKind::Flamegraph,
+                ]
+                .map(|kind| {
+                    let name = match kind {
+                        ArtifactKind::CpuProfile => "cpu",
+                        ArtifactKind::JsHeap => "heap",
+                        ArtifactKind::Flamegraph => "flamegraph",
+                    };
+                    let relative = PathBuf::from("artifacts")
+                        .join(trial_id)
+                        .join(format!("{scope}-{name}.txt"));
+                    let path = root.join(&relative);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    let bytes = format!("{trial_id}-{engine}-{scope}-{name}").into_bytes();
+                    fs::write(&path, &bytes).unwrap();
+                    ArtifactEvidence {
+                        capture_scope: (*scope).to_owned(),
+                        kind,
+                        path: relative.to_string_lossy().replace('\\', "/"),
+                        size_bytes: bytes.len() as u64,
+                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        format: "synthetic".to_owned(),
+                    }
+                })
+            })
+            .collect()
     }
 
     fn count_files(root: &Path) -> usize {

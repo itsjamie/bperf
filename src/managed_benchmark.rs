@@ -1231,14 +1231,14 @@ mod tests {
         let measurement_root = temporary
             .path()
             .join("measurements")
-            .join("measure-v4-test");
+            .join("measure-v5-test");
         fs::create_dir_all(&measurement_root).unwrap();
         fs::write(measurement_root.join("summary.json"), b"{}\n").unwrap();
 
         let later = record_measurement_index(MeasurementIndexOptions {
             measurement_root: &measurement_root,
             benchmark_id: "parser",
-            measurement_set_id: "measure-v4-test",
+            measurement_set_id: "measure-v5-test",
             recorded_at_unix_ms: 10,
             exit_code: 1,
             outcome: "negative",
@@ -1250,7 +1250,7 @@ mod tests {
         let earlier_options = MeasurementIndexOptions {
             measurement_root: &measurement_root,
             benchmark_id: "parser",
-            measurement_set_id: "measure-v4-test",
+            measurement_set_id: "measure-v5-test",
             recorded_at_unix_ms: 9,
             exit_code: 0,
             outcome: "positive",
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(receipt["recorded_at_unix_ms"], 10);
         assert_eq!(receipt["exit_code"], 1);
         assert_eq!(receipt["outcome"], "negative");
-        assert_eq!(receipt["measurement_set_id"], "measure-v4-test");
+        assert_eq!(receipt["measurement_set_id"], "measure-v5-test");
         assert!(
             receipt["measurement_summary"]
                 .as_str()

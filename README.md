@@ -36,6 +36,9 @@ Chromium, Firefox, and WebKit are one contract:
 - A missing capture capability fails before measurement. bperf does not
   silently drop an engine or artifact.
 - Correctness is checked independently in every engine.
+- Dedicated-worker and iframe execution is included in the same trial. Native
+  CPU, flamegraph, and heap evidence remains grouped by each engine's capture
+  scopes instead of being flattened or silently omitted.
 - Results stay indexed by benchmark case, engine, and metric. Raw measurements
   are not averaged across browsers.
 - Historical comparisons check a fresh runtime anchor in every engine before
@@ -134,7 +137,8 @@ export default defineBrowserBenchmark({
 
 The benchmark imports project code normally. `fixture()` turns a local file or
 remote source into a pinned, browser-reachable loopback URL. The subject still
-decides whether to use Fetch, XHR, streams, workers, or another browser API.
+decides whether to use Fetch, XHR, streams, dedicated workers, iframes, or
+another browser API.
 
 Put acquisition inside `measure()` when fetching or streaming is part of the
 behavior being measured. Move it to `setup()` when only the processing work

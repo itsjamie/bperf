@@ -1,8 +1,8 @@
 //! Complete capture-file identity, validation, and Speedscope construction.
 //!
 //! Native payload construction and sample/frame selection remain engine-specific.
-//! A prepared capture replaces exactly its three expected files and can finish
-//! only after producing nonempty CPU, heap, and flamegraph evidence.
+//! Each prepared capture scope replaces exactly its three expected files and
+//! can finish only after producing nonempty CPU, heap, and flamegraph evidence.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,77 +26,68 @@ const REQUIRED_KINDS: [ArtifactKind; 3] = [
 #[derive(Clone, Copy)]
 struct ArtifactSpec {
     kind: ArtifactKind,
-    name: &'static str,
+    suffix: &'static str,
     format: &'static str,
 }
 
-struct ArtifactLayout {
-    cpu_profile: ArtifactSpec,
-    heap_snapshot: ArtifactSpec,
-    flamegraph: ArtifactSpec,
+struct ArtifactFile {
+    spec: ArtifactSpec,
+    name: String,
 }
 
-impl ArtifactLayout {
-    const fn specs(&self) -> [ArtifactSpec; 3] {
-        [self.cpu_profile, self.heap_snapshot, self.flamegraph]
-    }
-}
-
-const CHROMIUM_LAYOUT: ArtifactLayout = ArtifactLayout {
-    cpu_profile: ArtifactSpec {
+const CHROMIUM_LAYOUT: [ArtifactSpec; 3] = [
+    ArtifactSpec {
         kind: ArtifactKind::CpuProfile,
-        name: "chromium.cpu.cpuprofile",
+        suffix: "cpu.cpuprofile",
         format: "V8 CPU profile",
     },
-    heap_snapshot: ArtifactSpec {
+    ArtifactSpec {
         kind: ArtifactKind::JsHeap,
-        name: "chromium.heap.heapsnapshot",
+        suffix: "heap.heapsnapshot",
         format: "V8 heap snapshot",
     },
-    flamegraph: ArtifactSpec {
+    ArtifactSpec {
         kind: ArtifactKind::Flamegraph,
-        name: "chromium.flamegraph.speedscope.json",
+        suffix: "flamegraph.speedscope.json",
         format: "Speedscope sampled profile",
     },
-};
-
-const FIREFOX_LAYOUT: ArtifactLayout = ArtifactLayout {
-    cpu_profile: ArtifactSpec {
+];
+const FIREFOX_LAYOUT: [ArtifactSpec; 3] = [
+    ArtifactSpec {
         kind: ArtifactKind::CpuProfile,
-        name: "firefox.cpu.json",
+        suffix: "cpu.json",
         format: "Gecko Profiler JSON",
     },
-    heap_snapshot: ArtifactSpec {
+    ArtifactSpec {
         kind: ArtifactKind::JsHeap,
-        name: "firefox.heap.fxsnapshot",
+        suffix: "heap.fxsnapshot",
         format: "Firefox .fxsnapshot",
     },
-    flamegraph: ArtifactSpec {
+    ArtifactSpec {
         kind: ArtifactKind::Flamegraph,
-        name: "firefox.flamegraph.speedscope.json",
+        suffix: "flamegraph.speedscope.json",
         format: "Speedscope sampled profiles",
     },
-};
-
-const WEBKIT_LAYOUT: ArtifactLayout = ArtifactLayout {
-    cpu_profile: ArtifactSpec {
+];
+const WEBKIT_LAYOUT: [ArtifactSpec; 3] = [
+    ArtifactSpec {
         kind: ArtifactKind::CpuProfile,
-        name: "webkit.cpu.json",
+        suffix: "cpu.json",
         format: "WebKit ScriptProfiler JSON",
     },
-    heap_snapshot: ArtifactSpec {
+    ArtifactSpec {
         kind: ArtifactKind::JsHeap,
-        name: "webkit.heap.json",
+        suffix: "heap.json",
         format: "WebKit Heap snapshot JSON",
     },
-    flamegraph: ArtifactSpec {
+    ArtifactSpec {
         kind: ArtifactKind::Flamegraph,
-        name: "webkit.flamegraph.speedscope.json",
+        suffix: "flamegraph.speedscope.json",
         format: "Speedscope sampled profile",
     },
-};
+];
 
-fn layout(engine: Engine) -> &'static ArtifactLayout {
+fn layout(engine: Engine) -> &'static [ArtifactSpec; 3] {
     match engine {
         Engine::Chromium => &CHROMIUM_LAYOUT,
         Engine::Firefox => &FIREFOX_LAYOUT,
@@ -104,18 +95,24 @@ fn layout(engine: Engine) -> &'static ArtifactLayout {
     }
 }
 
-/// Prepares and completes the three immutable files required for one capture.
+/// Prepares and completes the three immutable files required for one capture scope.
 ///
 /// Existing files at the engine's expected paths are replaced before capture.
 /// [`finish`](Self::finish) fails unless every required file is nonempty.
 pub(crate) struct CaptureArtifacts {
     engine: Engine,
+    capture_scope: String,
     root: PathBuf,
-    layout: &'static ArtifactLayout,
+    files: [ArtifactFile; 3],
 }
 
 impl CaptureArtifacts {
     pub(crate) fn prepare(engine: Engine, root: &Path) -> Result<Self> {
+        Self::prepare_scope(engine, root, default_capture_scope(engine))
+    }
+
+    pub(crate) fn prepare_scope(engine: Engine, root: &Path, capture_scope: &str) -> Result<Self> {
+        validate_capture_scope(capture_scope)?;
         fs::create_dir_all(root).with_context(|| {
             format!(
                 "failed to create {} artifact directory {}",
@@ -125,48 +122,91 @@ impl CaptureArtifacts {
         })?;
         let root = fs::canonicalize(root)
             .with_context(|| format!("failed to resolve artifact directory {}", root.display()))?;
-        let layout = layout(engine);
-        for spec in layout.specs() {
-            replace_existing(&root.join(spec.name))?;
+        let files = layout(engine).map(|spec| ArtifactFile {
+            spec,
+            name: artifact_name(engine, capture_scope, spec.suffix),
+        });
+        for file in &files {
+            replace_existing(&root.join(&file.name))?;
         }
         Ok(Self {
             engine,
+            capture_scope: capture_scope.to_owned(),
             root,
-            layout,
+            files,
         })
     }
 
     pub(crate) fn heap_snapshot_path(&self) -> PathBuf {
-        self.root.join(self.layout.heap_snapshot.name)
+        self.root.join(&self.file(ArtifactKind::JsHeap).name)
     }
 
     pub(crate) fn write_cpu_profile(&self, contents: impl AsRef<[u8]>) -> Result<()> {
-        self.write(self.layout.cpu_profile, contents.as_ref())
+        self.write(self.file(ArtifactKind::CpuProfile), contents.as_ref())
     }
 
     pub(crate) fn write_heap_snapshot(&self, contents: impl AsRef<[u8]>) -> Result<()> {
-        self.write(self.layout.heap_snapshot, contents.as_ref())
+        self.write(self.file(ArtifactKind::JsHeap), contents.as_ref())
     }
 
     pub(crate) fn write_flamegraph(&self, document: &SpeedscopeDocument) -> Result<()> {
-        self.write(self.layout.flamegraph, &serde_json::to_vec(document)?)
+        self.write(
+            self.file(ArtifactKind::Flamegraph),
+            &serde_json::to_vec(document)?,
+        )
     }
 
     pub(crate) fn finish(self) -> Result<Vec<ArtifactEvidence>> {
-        self.layout
-            .specs()
+        self.files
             .into_iter()
-            .map(|spec| describe_artifact(self.engine, &self.root, spec))
+            .map(|file| describe_artifact(self.engine, &self.capture_scope, &self.root, &file))
             .collect()
     }
 
-    fn write(&self, spec: ArtifactSpec, contents: &[u8]) -> Result<()> {
+    fn file(&self, kind: ArtifactKind) -> &ArtifactFile {
+        self.files
+            .iter()
+            .find(|file| file.spec.kind == kind)
+            .expect("artifact layouts contain every required kind")
+    }
+
+    fn write(&self, file: &ArtifactFile, contents: &[u8]) -> Result<()> {
         if contents.is_empty() {
-            bail!("{} emitted an empty {:?} artifact", self.engine, spec.kind);
+            bail!(
+                "{} emitted an empty {:?} artifact",
+                self.engine,
+                file.spec.kind
+            );
         }
-        let path = self.root.join(spec.name);
+        let path = self.root.join(&file.name);
         fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))
     }
+}
+
+pub(crate) const fn default_capture_scope(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Firefox => "browser-context",
+        Engine::Chromium | Engine::Webkit => "page",
+    }
+}
+
+fn artifact_name(engine: Engine, capture_scope: &str, suffix: &str) -> String {
+    let scope = (capture_scope != default_capture_scope(engine))
+        .then_some(format!(".{capture_scope}"))
+        .unwrap_or_default();
+    format!("{}{scope}.{suffix}", engine.as_str())
+}
+
+fn validate_capture_scope(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("capture scope must contain lowercase letters, digits, or dashes");
+    }
+    Ok(())
 }
 
 fn replace_existing(path: &Path) -> Result<()> {
@@ -181,8 +221,13 @@ fn replace_existing(path: &Path) -> Result<()> {
     }
 }
 
-fn describe_artifact(engine: Engine, root: &Path, spec: ArtifactSpec) -> Result<ArtifactEvidence> {
-    let path = root.join(spec.name);
+fn describe_artifact(
+    engine: Engine,
+    capture_scope: &str,
+    root: &Path,
+    file: &ArtifactFile,
+) -> Result<ArtifactEvidence> {
+    let path = root.join(&file.name);
     let canonical_path =
         fs::canonicalize(&path).with_context(|| format!("failed to resolve {}", path.display()))?;
     if !canonical_path.starts_with(root) {
@@ -198,11 +243,12 @@ fn describe_artifact(engine: Engine, root: &Path, spec: ArtifactSpec) -> Result<
         bail!("{engine} emitted an empty artifact: {}", path.display());
     }
     Ok(ArtifactEvidence {
-        kind: spec.kind,
-        path: spec.name.to_owned(),
+        capture_scope: capture_scope.to_owned(),
+        kind: file.spec.kind,
+        path: file.name.clone(),
         size_bytes,
         sha256: sha256_file(&canonical_path)?,
-        format: spec.format.to_owned(),
+        format: file.spec.format.to_owned(),
     })
 }
 
@@ -217,9 +263,40 @@ pub(crate) fn validate_artifacts(
 
 pub fn validate_artifact_set(engine: Engine, artifacts: &[ArtifactEvidence]) -> Result<()> {
     let expected_kinds = HashSet::from(REQUIRED_KINDS);
-    let actual_kinds: HashSet<_> = artifacts.iter().map(|artifact| artifact.kind).collect();
-    if actual_kinds != expected_kinds || artifacts.len() != REQUIRED_KINDS.len() {
-        bail!("{engine} returned an invalid artifact set: {actual_kinds:?}");
+    let mut scopes = HashMap::<&str, HashSet<ArtifactKind>>::new();
+    let mut paths = HashSet::new();
+    for artifact in artifacts {
+        validate_capture_scope(&artifact.capture_scope)
+            .with_context(|| format!("{engine} returned an invalid capture scope"))?;
+        if !paths.insert(artifact.path.as_str()) {
+            bail!(
+                "{engine} returned duplicate artifact path {}",
+                artifact.path
+            );
+        }
+        if !scopes
+            .entry(&artifact.capture_scope)
+            .or_default()
+            .insert(artifact.kind)
+        {
+            bail!(
+                "{engine} returned duplicate {:?} evidence for capture scope {}",
+                artifact.kind,
+                artifact.capture_scope
+            );
+        }
+    }
+    if scopes.is_empty() {
+        bail!("{engine} returned no artifact capture scopes");
+    }
+    let required_scope = default_capture_scope(engine);
+    if !scopes.contains_key(required_scope) {
+        bail!("{engine} returned no {required_scope} artifact capture scope");
+    }
+    for (scope, actual_kinds) in scopes {
+        if actual_kinds != expected_kinds {
+            bail!("{engine} returned an incomplete artifact scope {scope}: {actual_kinds:?}");
+        }
     }
 
     for artifact in artifacts {
@@ -569,8 +646,38 @@ mod tests {
                     .collect::<Vec<_>>(),
                 REQUIRED_KINDS
             );
+            assert!(
+                artifacts
+                    .iter()
+                    .all(|artifact| artifact.capture_scope == default_capture_scope(engine))
+            );
             validate_artifacts(engine, directory.path(), &artifacts).unwrap();
         }
+    }
+
+    #[test]
+    fn every_capture_scope_is_complete_and_has_distinct_files() {
+        let directory = tempdir().unwrap();
+        let mut artifacts = complete_artifacts(directory.path(), Engine::Chromium);
+        let worker =
+            CaptureArtifacts::prepare_scope(Engine::Chromium, directory.path(), "worker-1")
+                .unwrap();
+        worker.write_cpu_profile(b"worker cpu").unwrap();
+        fs::write(worker.heap_snapshot_path(), b"worker heap").unwrap();
+        worker.write_flamegraph(&test_flamegraph()).unwrap();
+        artifacts.extend(worker.finish().unwrap());
+
+        assert_eq!(artifacts.len(), 6);
+        assert!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.capture_scope == "worker-1")
+                .all(|artifact| artifact.path.starts_with("chromium.worker-1."))
+        );
+        validate_artifacts(Engine::Chromium, directory.path(), &artifacts).unwrap();
+
+        artifacts.pop();
+        assert!(validate_artifact_set(Engine::Chromium, &artifacts).is_err());
     }
 
     #[test]

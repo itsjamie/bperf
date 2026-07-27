@@ -92,21 +92,7 @@ impl FirefoxDebugSession {
             bail!("Firefox profiler was active before the CPU interval");
         }
         let started = response_value(
-            &self.rdp.request(json!({
-                "to": self.perf_actor,
-                "type": "startProfiler",
-                "options": {
-                    "entries": 1_000_000,
-                    "interval": 1,
-                    "features": ["js", "stackwalk", "cpu"],
-                    "threads": [
-                        "GeckoMain",
-                        "DOM Worker",
-                        "Renderer",
-                        "Compositor",
-                    ],
-                },
-            }))?,
+            &self.rdp.request(profiler_start_request(&self.perf_actor))?,
             "startProfiler",
         )?
         .as_bool()
@@ -203,6 +189,22 @@ impl FirefoxDebugSession {
             ))),
         }
     }
+}
+
+fn profiler_start_request(perf_actor: &str) -> Value {
+    json!({
+        "to": perf_actor,
+        "type": "startProfiler",
+        "entries": 1_000_000,
+        "interval": 1,
+        "features": ["js", "stackwalk", "cpu"],
+        "threads": [
+            "GeckoMain",
+            "DOM Worker",
+            "Renderer",
+            "Compositor",
+        ],
+    })
 }
 
 enum RdpMessage {
@@ -815,6 +817,21 @@ mod tests {
             (Some(("profiler".to_owned(), "profile".to_owned())), 42)
         );
         assert!(parse_rdp_header("bulk actor type nope").is_err());
+    }
+
+    #[test]
+    fn profiler_options_use_the_actor_wire_shape_and_include_workers() {
+        let request = profiler_start_request("profiler");
+        assert_eq!(request["to"], "profiler");
+        assert_eq!(request["type"], "startProfiler");
+        assert_eq!(request["interval"], 1);
+        assert!(request.get("options").is_none());
+        assert!(
+            request["threads"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("DOM Worker"))
+        );
     }
 
     #[test]

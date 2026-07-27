@@ -27,7 +27,7 @@ use crate::{
         RUNTIME_ANCHOR_EXPRESSION, SETTLE_EXPRESSION, VERSION as BROWSER_WORKLOAD_VERSION,
         WORKLOAD_READY_EXPRESSION, WorkloadScript, bootstrap_source, decode_batch_size,
         decode_runtime_anchor, decode_workload, default_browser_config, installed_expression,
-        is_allowed_adapter_url, is_allowed_trial_url,
+        is_allowed_adapter_url, is_allowed_trial_url, is_benchmark_code_url,
     },
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
@@ -36,7 +36,7 @@ use crate::{
     },
 };
 
-pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -81,6 +81,9 @@ const REQUIRED_PROTOCOL_COMMANDS: &[&str] = &[
     "ScriptProfiler.stopTracking",
     "Target.resume",
     "Target.sendMessageToTarget",
+    "Worker.enable",
+    "Worker.initialized",
+    "Worker.sendMessageToWorker",
 ];
 const REQUIRED_PROTOCOL_EVENTS: &[&str] = &[
     "Network.loadingFailed",
@@ -97,6 +100,9 @@ const REQUIRED_PROTOCOL_EVENTS: &[&str] = &[
     "Target.dispatchMessageFromTarget",
     "Target.targetCreated",
     "Target.targetDestroyed",
+    "Worker.dispatchMessageFromWorker",
+    "Worker.workerCreated",
+    "Worker.workerTerminated",
 ];
 const REQUIRED_PROTOCOL_PARAMETERS: &[(&str, &[&str])] = &[
     ("Network.requestIntercepted", &["requestId", "request"]),
@@ -119,6 +125,11 @@ const REQUIRED_PROTOCOL_PARAMETERS: &[(&str, &[&str])] = &[
     ),
     ("Runtime.releaseObject", &["objectId"]),
     ("Target.sendMessageToTarget", &["message", "targetId"]),
+    ("Worker.initialized", &["workerId"]),
+    ("Worker.sendMessageToWorker", &["message", "workerId"]),
+    ("Worker.dispatchMessageFromWorker", &["message", "workerId"]),
+    ("Worker.workerCreated", &["url", "workerId"]),
+    ("Worker.workerTerminated", &["workerId"]),
 ];
 
 #[derive(Clone)]
@@ -387,7 +398,6 @@ impl WebKitLane {
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TrialCapture> {
         let page = self.connection.open_page(request.browser)?;
         let result = (|| {
-            let artifacts = CaptureArtifacts::prepare(Engine::Webkit, request.artifact_root)?;
             self.connection
                 .navigate(&page.page_proxy_id, request.target_url)?;
             self.connection.wait_for_expression(
@@ -405,56 +415,52 @@ impl WebKitLane {
             let batch_size =
                 decode_batch_size(selected).context("WebKit batch calibration failed")?;
 
-            self.connection.clear_profile(&page.page_proxy_id)?;
-            self.connection.send_current_target(
-                &page.page_proxy_id,
-                "ScriptProfiler.startTracking",
-                json!({"includeSamples": true}),
-                REQUEST_TIMEOUT,
-            )?;
+            self.connection.start_profile_capture(&page.page_proxy_id)?;
             let workload = decode_workload(
                 self.connection
                     .evaluate(&page.page_proxy_id, &script.execute(batch_size))?,
             )
             .context("WebKit workload execution failed")?;
-            self.connection.send_current_target(
-                &page.page_proxy_id,
-                "ScriptProfiler.stopTracking",
-                json!({}),
-                REQUEST_TIMEOUT,
-            )?;
-            let profile = self
-                .connection
-                .wait_for_profile(&page.page_proxy_id, CAPTURE_TIMEOUT)?;
-            let cpu_active_ms = profile_cpu_active_milliseconds(&profile, request.target_url)?
-                / f64::from(batch_size);
+            let profiles = self.connection.stop_profile_capture(&page.page_proxy_id)?;
+            let cpu_active_ms = profiles.iter().try_fold(0.0, |total, realm| {
+                Ok::<_, anyhow::Error>(
+                    total + benchmark_profile_cpu_milliseconds(&realm.profile, request.target_url)?,
+                )
+            })? / f64::from(batch_size);
+            if !cpu_active_ms.is_finite() || cpu_active_ms <= 0.0 {
+                bail!("WebKit CPU profiles have no positive benchmark sample duration");
+            }
 
             self.connection
                 .evaluate(&page.page_proxy_id, SETTLE_EXPRESSION)?;
-            self.connection.send_current_target(
-                &page.page_proxy_id,
-                "Heap.enable",
-                json!({}),
-                REQUEST_TIMEOUT,
-            )?;
-            let heap = self.connection.send_current_target(
-                &page.page_proxy_id,
-                "Heap.snapshot",
-                json!({}),
-                CAPTURE_TIMEOUT,
-            )?;
-            let snapshot = heap
-                .get("snapshotData")
-                .and_then(Value::as_str)
-                .context("WebKit heap snapshot returned no data")?;
-            let heap_bytes = parse_live_heap_bytes(snapshot)?;
-            let artifacts =
-                finish_capture_artifacts(artifacts, &profile, snapshot, Some(request.target_url))?;
+            let mut heap_bytes = 0_u64;
+            let mut artifact_evidence = Vec::with_capacity(profiles.len() * 3);
+            for realm in profiles {
+                let snapshot = self
+                    .connection
+                    .capture_realm_heap(&page.page_proxy_id, &realm.descriptor.realm)?;
+                heap_bytes = heap_bytes
+                    .checked_add(parse_live_heap_bytes(&snapshot)?)
+                    .context("WebKit aggregate heap size overflowed")?;
+                let artifacts = CaptureArtifacts::prepare_scope(
+                    Engine::Webkit,
+                    request.artifact_root,
+                    &realm.descriptor.capture_scope,
+                )?;
+                artifact_evidence.extend(finish_capture_artifacts(
+                    artifacts,
+                    &realm.profile,
+                    &snapshot,
+                    Some(request.target_url),
+                )?);
+            }
+            self.connection
+                .finish_complete_capture(&page.page_proxy_id)?;
             Ok(TrialCapture {
                 workload,
                 cpu_active_ms,
                 js_heap_live_bytes: heap_bytes,
-                artifacts,
+                artifacts: artifact_evidence,
             })
         })();
         combine_page_close(result, self.connection.close_page(page))
@@ -569,7 +575,8 @@ struct PageRoute {
     current_target: Option<String>,
     provisional_target: Option<String>,
     targets: HashMap<String, TargetRoute>,
-    profile: Option<Value>,
+    capture_phase: WebKitCapturePhase,
+    next_worker_scope: usize,
     proxy_initialized: bool,
 }
 
@@ -580,11 +587,53 @@ struct TargetRoute {
     destroyed: bool,
     request_urls: HashMap<String, String>,
     pending_interceptions: HashSet<String>,
+    profile: Option<Value>,
+    profiler_started: bool,
+    workers: HashMap<String, WorkerRoute>,
+}
+
+#[derive(Clone)]
+struct WorkerRoute {
+    capture_scope: String,
+    url: String,
+    profile: Option<Value>,
+    profiler_started: bool,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum WebKitCapturePhase {
+    #[default]
+    Idle,
+    Profiling,
+    Finalizing,
 }
 
 struct OpenPage {
     browser_context_id: String,
     page_proxy_id: String,
+}
+
+#[derive(Clone)]
+enum WebKitRealm {
+    Page {
+        target_id: String,
+    },
+    Worker {
+        target_id: String,
+        worker_id: String,
+    },
+}
+
+#[derive(Clone)]
+struct WebKitRealmDescriptor {
+    capture_scope: String,
+    source_url: String,
+    realm: WebKitRealm,
+}
+
+struct WebKitRealmProfile {
+    descriptor: WebKitRealmDescriptor,
+    profile: Value,
 }
 
 trait InspectorTransport {
@@ -719,6 +768,37 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         self.send_target(page_proxy_id, &target, method, params, timeout)
     }
 
+    fn send_worker(
+        &mut self,
+        page_proxy_id: &str,
+        target_id: &str,
+        worker_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let id = self.allocate_id();
+        let message = serde_json::to_string(&json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+        let deadline = Instant::now() + timeout;
+        self.send_target(
+            page_proxy_id,
+            target_id,
+            "Worker.sendMessageToWorker",
+            json!({
+                "workerId": worker_id,
+                "message": message,
+            }),
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .with_context(|| format!("WebKit could not route {method} to worker {worker_id}"))?;
+        self.wait_for_response(id, deadline.saturating_duration_since(Instant::now()))
+            .with_context(|| format!("WebKit worker command {method} failed"))
+    }
+
     fn send_target_without_waiting(
         &mut self,
         page_proxy_id: &str,
@@ -824,7 +904,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                             current_target: None,
                             provisional_target: None,
                             targets: HashMap::new(),
-                            profile: None,
+                            capture_phase: WebKitCapturePhase::Idle,
+                            next_worker_scope: 1,
                             proxy_initialized: false,
                         });
                     self.replay_pending_page_messages(&page_proxy_id)?;
@@ -891,8 +972,11 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                 let info = params
                     .get("targetInfo")
                     .context("Target.targetCreated has no targetInfo")?;
-                if info.get("type").and_then(Value::as_str) != Some("page") {
-                    return Ok(());
+                let target_type = required_string(info, "type")?;
+                if target_type != "page" {
+                    bail!(
+                        "WebKit exposed a separate {target_type} target that its complete capture contract does not support"
+                    );
                 }
                 let target_id = required_string(info, "targetId")?;
                 let provisional = info
@@ -1080,13 +1164,150 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                     target.pending_interceptions.remove(request_id);
                 }
             }
-            Some("ScriptProfiler.trackingComplete") => {
-                if let Some(page) = self.pages.get_mut(page_proxy_id) {
-                    page.profile = Some(params);
+            Some("Worker.workerCreated") => {
+                let worker_id = required_string(&params, "workerId")?;
+                let url = required_string(&params, "url")?;
+                let (capture_scope, capture_phase) = {
+                    let page = self
+                        .pages
+                        .get_mut(page_proxy_id)
+                        .context("worker belongs to an unknown WebKit page")?;
+                    let capture_scope = format!("worker-{}", page.next_worker_scope);
+                    page.next_worker_scope = page
+                        .next_worker_scope
+                        .checked_add(1)
+                        .context("WebKit worker capture-scope counter overflowed")?;
+                    let replaced = page
+                        .targets
+                        .get_mut(target_id)
+                        .context("worker belongs to an unknown WebKit target")?
+                        .workers
+                        .insert(
+                            worker_id.clone(),
+                            WorkerRoute {
+                                capture_scope: capture_scope.clone(),
+                                url,
+                                profile: None,
+                                profiler_started: false,
+                            },
+                        );
+                    if replaced.is_some() {
+                        bail!("WebKit reported duplicate worker {worker_id}");
+                    }
+                    (capture_scope, page.capture_phase)
+                };
+                self.initialize_worker(
+                    page_proxy_id,
+                    target_id,
+                    &worker_id,
+                    &capture_scope,
+                    capture_phase,
+                )?;
+            }
+            Some("Worker.dispatchMessageFromWorker") => {
+                let worker_id = required_string(&params, "workerId")?;
+                let nested: Value = serde_json::from_str(
+                    params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .context("worker dispatch has no nested message")?,
+                )
+                .context("WebKit worker dispatched invalid JSON")?;
+                if let Some(id) = nested.get("id").and_then(Value::as_u64) {
+                    self.store_response(id, &nested);
+                } else if nested.get("method").and_then(Value::as_str)
+                    == Some("ScriptProfiler.trackingComplete")
+                {
+                    let profile = nested.get("params").cloned().unwrap_or_else(|| json!({}));
+                    self.pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(target_id))
+                        .and_then(|target| target.workers.get_mut(&worker_id))
+                        .context("profile belongs to an unknown WebKit worker")?
+                        .profile = Some(profile);
                 }
+            }
+            Some("Worker.workerTerminated") => {
+                let worker_id = required_string(&params, "workerId")?;
+                let page = self
+                    .pages
+                    .get_mut(page_proxy_id)
+                    .context("terminated worker belongs to an unknown WebKit page")?;
+                let worker = page
+                    .targets
+                    .get_mut(target_id)
+                    .and_then(|target| target.workers.remove(&worker_id));
+                if page.capture_phase != WebKitCapturePhase::Idle {
+                    self.fatal_error = Some(if worker.is_some() {
+                        "WebKit terminated a worker during complete capture".to_owned()
+                    } else {
+                        "WebKit terminated an unknown worker during complete capture".to_owned()
+                    });
+                }
+            }
+            Some("ScriptProfiler.trackingComplete") => {
+                self.pages
+                    .get_mut(page_proxy_id)
+                    .and_then(|page| page.targets.get_mut(target_id))
+                    .context("profile belongs to an unknown WebKit target")?
+                    .profile = Some(params);
             }
             Some(_) | None => {}
         }
+        Ok(())
+    }
+
+    fn initialize_worker(
+        &mut self,
+        page_proxy_id: &str,
+        target_id: &str,
+        worker_id: &str,
+        capture_scope: &str,
+        capture_phase: WebKitCapturePhase,
+    ) -> Result<()> {
+        self.send_worker(
+            page_proxy_id,
+            target_id,
+            worker_id,
+            "Runtime.enable",
+            json!({}),
+            REQUEST_TIMEOUT,
+        )?;
+        let installed = self.send_worker(
+            page_proxy_id,
+            target_id,
+            worker_id,
+            "Runtime.evaluate",
+            json!({
+                "expression": bootstrap_source(),
+                "returnByValue": true,
+                "doNotPauseOnExceptionsAndMuteConsole": false,
+            }),
+            REQUEST_TIMEOUT,
+        )?;
+        if installed
+            .get("wasThrown")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!("WebKit rejected the browser workload bootstrap in {capture_scope}");
+        }
+        match capture_phase {
+            WebKitCapturePhase::Idle => {}
+            WebKitCapturePhase::Profiling => {
+                self.start_worker_profiler(page_proxy_id, target_id, worker_id)?;
+            }
+            WebKitCapturePhase::Finalizing => {
+                bail!("WebKit created a worker after profile finalization began");
+            }
+        }
+        self.send_target(
+            page_proxy_id,
+            target_id,
+            "Worker.initialized",
+            json!({"workerId": worker_id}),
+            REQUEST_TIMEOUT,
+        )?;
         Ok(())
     }
 
@@ -1174,6 +1395,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         let bootstrap = bootstrap_source();
         for (method, params) in [
             ("Runtime.enable", json!({})),
+            ("Worker.enable", json!({})),
             ("Page.overrideUserAgent", json!({"value": user_agent})),
             ("Network.enable", json!({})),
             ("Network.setInterceptionEnabled", json!({"enabled": true})),
@@ -1322,7 +1544,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                     current_target: None,
                     provisional_target: None,
                     targets: HashMap::new(),
-                    profile: None,
+                    capture_phase: WebKitCapturePhase::Idle,
+                    next_worker_scope: 1,
                     proxy_initialized: false,
                 },
             );
@@ -1498,26 +1721,313 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
     }
 
     fn clear_profile(&mut self, page_proxy_id: &str) -> Result<()> {
+        let target_id = self.current_target(page_proxy_id)?;
         self.pages
             .get_mut(page_proxy_id)
-            .context("cannot profile an unknown WebKit page")?
+            .and_then(|page| page.targets.get_mut(&target_id))
+            .context("cannot profile an unknown WebKit target")?
             .profile = None;
         Ok(())
     }
 
     fn wait_for_profile(&mut self, page_proxy_id: &str, timeout: Duration) -> Result<Value> {
+        let target_id = self.current_target(page_proxy_id)?;
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(profile) = self
                 .pages
                 .get_mut(page_proxy_id)
-                .and_then(|page| page.profile.take())
+                .and_then(|page| page.targets.get_mut(&target_id))
+                .and_then(|target| target.profile.take())
             {
                 return Ok(profile);
             }
             self.check_fatal_error()?;
             self.pump_until(deadline)?;
         }
+    }
+
+    fn capture_realms(&self, page_proxy_id: &str) -> Result<Vec<WebKitRealmDescriptor>> {
+        let page = self
+            .pages
+            .get(page_proxy_id)
+            .context("cannot enumerate realms for an unknown WebKit page")?;
+        let target_id = page
+            .current_target
+            .clone()
+            .context("WebKit page has no current target")?;
+        let target = page
+            .targets
+            .get(&target_id)
+            .context("WebKit current target disappeared")?;
+        let mut realms = vec![WebKitRealmDescriptor {
+            capture_scope: "page".to_owned(),
+            source_url: String::new(),
+            realm: WebKitRealm::Page {
+                target_id: target_id.clone(),
+            },
+        }];
+        realms.extend(
+            target
+                .workers
+                .iter()
+                .map(|(worker_id, worker)| WebKitRealmDescriptor {
+                    capture_scope: worker.capture_scope.clone(),
+                    source_url: worker.url.clone(),
+                    realm: WebKitRealm::Worker {
+                        target_id: target_id.clone(),
+                        worker_id: worker_id.clone(),
+                    },
+                }),
+        );
+        realms.sort_by(|left, right| left.capture_scope.cmp(&right.capture_scope));
+        Ok(realms)
+    }
+
+    fn start_profile_capture(&mut self, page_proxy_id: &str) -> Result<()> {
+        let page = self
+            .pages
+            .get_mut(page_proxy_id)
+            .context("cannot profile an unknown WebKit page")?;
+        if page.capture_phase != WebKitCapturePhase::Idle {
+            bail!("WebKit profile capture is already active");
+        }
+        page.capture_phase = WebKitCapturePhase::Profiling;
+        let realms = self.capture_realms(page_proxy_id)?;
+        for descriptor in realms {
+            match descriptor.realm {
+                WebKitRealm::Page { target_id } => {
+                    self.pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(&target_id))
+                        .context("WebKit page target disappeared before profiling")?
+                        .profile = None;
+                    self.send_target(
+                        page_proxy_id,
+                        &target_id,
+                        "ScriptProfiler.startTracking",
+                        json!({"includeSamples": true}),
+                        REQUEST_TIMEOUT,
+                    )?;
+                    self.pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(&target_id))
+                        .context("WebKit page target disappeared while profiling began")?
+                        .profiler_started = true;
+                }
+                WebKitRealm::Worker {
+                    target_id,
+                    worker_id,
+                } => {
+                    self.pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(&target_id))
+                        .and_then(|target| target.workers.get_mut(&worker_id))
+                        .context("WebKit worker disappeared before profiling")?
+                        .profile = None;
+                    if !self
+                        .pages
+                        .get(page_proxy_id)
+                        .and_then(|page| page.targets.get(&target_id))
+                        .and_then(|target| target.workers.get(&worker_id))
+                        .is_some_and(|worker| worker.profiler_started)
+                    {
+                        self.start_worker_profiler(page_proxy_id, &target_id, &worker_id)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn start_worker_profiler(
+        &mut self,
+        page_proxy_id: &str,
+        target_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.send_worker(
+            page_proxy_id,
+            target_id,
+            worker_id,
+            "ScriptProfiler.startTracking",
+            json!({"includeSamples": true}),
+            REQUEST_TIMEOUT,
+        )?;
+        self.pages
+            .get_mut(page_proxy_id)
+            .and_then(|page| page.targets.get_mut(target_id))
+            .and_then(|target| target.workers.get_mut(worker_id))
+            .context("WebKit worker disappeared while profiling began")?
+            .profiler_started = true;
+        Ok(())
+    }
+
+    fn stop_profile_capture(&mut self, page_proxy_id: &str) -> Result<Vec<WebKitRealmProfile>> {
+        let page = self
+            .pages
+            .get_mut(page_proxy_id)
+            .context("cannot stop profiling an unknown WebKit page")?;
+        if page.capture_phase != WebKitCapturePhase::Profiling {
+            bail!("WebKit profile capture is not active");
+        }
+        page.capture_phase = WebKitCapturePhase::Finalizing;
+        let realms = self.capture_realms(page_proxy_id)?;
+        for descriptor in &realms {
+            match &descriptor.realm {
+                WebKitRealm::Page { target_id } => {
+                    let started = self
+                        .pages
+                        .get(page_proxy_id)
+                        .and_then(|page| page.targets.get(target_id))
+                        .is_some_and(|target| target.profiler_started);
+                    if !started {
+                        bail!("WebKit page was not included from the start of profile capture");
+                    }
+                    self.send_target(
+                        page_proxy_id,
+                        target_id,
+                        "ScriptProfiler.stopTracking",
+                        json!({}),
+                        REQUEST_TIMEOUT,
+                    )?;
+                    self.pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(target_id))
+                        .context("WebKit page disappeared during profile finalization")?
+                        .profiler_started = false;
+                }
+                WebKitRealm::Worker {
+                    target_id,
+                    worker_id,
+                } => {
+                    let started = self
+                        .pages
+                        .get(page_proxy_id)
+                        .and_then(|page| page.targets.get(target_id))
+                        .and_then(|target| target.workers.get(worker_id))
+                        .is_some_and(|worker| worker.profiler_started);
+                    if !started {
+                        bail!(
+                            "WebKit {} ({}) was not included from the start of profile capture",
+                            descriptor.capture_scope,
+                            descriptor.source_url
+                        );
+                    }
+                    self.send_worker(
+                        page_proxy_id,
+                        target_id,
+                        worker_id,
+                        "ScriptProfiler.stopTracking",
+                        json!({}),
+                        REQUEST_TIMEOUT,
+                    )?;
+                    self.pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(target_id))
+                        .and_then(|target| target.workers.get_mut(worker_id))
+                        .context("WebKit worker disappeared during profile finalization")?
+                        .profiler_started = false;
+                }
+            }
+        }
+
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        let mut profiles = Vec::with_capacity(realms.len());
+        for descriptor in realms {
+            let profile = loop {
+                let profile = match &descriptor.realm {
+                    WebKitRealm::Page { target_id } => self
+                        .pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(target_id))
+                        .and_then(|target| target.profile.take()),
+                    WebKitRealm::Worker {
+                        target_id,
+                        worker_id,
+                    } => self
+                        .pages
+                        .get_mut(page_proxy_id)
+                        .and_then(|page| page.targets.get_mut(target_id))
+                        .and_then(|target| target.workers.get_mut(worker_id))
+                        .and_then(|worker| worker.profile.take()),
+                };
+                if let Some(profile) = profile {
+                    break profile;
+                }
+                self.check_fatal_error()?;
+                self.pump_until(deadline)?;
+            };
+            parse_profile(&profile).with_context(|| {
+                format!(
+                    "WebKit {} CPU capture was invalid",
+                    descriptor.capture_scope
+                )
+            })?;
+            profiles.push(WebKitRealmProfile {
+                descriptor,
+                profile,
+            });
+        }
+        Ok(profiles)
+    }
+
+    fn capture_realm_heap(&mut self, page_proxy_id: &str, realm: &WebKitRealm) -> Result<String> {
+        let heap = match realm {
+            WebKitRealm::Page { target_id } => {
+                self.send_target(
+                    page_proxy_id,
+                    target_id,
+                    "Heap.enable",
+                    json!({}),
+                    REQUEST_TIMEOUT,
+                )?;
+                self.send_target(
+                    page_proxy_id,
+                    target_id,
+                    "Heap.snapshot",
+                    json!({}),
+                    CAPTURE_TIMEOUT,
+                )?
+            }
+            WebKitRealm::Worker {
+                target_id,
+                worker_id,
+            } => {
+                self.send_worker(
+                    page_proxy_id,
+                    target_id,
+                    worker_id,
+                    "Heap.enable",
+                    json!({}),
+                    REQUEST_TIMEOUT,
+                )?;
+                self.send_worker(
+                    page_proxy_id,
+                    target_id,
+                    worker_id,
+                    "Heap.snapshot",
+                    json!({}),
+                    CAPTURE_TIMEOUT,
+                )?
+            }
+        };
+        heap.get("snapshotData")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("WebKit heap snapshot returned no data")
+    }
+
+    fn finish_complete_capture(&mut self, page_proxy_id: &str) -> Result<()> {
+        let page = self
+            .pages
+            .get_mut(page_proxy_id)
+            .context("cannot finish capture for an unknown WebKit page")?;
+        if page.capture_phase != WebKitCapturePhase::Finalizing {
+            bail!("WebKit complete capture was not being finalized");
+        }
+        page.capture_phase = WebKitCapturePhase::Idle;
+        self.check_fatal_error()
     }
 
     fn close_page(&mut self, page: OpenPage) -> Result<()> {
@@ -1652,16 +2162,13 @@ fn target_traces(value: &Value, target_url: &str) -> Result<Vec<WebKitStackTrace
             trace
                 .stack_frames
                 .iter()
-                .any(|frame| frame.url.starts_with(target_url))
+                .any(|frame| is_benchmark_code_url(&frame.url) || frame.url.starts_with(target_url))
         })
         .collect())
 }
 
-fn profile_cpu_active_milliseconds(value: &Value, target_url: &str) -> Result<f64> {
+fn benchmark_profile_cpu_milliseconds(value: &Value, target_url: &str) -> Result<f64> {
     let count = target_traces(value, target_url)?.len();
-    if count == 0 {
-        bail!("WebKit CPU profile has no positive sample duration");
-    }
     Ok(count as f64)
 }
 
@@ -1713,6 +2220,9 @@ fn webkit_speedscope(profile: &Value, target_url: Option<&str>) -> Result<Speeds
             .unwrap_or_default()
     };
     if traces.is_empty() {
+        if target_url.is_some() {
+            return webkit_speedscope(profile, None);
+        }
         bail!("WebKit CPU profile contains no Speedscope samples");
     }
     let mut builder = SpeedscopeBuilder::new("WebKit CPU", "bperf Rust WebKit adapter");
@@ -1839,6 +2349,16 @@ mod tests {
         })
     }
 
+    fn worker_dispatch(nested: Value) -> Value {
+        target_dispatch(json!({
+            "method": "Worker.dispatchMessageFromWorker",
+            "params": {
+                "workerId": "worker",
+                "message": serde_json::to_string(&nested).unwrap(),
+            }
+        }))
+    }
+
     fn route(current: &str, provisional: Option<&str>) -> PageRoute {
         let mut targets = HashMap::new();
         targets.insert(
@@ -1857,7 +2377,8 @@ mod tests {
             current_target: Some(current.to_owned()),
             provisional_target: provisional.map(str::to_owned),
             targets,
-            profile: None,
+            capture_phase: WebKitCapturePhase::Idle,
+            next_worker_scope: 1,
             proxy_initialized: true,
         }
     }
@@ -2014,7 +2535,7 @@ globalThis.__bperf = {
             serde_json::from_slice(&fs::read(fixture("cpu.json")).unwrap()).unwrap();
         let heap = fs::read_to_string(fixture("heap.json")).unwrap();
         assert_eq!(
-            profile_cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").unwrap(),
+            benchmark_profile_cpu_milliseconds(&profile, "http://127.0.0.1:4317/").unwrap(),
             2.0
         );
         assert_eq!(parse_live_heap_bytes(&heap).unwrap(), 96);
@@ -2034,12 +2555,13 @@ globalThis.__bperf = {
         assert!(parse_live_heap_bytes("{}").is_err());
         assert!(parse_live_heap_bytes(r#"{"nodes":[1,2,3]}"#).is_err());
         assert!(parse_live_heap_bytes(r#"{"nodes":[1,-1,0,0]}"#).is_err());
-        assert!(
-            profile_cpu_active_milliseconds(
+        assert_eq!(
+            benchmark_profile_cpu_milliseconds(
                 &json!({"samples":{"stackTraces":[]}}),
                 "http://127.0.0.1/"
             )
-            .is_err()
+            .unwrap(),
+            0.0
         );
     }
 
@@ -2125,6 +2647,93 @@ globalThis.__bperf = {
             connection.pages["proxy"].targets["target"].load_fired,
             "nested page events must update the matching target"
         );
+    }
+
+    #[test]
+    fn nested_worker_responses_profiles_and_scopes_route_to_their_worker() {
+        let mut connection = InspectorConnection::new(
+            FakeTransport::default(),
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        let mut page = route("target", None);
+        page.targets.get_mut("target").unwrap().workers.insert(
+            "worker".to_owned(),
+            WorkerRoute {
+                capture_scope: "worker-1".to_owned(),
+                url: "http://127.0.0.1:4317/worker.js".to_owned(),
+                profile: None,
+                profiler_started: true,
+            },
+        );
+        connection.pages.insert("proxy".to_owned(), page);
+
+        connection
+            .dispatch_page_message(
+                "proxy",
+                worker_dispatch(json!({
+                    "id": 41,
+                    "result": {"value": 42}
+                })),
+            )
+            .unwrap();
+        assert_eq!(
+            connection.responses.remove(&41).unwrap().unwrap(),
+            json!({"value": 42})
+        );
+
+        let profile = json!({"samples": {"stackTraces": []}});
+        connection
+            .dispatch_page_message(
+                "proxy",
+                worker_dispatch(json!({
+                    "method": "ScriptProfiler.trackingComplete",
+                    "params": profile
+                })),
+            )
+            .unwrap();
+        assert_eq!(
+            connection.pages["proxy"].targets["target"].workers["worker"].profile,
+            Some(profile)
+        );
+
+        let realms = connection.capture_realms("proxy").unwrap();
+        assert_eq!(
+            realms
+                .iter()
+                .map(|realm| realm.capture_scope.as_str())
+                .collect::<Vec<_>>(),
+            ["page", "worker-1"]
+        );
+    }
+
+    #[test]
+    fn separate_webkit_child_targets_fail_instead_of_losing_evidence() {
+        let mut connection = InspectorConnection::new(
+            FakeTransport::default(),
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        connection
+            .pages
+            .insert("proxy".to_owned(), route("target", None));
+        let error = connection
+            .dispatch_page_message(
+                "proxy",
+                json!({
+                    "method": "Target.targetCreated",
+                    "params": {
+                        "targetInfo": {
+                            "targetId": "frame",
+                            "type": "frame"
+                        }
+                    }
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("separate frame target"));
+        assert!(error.contains("complete capture contract"));
     }
 
     #[test]

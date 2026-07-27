@@ -1,8 +1,9 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "engine": "chromium",
   "artifacts": [
     {
+      "capture_scope": "page",
       "kind": "cpu_profile",
       "path": "cpu.json",
       "size_bytes": 276,
@@ -10,6 +11,7 @@
       "format": "V8 CPU profile"
     },
     {
+      "capture_scope": "page",
       "kind": "js_heap",
       "path": "heap.json",
       "size_bytes": 99,
@@ -17,6 +19,7 @@
       "format": "V8 heap snapshot"
     },
     {
+      "capture_scope": "page",
       "kind": "flamegraph",
       "path": "flamegraph.json",
       "size_bytes": 451,

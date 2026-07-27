@@ -138,9 +138,9 @@ await writeFile(
         webkit: "rust-webkit",
       },
       protocols: {
-        capture: 12,
+        capture: 13,
         benchmark_host: 2,
-        environment_schema: 5,
+        environment_schema: 6,
         doctor_schema: 2,
       },
       executable_sha256: executableSha256,

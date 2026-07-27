@@ -1359,7 +1359,7 @@ mod tests {
     ) {
         for trial in measurement.pending_trials() {
             let metric_value = metric_value(trial);
-            let artifacts = synthetic_artifacts(measurement.root(), &trial.trial_id);
+            let artifacts = synthetic_artifacts(measurement.root(), &trial.trial_id, trial.engine);
             measurement
                 .append_result(&TrialResult {
                     schema_version: MEASUREMENT_SCHEMA_VERSION,
@@ -1391,7 +1391,7 @@ mod tests {
         }
     }
 
-    fn synthetic_artifacts(root: &Path, trial_id: &str) -> Vec<ArtifactEvidence> {
+    fn synthetic_artifacts(root: &Path, trial_id: &str, engine: Engine) -> Vec<ArtifactEvidence> {
         [
             ArtifactKind::CpuProfile,
             ArtifactKind::JsHeap,
@@ -1413,6 +1413,11 @@ mod tests {
             let bytes = format!("{trial_id}-{name}").into_bytes();
             fs::write(&path, &bytes).unwrap();
             ArtifactEvidence {
+                capture_scope: match engine {
+                    Engine::Firefox => "browser-context",
+                    Engine::Chromium | Engine::Webkit => "page",
+                }
+                .to_owned(),
                 kind,
                 path: relative.to_string_lossy().replace('\\', "/"),
                 size_bytes: bytes.len() as u64,

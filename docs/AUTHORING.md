@@ -89,6 +89,37 @@ Every trial gets a new browser context and page. `setup()` therefore cannot
 carry state between trials. The browser process is retained within an engine's
 measurement lane so startup does not dominate short workloads.
 
+## Dedicated workers and iframes
+
+Code run by page-owned dedicated workers and same-origin or cross-origin
+loopback iframes is part of the trial's browser evidence. Await measured child
+work before `measure()` resolves so wall timing and CPU evidence describe the
+complete semantic operation:
+
+```ts
+async measure() {
+  const worker = new Worker(new URL("./parser-worker.ts", import.meta.url), {
+    type: "module",
+  });
+  const result = await runWorker(worker);
+  worker.terminate();
+  return result;
+}
+```
+
+If the measured operation leaves asynchronous child work that must affect the
+heap, retain the relevant objects and await completion in `settle()`. Work done
+by `settle()` remains outside wall and CPU metrics.
+
+One trial may retain several native artifact groups called capture scopes.
+Chromium and WebKit expose some child realms separately; Firefox captures the
+browser context as one group. Capture scopes are diagnostic evidence, not
+additional benchmark cases, and bperf aggregates their CPU and live-heap
+scalars within each engine.
+
+Shared workers and service workers are not part of the common capture contract.
+Use the advanced protocol when a subject requires either lifecycle.
+
 ## Choose the measurement boundary
 
 The most important authoring decision is what belongs in `measure()`.

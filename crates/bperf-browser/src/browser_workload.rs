@@ -157,6 +157,20 @@ pub(crate) fn is_allowed_trial_url(value: &str) -> bool {
     })
 }
 
+/// Profiler URLs are benchmark-owned when the same isolated-page network
+/// policy would have admitted them. This includes worker blobs, data URLs, and
+/// iframe scripts served from a different loopback origin.
+pub(crate) fn is_benchmark_code_url(value: &str) -> bool {
+    is_allowed_trial_url(value)
+}
+
+pub(crate) fn location_contains_benchmark_code(value: &str) -> bool {
+    ["http://", "https://", "blob:", "data:", "about:"]
+        .iter()
+        .flat_map(|marker| value.match_indices(marker).map(|(index, _)| index))
+        .any(|index| is_benchmark_code_url(&value[index..]))
+}
+
 fn split_url(value: &str) -> Option<(&str, &str)> {
     if value.chars().any(|character| {
         character.is_ascii_control() || character.is_whitespace() || character == '\\'
@@ -230,6 +244,29 @@ mod tests {
         }
         assert!(is_allowed_adapter_url("http://127.0.0.1:4317/"));
         assert!(!is_allowed_adapter_url("https://127.0.0.1:4317/"));
+    }
+
+    #[test]
+    fn profiler_attribution_includes_local_frames_workers_and_inline_realms() {
+        for location in [
+            "http://localhost:4317/frame.js",
+            "blob:http://127.0.0.1:4317/worker-id",
+            "data:text/javascript,postMessage(1)",
+            "about:srcdoc",
+            "workerLoop (http://[::1]:4317/worker.js:10:2)",
+            "dispatch https://example.com/then http://localhost:4317/frame.js",
+        ] {
+            assert!(
+                location_contains_benchmark_code(location),
+                "expected benchmark-owned profiler location: {location}"
+            );
+        }
+        assert!(!location_contains_benchmark_code(
+            "dispatch (resource://gre/modules/Timer.sys.mjs:1:1)"
+        ));
+        assert!(!location_contains_benchmark_code(
+            "tracker (https://example.com/worker.js:1:1)"
+        ));
     }
 
     #[test]

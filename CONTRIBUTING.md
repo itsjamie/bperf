@@ -49,6 +49,7 @@ cargo test -p bperf-browser chromium::tests::browser_lab_uses_fresh_contexts_and
 cargo test -p bperf-browser firefox::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
 cargo test -p bperf-browser webkit::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
 cargo test -p bperf-browser lab::tests::retained_lanes_keep_one_root_pid_and_shutdown_all_contained_processes -- --ignored --exact
+cargo test -p bperf-browser --test child_realms -- --ignored
 cargo test --test measurement_contract variants_can_be_measured_and_compared_on_every_engine -- --ignored --exact
 cargo test managed_benchmark_satisfies_every_engine_contract -- --ignored
 ```
@@ -62,7 +63,8 @@ process sandbox; do not disable it to make a test pass.
 A capture change is not complete until every requested artifact succeeds on
 all three engines. Do not add a shared path that silently supports only
 Chromium or only the engines exposed through a public Playwright protocol
-session.
+session. The child-realm gate must prove that named page, dedicated-worker, and
+cross-origin iframe work appears in native evidence on every engine.
 
 Run the direct Chromium, Firefox, and WebKit gates on every platform targeted
 by the release.

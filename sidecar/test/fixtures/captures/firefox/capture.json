@@ -1,8 +1,9 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "engine": "firefox",
   "artifacts": [
     {
+      "capture_scope": "browser-context",
       "kind": "cpu_profile",
       "path": "cpu.json",
       "size_bytes": 358,
@@ -10,6 +11,7 @@
       "format": "Gecko Profiler JSON"
     },
     {
+      "capture_scope": "browser-context",
       "kind": "js_heap",
       "path": "heap.fxsnapshot",
       "size_bytes": 62,
@@ -17,6 +19,7 @@
       "format": "Firefox .fxsnapshot"
     },
     {
+      "capture_scope": "browser-context",
       "kind": "flamegraph",
       "path": "flamegraph.json",
       "size_bytes": 393,

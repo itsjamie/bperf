@@ -28,7 +28,7 @@ use crate::{
         RUNTIME_ANCHOR_EXPRESSION, SETTLE_EXPRESSION, VERSION as BROWSER_WORKLOAD_VERSION,
         WORKLOAD_READY_EXPRESSION, WorkloadScript, bootstrap_source, decode_batch_size,
         decode_runtime_anchor, decode_workload, default_browser_config, installed_expression,
-        is_allowed_adapter_url, is_allowed_trial_url,
+        is_allowed_adapter_url, is_allowed_trial_url, is_benchmark_code_url,
     },
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
@@ -37,7 +37,7 @@ use crate::{
     },
 };
 
-pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -310,7 +310,6 @@ impl ChromiumLane {
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TrialCapture> {
         let page = self.connection.open_page(request.browser)?;
         let result = (|| {
-            let artifacts = CaptureArtifacts::prepare(Engine::Chromium, request.artifact_root)?;
             self.connection
                 .navigate(&page.session_id, request.target_url)?;
             self.connection.wait_for_expression(
@@ -328,53 +327,51 @@ impl ChromiumLane {
             let batch_size =
                 decode_batch_size(selected).context("Chromium batch calibration failed")?;
 
-            self.connection.send_session(
-                &page.session_id,
-                "Profiler.enable",
-                json!({}),
-                REQUEST_TIMEOUT,
-            )?;
-            self.connection.send_session(
-                &page.session_id,
-                "Profiler.start",
-                json!({}),
-                REQUEST_TIMEOUT,
-            )?;
+            self.connection.start_profile_capture()?;
             let workload = decode_workload(
                 self.connection
                     .evaluate(&page.session_id, &script.execute(batch_size))?,
             )
             .context("Chromium workload execution failed")?;
-            let stopped = self.connection.send_session(
-                &page.session_id,
-                "Profiler.stop",
-                json!({}),
-                CAPTURE_TIMEOUT,
-            )?;
-            let profile = stopped
-                .get("profile")
-                .cloned()
-                .context("Chromium CPU capture returned no profile")?;
-            let parsed = parse_cpu_profile(&profile)?;
-            if parsed.samples.is_empty() {
-                bail!("Chromium CPU profile did not contain samples");
+            let profiles = self.connection.stop_profile_capture()?;
+            let cpu_active_ms = profiles.iter().try_fold(0.0, |total, realm| {
+                Ok::<_, anyhow::Error>(
+                    total + benchmark_cpu_milliseconds(&realm.profile, request.target_url)?,
+                )
+            })? / f64::from(batch_size);
+            if !cpu_active_ms.is_finite() || cpu_active_ms <= 0.0 {
+                bail!("Chromium CPU profiles have no positive benchmark sample duration");
             }
-            let cpu_active_ms =
-                cpu_active_milliseconds(&parsed, request.target_url)? / f64::from(batch_size);
 
             self.connection
                 .evaluate(&page.session_id, SETTLE_EXPRESSION)?;
-            let heap_path = artifacts.heap_snapshot_path();
-            self.connection
-                .capture_heap_snapshot(&page.session_id, &heap_path)?;
-            let heap_bytes = parse_live_heap_bytes(&heap_path)?;
-            let artifacts =
-                finish_capture_artifacts(artifacts, &profile, &parsed, Some(request.target_url))?;
+            let mut heap_bytes = 0_u64;
+            let mut artifact_evidence = Vec::with_capacity(profiles.len() * 3);
+            for realm in profiles {
+                let artifacts = CaptureArtifacts::prepare_scope(
+                    Engine::Chromium,
+                    request.artifact_root,
+                    &realm.capture_scope,
+                )?;
+                let heap_path = artifacts.heap_snapshot_path();
+                self.connection
+                    .capture_heap_snapshot(&realm.session_id, &heap_path)?;
+                heap_bytes = heap_bytes
+                    .checked_add(parse_live_heap_bytes(&heap_path)?)
+                    .context("Chromium aggregate heap size overflowed")?;
+                artifact_evidence.extend(finish_capture_artifacts(
+                    artifacts,
+                    &realm.source,
+                    &realm.profile,
+                    Some(request.target_url),
+                )?);
+            }
+            self.connection.finish_complete_capture()?;
             Ok(TrialCapture {
                 workload,
                 cpu_active_ms,
                 js_heap_live_bytes: heap_bytes,
-                artifacts,
+                artifacts: artifact_evidence,
             })
         })();
         combine_page_close(result, self.connection.close_page(page))
@@ -482,9 +479,32 @@ struct OpenPage {
     session_id: String,
 }
 
-#[derive(Default)]
 struct SessionState {
     load_fired: bool,
+    target_id: String,
+    target_type: String,
+    capture_scope: Option<String>,
+    profiler_started: bool,
+}
+
+impl SessionState {
+    fn page(target_id: String) -> Self {
+        Self {
+            load_fired: false,
+            target_id,
+            target_type: "page".to_owned(),
+            capture_scope: Some("page".to_owned()),
+            profiler_started: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum CapturePhase {
+    #[default]
+    Idle,
+    Profiling,
+    Finalizing,
 }
 
 trait CdpTransport {
@@ -517,6 +537,13 @@ struct HeapCapture {
     chunks: usize,
 }
 
+struct ChromiumRealmProfile {
+    session_id: String,
+    capture_scope: String,
+    source: Value,
+    profile: ChromiumProfile,
+}
+
 struct CdpConnection<Transport: CdpTransport> {
     process: Transport,
     download_directory: PathBuf,
@@ -525,6 +552,9 @@ struct CdpConnection<Transport: CdpTransport> {
     ignored_responses: HashSet<u64>,
     sessions: HashMap<String, SessionState>,
     primary_sessions: HashSet<String>,
+    capture_phase: CapturePhase,
+    next_worker_scope: usize,
+    next_iframe_scope: usize,
     heap_capture: Option<HeapCapture>,
     fatal_error: Option<String>,
 }
@@ -539,6 +569,9 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             ignored_responses: HashSet::new(),
             sessions: HashMap::new(),
             primary_sessions: HashSet::new(),
+            capture_phase: CapturePhase::Idle,
+            next_worker_scope: 1,
+            next_iframe_scope: 1,
             heap_capture: None,
             fatal_error: None,
         }
@@ -650,8 +683,10 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             .map(str::to_owned);
         match method {
             "Page.loadEventFired" => {
-                if let Some(session_id) = session_id {
-                    self.sessions.entry(session_id).or_default().load_fired = true;
+                if let Some(session_id) = session_id
+                    && let Some(session) = self.sessions.get_mut(&session_id)
+                {
+                    session.load_fired = true;
                 }
                 Ok(None)
             }
@@ -689,32 +724,52 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             }
             "Target.attachedToTarget" => {
                 let child_session = required_string(&params, "sessionId")?;
-                let target_type = params
+                let target_info = params
                     .get("targetInfo")
-                    .and_then(|info| info.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+                    .context("Chromium attached target has no targetInfo")?;
+                let target_type = required_string(target_info, "type")?;
+                let target_id = required_string(target_info, "targetId")?;
                 let waiting = params
                     .get("waitingForDebugger")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                if !matches!(
+                    target_type.as_str(),
+                    "worker" | "iframe" | "shared_worker" | "service_worker"
+                ) {
+                    if waiting {
+                        bail!(
+                            "Chromium auto-attached unsupported paused target type {target_type:?}"
+                        );
+                    }
+                    return Ok(None);
+                }
                 if waiting {
-                    self.sessions.entry(child_session.clone()).or_default();
                     Ok(Some(CdpAction::InitializeTarget {
                         session_id: child_session,
+                        target_id,
                         target_type,
                     }))
                 } else {
+                    self.fatal_error = Some(format!(
+                        "Chromium attached {target_type} target {target_id} without pausing it; complete child-realm capture is unavailable"
+                    ));
                     Ok(None)
                 }
             }
             "Target.detachedFromTarget" => {
                 if let Some(detached) = params.get("sessionId").and_then(Value::as_str) {
-                    self.sessions.remove(detached);
+                    let detached_state = self.sessions.remove(detached);
                     if self.primary_sessions.contains(detached) {
                         self.fatal_error =
                             Some("Chromium detached the active page target".to_owned());
+                    } else if self.capture_phase != CapturePhase::Idle
+                        && detached_state.is_some_and(|state| state.capture_scope.is_some())
+                    {
+                        self.fatal_error = Some(
+                            "Chromium detached a worker or iframe during complete capture"
+                                .to_owned(),
+                        );
                     }
                 }
                 Ok(None)
@@ -758,19 +813,55 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             }
             CdpAction::InitializeTarget {
                 session_id,
+                target_id,
                 target_type,
-            } => self.initialize_autoattached_target(&session_id, &target_type),
+            } => self.initialize_autoattached_target(&session_id, &target_id, &target_type),
         }
     }
 
     fn initialize_autoattached_target(
         &mut self,
         session_id: &str,
+        target_id: &str,
         target_type: &str,
     ) -> Result<()> {
+        let capture_scope = match target_type {
+            "worker" => {
+                let scope = format!("worker-{}", self.next_worker_scope);
+                self.next_worker_scope = self
+                    .next_worker_scope
+                    .checked_add(1)
+                    .context("Chromium worker capture-scope counter overflowed")?;
+                Some(scope)
+            }
+            "iframe" => {
+                let scope = format!("iframe-{}", self.next_iframe_scope);
+                self.next_iframe_scope = self
+                    .next_iframe_scope
+                    .checked_add(1)
+                    .context("Chromium iframe capture-scope counter overflowed")?;
+                Some(scope)
+            }
+            "shared_worker" | "service_worker" => {
+                bail!(
+                    "Chromium {target_type} targets are not supported by the complete capture contract; use a dedicated Worker"
+                )
+            }
+            other => bail!("Chromium auto-attached unsupported target type {other:?}"),
+        };
+        self.sessions.insert(
+            session_id.to_owned(),
+            SessionState {
+                load_fired: false,
+                target_id: target_id.to_owned(),
+                target_type: target_type.to_owned(),
+                capture_scope,
+                profiler_started: false,
+            },
+        );
         self.send_session(session_id, "Runtime.enable", json!({}), REQUEST_TIMEOUT)?;
-        self.enable_fetch(session_id)?;
         if target_type == "iframe" {
+            self.enable_fetch(session_id)?;
             self.send_session(
                 session_id,
                 "Page.addScriptToEvaluateOnNewDocument",
@@ -779,6 +870,11 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             )?;
         }
         self.install_bootstrap(session_id)?;
+        if self.capture_phase == CapturePhase::Profiling {
+            self.start_profiler(session_id)?;
+        } else if self.capture_phase == CapturePhase::Finalizing {
+            bail!("Chromium created a worker or iframe after profile finalization began");
+        }
         self.send_session(
             session_id,
             "Runtime.runIfWaitingForDebugger",
@@ -820,8 +916,12 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             REQUEST_TIMEOUT,
         )?;
         let session_id = required_string(&attached, "sessionId")?;
-        self.sessions.entry(session_id.clone()).or_default();
+        self.sessions
+            .insert(session_id.clone(), SessionState::page(target_id.clone()));
         self.primary_sessions.insert(session_id.clone());
+        self.capture_phase = CapturePhase::Idle;
+        self.next_worker_scope = 1;
+        self.next_iframe_scope = 1;
         if let Err(error) = self.configure_page(&session_id, config) {
             self.primary_sessions.remove(&session_id);
             let _ = self.send_root(
@@ -1036,6 +1136,102 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
         }
     }
 
+    fn start_profile_capture(&mut self) -> Result<()> {
+        if self.capture_phase != CapturePhase::Idle {
+            bail!("Chromium profile capture is already active");
+        }
+        self.capture_phase = CapturePhase::Profiling;
+        let mut sessions = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, state)| {
+                state
+                    .capture_scope
+                    .as_ref()
+                    .map(|scope| (scope.clone(), session_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        sessions.sort();
+        for (_, session_id) in sessions {
+            if !self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|state| state.profiler_started)
+            {
+                self.start_profiler(&session_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_profiler(&mut self, session_id: &str) -> Result<()> {
+        self.send_session(session_id, "Profiler.enable", json!({}), REQUEST_TIMEOUT)?;
+        self.send_session(session_id, "Profiler.start", json!({}), REQUEST_TIMEOUT)?;
+        self.sessions
+            .get_mut(session_id)
+            .context("Chromium profiled target disappeared before capture began")?
+            .profiler_started = true;
+        Ok(())
+    }
+
+    fn stop_profile_capture(&mut self) -> Result<Vec<ChromiumRealmProfile>> {
+        if self.capture_phase != CapturePhase::Profiling {
+            bail!("Chromium profile capture is not active");
+        }
+        self.capture_phase = CapturePhase::Finalizing;
+        let mut sessions = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, state)| {
+                state.capture_scope.as_ref().map(|scope| {
+                    (
+                        scope.clone(),
+                        session_id.clone(),
+                        state.target_type.clone(),
+                        state.target_id.clone(),
+                        state.profiler_started,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        sessions.sort();
+        let mut profiles = Vec::with_capacity(sessions.len());
+        for (capture_scope, session_id, target_type, target_id, started) in sessions {
+            if !started {
+                bail!(
+                    "Chromium {target_type} target {target_id} was not included from the start of profile capture"
+                );
+            }
+            let stopped =
+                self.send_session(&session_id, "Profiler.stop", json!({}), CAPTURE_TIMEOUT)?;
+            let source = stopped.get("profile").cloned().with_context(|| {
+                format!("Chromium {capture_scope} CPU capture returned no profile")
+            })?;
+            let profile = parse_cpu_profile(&source)
+                .with_context(|| format!("Chromium {capture_scope} CPU capture was invalid"))?;
+            self.sessions
+                .get_mut(&session_id)
+                .context("Chromium profiled target disappeared during finalization")?
+                .profiler_started = false;
+            profiles.push(ChromiumRealmProfile {
+                session_id,
+                capture_scope,
+                source,
+                profile,
+            });
+        }
+        Ok(profiles)
+    }
+
+    fn finish_complete_capture(&mut self) -> Result<()> {
+        if self.capture_phase != CapturePhase::Finalizing {
+            bail!("Chromium complete capture was not being finalized");
+        }
+        self.check_fatal_error()?;
+        self.capture_phase = CapturePhase::Idle;
+        Ok(())
+    }
+
     fn capture_heap_snapshot(&mut self, session_id: &str, path: &Path) -> Result<()> {
         self.send_session(
             session_id,
@@ -1079,6 +1275,7 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
     fn close_page(&mut self, page: OpenPage) -> Result<()> {
         self.primary_sessions.remove(&page.session_id);
         self.sessions.remove(&page.session_id);
+        self.capture_phase = CapturePhase::Idle;
         let closed = self.send_root(
             "Target.closeTarget",
             json!({"targetId": page.target_id}),
@@ -1089,6 +1286,9 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             json!({"browserContextId": page.browser_context_id}),
             REQUEST_TIMEOUT,
         );
+        self.sessions.clear();
+        self.next_worker_scope = 1;
+        self.next_iframe_scope = 1;
         match (closed, disposed) {
             (Ok(_), Ok(_)) => Ok(()),
             (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
@@ -1132,6 +1332,7 @@ enum CdpAction {
     },
     InitializeTarget {
         session_id: String,
+        target_id: String,
         target_type: String,
     },
 }
@@ -1221,7 +1422,10 @@ fn target_nodes(profile: &ChromiumProfile, target_url: &str) -> Result<HashSet<u
             let frame = nodes
                 .get(&id)
                 .context("Chromium CPU profile references a missing node")?;
-            if frame.call_frame.url.starts_with(target_url) || belongs.contains(&id) {
+            if is_benchmark_code_url(&frame.call_frame.url)
+                || frame.call_frame.url.starts_with(target_url)
+                || belongs.contains(&id)
+            {
                 belongs.extend(visited);
                 break;
             }
@@ -1231,7 +1435,7 @@ fn target_nodes(profile: &ChromiumProfile, target_url: &str) -> Result<HashSet<u
     Ok(belongs)
 }
 
-fn cpu_active_milliseconds(profile: &ChromiumProfile, target_url: &str) -> Result<f64> {
+fn benchmark_cpu_milliseconds(profile: &ChromiumProfile, target_url: &str) -> Result<f64> {
     let target_nodes = target_nodes(profile, target_url)?;
     let duration = profile
         .samples
@@ -1242,9 +1446,6 @@ fn cpu_active_milliseconds(profile: &ChromiumProfile, target_url: &str) -> Resul
         })
         .try_fold(0_u64, |total, delta| total.checked_add(delta))
         .context("Chromium CPU sample duration overflowed")?;
-    if duration == 0 {
-        bail!("Chromium CPU profile has no positive sample duration");
-    }
     Ok(duration as f64 / 1_000.0)
 }
 
@@ -1332,6 +1533,9 @@ fn chromium_speedscope(
         weights.push((*delta).max(1) as f64);
     }
     if samples.is_empty() {
+        if target_url.is_some() {
+            return chromium_speedscope(profile, None);
+        }
         bail!("Chromium CPU profile has no Speedscope samples");
     }
     builder.sampled_profile(
@@ -1518,7 +1722,7 @@ globalThis.__bperf = {
             serde_json::from_slice(&fs::read(fixture("cpu.json")).unwrap()).unwrap();
         let parsed = parse_cpu_profile(&profile).unwrap();
         assert_eq!(
-            cpu_active_milliseconds(&parsed, "http://127.0.0.1:4317/").unwrap(),
+            benchmark_cpu_milliseconds(&parsed, "http://127.0.0.1:4317/").unwrap(),
             3.0
         );
         assert_eq!(parse_live_heap_bytes(&fixture("heap.json")).unwrap(), 96);
