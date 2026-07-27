@@ -6,6 +6,12 @@ description = "Cross-engine browser benchmark measurement and comparison CLI"
 license = "MIT"
 repository = "https://github.com/itsjamie/bperf"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target}.tar.gz"
+bin-dir = "{ name }-{ version }-{ target}/{ bin }{ binary-ext}"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
+
 [workspace]
 members = [
     ".",

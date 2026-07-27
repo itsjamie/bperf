@@ -11,8 +11,8 @@ You need Rust with edition 2024 support and Node.js 24.12 or newer.
 
 ```text
 npm --prefix sidecar ci
-npm --prefix sidecar exec -- playwright install chromium firefox webkit
 cargo build --locked
+cargo run -- browsers install --engine all
 ```
 
 Run the capability gate before working on an engine adapter:
@@ -74,6 +74,20 @@ job, then runs the all-engine orchestration and comparison gates on Ubuntu.
 Browser failures are reported directly; the workflow does not retry them or
 disable an engine sandbox.
 
+The package contract additionally builds the native target-triple archive,
+installs only its executable into a clean Cargo root, downloads the pinned
+browsers through that installed executable, runs `doctor --engine all`, and
+measures the managed example. It runs on x86-64 Linux and Windows, plus Apple
+Silicon and Intel macOS. This proves that release builds materialize their
+embedded benchmark runtime instead of borrowing the checkout. The same job also
+runs stock `cargo install --path`, provisions its source-embedded runtime, and
+proves Chromium capture from that installation.
+
+A `v*` tag must exactly match the Cargo package version. After the fast,
+per-engine, cross-engine, and package contracts pass, CI publishes the four
+archives and `SHA256SUMS` as a GitHub release. Do not create a release manually
+from artifacts that skipped those gates.
+
 `crates/bperf-browser/src/browser_process.rs` owns platform launch and
 process-tree cleanup;
 `crates/bperf-browser/src/artifacts.rs` owns artifact identity and the common Speedscope
@@ -81,6 +95,8 @@ viewer schema;
 `crates/bperf-browser/src/chromium.rs`, `firefox.rs`, `firefox_rdp.rs`, and
 `webkit.rs`
 own their engine protocols and native capture formats.
+`crates/bperf-runtime` owns release-runtime embedding, atomic materialization,
+Playwright registry discovery, and pinned browser installation.
 `sidecar/src/benchmark-host.ts` may bundle and serve benchmarks but must not
 launch a browser.
 

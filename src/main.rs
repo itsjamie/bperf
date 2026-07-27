@@ -9,7 +9,7 @@ use anyhow::Result;
 use bperf_browser::lab::Engine;
 use bperf_decision::{baseline, comparison, lineage};
 use bperf_measurement::{sampling, store as measurement};
-use bperf_runtime::installation::RuntimeInstallation;
+use bperf_runtime::installation::{BrowserName, RuntimeInstallation};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -27,6 +27,8 @@ struct Cli {
 enum Command {
     /// Prove that required browser capture capabilities work on this host.
     Doctor(DoctorArgs),
+    /// Install the pinned browser builds used by bperf.
+    Browsers(BrowsersArgs),
     /// Validate a benchmark and, optionally, a compatible variant.
     Validate(ValidateArgs),
     /// Prepare an immutable measurement set for one variant.
@@ -67,6 +69,50 @@ impl EngineSelection {
             Self::All => Engine::ALL.to_vec(),
         }
     }
+
+    fn browsers(self) -> Vec<BrowserName> {
+        match self {
+            Self::Chromium => vec![BrowserName::ChromiumHeadlessShell],
+            Self::Firefox => vec![BrowserName::Firefox],
+            Self::Webkit => vec![BrowserName::Webkit],
+            Self::All => vec![
+                BrowserName::ChromiumHeadlessShell,
+                BrowserName::Firefox,
+                BrowserName::Webkit,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct BrowsersArgs {
+    #[command(subcommand)]
+    command: BrowsersCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BrowsersCommand {
+    /// Download the browser builds pinned by this bperf version.
+    Install(BrowserInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct BrowserInstallArgs {
+    /// Browser engine to install.
+    #[arg(long, value_enum, default_value_t)]
+    engine: EngineSelection,
+
+    /// Also install operating-system dependencies required by the browsers.
+    #[arg(long)]
+    with_deps: bool,
+
+    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
+    #[arg(long)]
+    node: Option<PathBuf>,
+
+    /// Override the bundled benchmark runtime directory.
+    #[arg(long)]
+    sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -387,6 +433,20 @@ fn main() -> Result<ExitCode> {
             doctor::run(options)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Browsers(args) => match args.command {
+            BrowsersCommand::Install(args) => {
+                let runtime = args.sidecar.map_or_else(
+                    RuntimeInstallation::discover,
+                    RuntimeInstallation::from_root,
+                )?;
+                let node = args
+                    .node
+                    .or_else(|| std::env::var_os("BPERF_NODE").map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("node"));
+                runtime.install_browsers(&node, &args.engine.browsers(), args.with_deps)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Command::Validate(args) => {
             measurement::validate(measurement::ValidateOptions {
                 benchmark: args.benchmark,

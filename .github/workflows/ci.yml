@@ -135,3 +135,92 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
+
+  package-contract:
+    name: Package / ${{ matrix.target }}
+    needs: fast
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install sidecar dependencies
+        run: npm --prefix sidecar ci
+      - name: Build and Cargo-install the release package
+        env:
+          BPERF_INSTALL_ROOT: ${{ runner.temp }}/bperf-cargo
+          BPERF_RELEASE_TARGET: ${{ matrix.target }}
+        run: node scripts/package-release.ts --install
+      - name: Prove the installed all-engine and managed benchmark contracts
+        env:
+          BPERF_TEST_CARGO_HOME: ${{ runner.temp }}/bperf-cargo
+          BPERF_TEST_ROOT: ${{ runner.temp }}/bperf-package-test
+        run: node scripts/verify-install.ts release
+      - name: Install from source through Cargo
+        run: cargo install --path . --locked --root "${{ runner.temp }}/bperf-source-cargo"
+      - name: Prove the Cargo source installation
+        env:
+          BPERF_TEST_CARGO_HOME: ${{ runner.temp }}/bperf-source-cargo
+          BPERF_TEST_ROOT: ${{ runner.temp }}/bperf-source-cargo-test
+        run: node scripts/verify-install.ts source
+      - name: Upload the tagged release package
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/bperf-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload package evidence after failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-failure-${{ matrix.target }}
+          path: |
+            .bperf
+            ${{ runner.temp }}/bperf-package-test
+            ${{ runner.temp }}/bperf-source-cargo-test
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - engine-contract
+      - cross-engine-contract
+      - package-contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Write release checksums
+        run: sha256sum dist/*.tar.gz | sort > dist/SHA256SUMS
+      - name: Publish the tagged release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes --title "bperf ${{ github.ref_name }}"

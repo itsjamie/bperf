@@ -13,6 +13,7 @@ decisions whose alternatives and tradeoffs still matter.
 | [0006](0006-adaptive-calibration.md) | Use pilot sizing for warm-up and stop each case/engine pilot prefix independently. |
 | [0007](0007-rust-browser-adapters.md) | Move all browser capture into Rust and organize runtime, browser, measurement, and decision knowledge behind explicit crate Interfaces. |
 | [0008](0008-child-execution-realms.md) | Include dedicated workers and iframes through engine-native capture scopes without changing benchmark statistics. |
+| [0009](0009-release-distribution.md) | Embed the locked benchmark runtime in each native executable and publish only after installed-package contracts pass. |
 
 Accepted records are not edited to make an old decision look current. If the
 decision changes, add a new ADR that supersedes the old one and update

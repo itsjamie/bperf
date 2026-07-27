@@ -4,7 +4,9 @@ Status: the TypeScript authoring path, three-engine combined trials, retained
 browser lanes, adaptive sampling, baseline comparison, runtime anchors,
 optimization lineage, independent confirmation, and representative artifact
 retention are implemented. Dedicated-worker and iframe execution contribute to
-the same complete trial evidence on every engine.
+the same complete trial evidence on every engine. Tagged releases produce
+cargo-binstall-compatible, target-triple archives whose executables carry the
+pinned benchmark runtime.
 
 This document describes the current design. The
 [architecture decision records](adr/README.md) preserve the alternatives and
@@ -675,7 +677,7 @@ hides knowledge that would otherwise spread through the application:
 | Crate / Module | Interface and hidden knowledge |
 |---|---|
 | `bperf` application | `doctor`, `run`, and `confirm` orchestration. It composes the library Interfaces but is not a dependency of them. |
-| `bperf-runtime::installation` | Validated runtime discovery, benchmark-host identity, pinned browser selection, Playwright version, and Node-safe paths. Release layout, cache conventions, and registry parsing stay private. |
+| `bperf-runtime::installation` | Validated runtime discovery, embedded-runtime materialization, benchmark-host identity, pinned browser installation and selection, Playwright version, and Node-safe paths. Release layout, cache conventions, and registry parsing stay private. |
 | `bperf-browser::lab` | Engine-neutral configurations and evidence, retained lane lifecycle, complete capture validation, and managed benchmark inspection. |
 | `bperf-browser::artifacts` | Complete per-scope artifact-set and file validation. Construction helpers and Speedscope representation stay crate-private. |
 | Private browser Modules | Chromium CDP, Firefox Juggler/RDP, WebKit inspector protocol, native formats, workload injection, and process containment. |
@@ -702,9 +704,12 @@ Managed discovery serves the unresolved bundle and compares descriptions from
 Chromium, Firefox, and WebKit. After fixture resolution locks the inputs,
 it serves the resolved bundle, compares descriptions again, and exercises every
 case in a fresh context on every engine. The Node host does not launch browsers.
-The packaged Node runtime contains only that host, the benchmark authoring
-module, the project bundler, package manifests, and the pinned Playwright
-registry.
+Release binaries embed that host, the benchmark authoring module, the project
+bundler, package manifests, production Node packages, and the pinned Playwright
+registry. The installation module materializes those versioned files atomically
+beside the executable. Debug builds use the checkout; release builds never
+depend on the build machine's source path. Browser binaries remain separate and
+are downloaded through `bperf browsers install`.
 
 Capture protocol 13, benchmark-host protocol 2, environment schema 6,
 measurement schema 5, and doctor schema 2 identify the child-realm-capable
@@ -717,6 +722,7 @@ The common interface is:
 
 ```text
 bperf doctor [--engine chromium|firefox|webkit|all]
+bperf browsers install [--engine chromium|firefox|webkit|all] [--with-deps]
 bperf run <benchmark.ts> [--budget <duration>] [--message <text>] [--json]
 bperf confirm <cycle-id> <benchmark.ts> [--budget <duration>] [--json]
 bperf history <benchmark-id> [--format text|json|agent-context]

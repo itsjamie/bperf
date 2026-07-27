@@ -2,4 +2,5 @@
 
 pub mod installation;
 
+mod embedded;
 mod playwright;

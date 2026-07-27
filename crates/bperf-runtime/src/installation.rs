@@ -5,11 +5,12 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context, Result, bail};
 
-use crate::playwright::PlaywrightInstallation;
+use crate::{embedded, playwright::PlaywrightInstallation};
 
 const SIDECAR_DIRECTORY_ENV: &str = "BPERF_SIDECAR_DIR";
 const BENCHMARK_HOST: &str = "benchmark-host.ts";
@@ -33,6 +34,14 @@ impl BrowserName {
     pub(crate) const fn registry_name(self) -> &'static str {
         match self {
             Self::ChromiumHeadlessShell => "chromium-headless-shell",
+            Self::Firefox => "firefox",
+            Self::Webkit => "webkit",
+        }
+    }
+
+    const fn install_name(self) -> &'static str {
+        match self {
+            Self::ChromiumHeadlessShell => "chromium",
             Self::Firefox => "firefox",
             Self::Webkit => "webkit",
         }
@@ -62,13 +71,23 @@ impl InstalledBrowser {
 
 impl RuntimeInstallation {
     pub fn discover() -> Result<Self> {
-        discover_from(
-            std::env::var_os(SIDECAR_DIRECTORY_ENV),
-            std::env::current_exe().ok().as_deref(),
+        let configured = std::env::var_os(SIDECAR_DIRECTORY_ENV);
+        let executable = std::env::current_exe().ok();
+        let development = cfg!(debug_assertions).then(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("sidecar"),
-        )
+                .join("sidecar")
+        });
+        if let Some(runtime) = discover_from(configured, executable.as_deref(), development)? {
+            return Ok(runtime);
+        }
+
+        let executable_directory = executable
+            .as_deref()
+            .and_then(Path::parent)
+            .context("could not locate the bperf executable to materialize its bundled runtime")?;
+        let root = embedded::materialize(executable_directory)?;
+        validate(root)
     }
 
     pub fn from_root(root: impl Into<PathBuf>) -> Result<Self> {
@@ -97,6 +116,39 @@ impl RuntimeInstallation {
     pub fn playwright_version(&self) -> &str {
         self.playwright.version()
     }
+
+    pub fn install_browsers(
+        &self,
+        node: &Path,
+        browsers: &[BrowserName],
+        with_dependencies: bool,
+    ) -> Result<()> {
+        let cli = self
+            .root
+            .join("node_modules")
+            .join("playwright")
+            .join("cli.js");
+        let mut command = Command::new(node);
+        command.arg(node_path(&cli)).arg("install");
+        if with_dependencies {
+            command.arg("--with-deps");
+        }
+        command.args(browsers.iter().map(|browser| browser.install_name()));
+        let status = command.status().with_context(|| {
+            format!(
+                "failed to start Playwright {} with Node executable {}",
+                self.playwright.version(),
+                node.display()
+            )
+        })?;
+        if !status.success() {
+            bail!(
+                "Playwright {} browser installation exited with {status}",
+                self.playwright.version()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Preserves absolute path identity without Windows verbatim syntax, which Node
@@ -118,12 +170,14 @@ pub fn node_path(path: &Path) -> String {
 fn discover_from(
     configured: Option<OsString>,
     executable: Option<&Path>,
-    development: PathBuf,
-) -> Result<RuntimeInstallation> {
+    development: Option<PathBuf>,
+) -> Result<Option<RuntimeInstallation>> {
     if let Some(configured) = configured {
-        return validate(PathBuf::from(configured)).with_context(|| {
-            format!("{SIDECAR_DIRECTORY_ENV} does not name a usable sidecar installation")
-        });
+        return validate(PathBuf::from(configured))
+            .map(Some)
+            .with_context(|| {
+                format!("{SIDECAR_DIRECTORY_ENV} does not name a usable sidecar installation")
+            });
     }
 
     if let Some(executable_directory) = executable.and_then(Path::parent) {
@@ -135,18 +189,18 @@ fn discover_from(
                 .join("sidecar"),
         ] {
             if candidate.exists() {
-                return validate(candidate);
+                return validate(candidate).map(Some);
             }
         }
     }
 
-    if development.exists() {
-        return validate(development);
+    if let Some(development) = development
+        && development.exists()
+    {
+        return validate(development).map(Some);
     }
 
-    bail!(
-        "could not find the bperf Node sidecar; install the release bundle beside the executable or set {SIDECAR_DIRECTORY_ENV}"
-    )
+    Ok(None)
 }
 
 fn validate(root: PathBuf) -> Result<RuntimeInstallation> {
@@ -203,7 +257,9 @@ mod tests {
                 .unwrap()
                 .join(if cfg!(windows) { "bperf.exe" } else { "bperf" });
 
-        let runtime = discover_from(None, Some(&executable), development).unwrap();
+        let runtime = discover_from(None, Some(&executable), Some(development))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             runtime.benchmark_host(),
@@ -221,11 +277,27 @@ mod tests {
         fake_installation(&development);
         let missing = directory.path().join("missing");
 
-        let error = discover_from(Some(missing.into_os_string()), None, development).unwrap_err();
+        let error =
+            discover_from(Some(missing.into_os_string()), None, Some(development)).unwrap_err();
 
         assert!(
             format!("{error:#}")
                 .contains("BPERF_SIDECAR_DIR does not name a usable sidecar installation")
+        );
+    }
+
+    #[test]
+    fn no_external_runtime_defers_to_the_embedded_distribution() {
+        let directory = tempdir().unwrap();
+
+        assert!(
+            discover_from(
+                None,
+                Some(&directory.path().join("bin").join("bperf")),
+                Some(directory.path().join("development")),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

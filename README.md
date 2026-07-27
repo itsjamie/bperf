@@ -55,23 +55,52 @@ TypeScript authoring API may still change.
 
 ## Requirements
 
-- Rust with edition 2024 support
 - Node.js 24.12 or newer
-- The Chromium, Firefox, and WebKit builds pinned by the sidecar's Playwright
-  version
+- Rust with edition 2024 support when installing from source
+- The Chromium, Firefox, and WebKit builds pinned by bperf's Playwright version
+
+## Install
+
+Every `v*` tag publishes native archives for x86-64 Linux and Windows, plus
+Apple Silicon and Intel macOS. Each archive contains one bperf executable with
+the benchmark host, project bundler, and pinned Playwright registry embedded
+inside it. Extract the archive, put its directory on `PATH`, then install the
+browser builds:
+
+```text
+bperf browsers install --engine all
+bperf doctor --engine all
+```
+
+On Linux, pass `--with-deps` to let Playwright install required operating-system
+packages as well:
+
+```text
+bperf browsers install --engine all --with-deps
+```
+
+Cargo can build and install the same self-contained executable directly from a
+tag:
+
+```text
+cargo install --git https://github.com/itsjamie/bperf --tag v0.1.0 --locked bperf
+bperf browsers install --engine all
+bperf doctor --engine all
+```
+
+The first command that needs the benchmark runtime materializes its embedded,
+versioned files beside the executable. A release binary already contains the
+production Node packages. A source-built Cargo installation resolves those
+locked packages with `npm ci` during first use.
 
 From a source checkout:
 
 ```text
 npm --prefix sidecar ci
-npm --prefix sidecar exec -- playwright install chromium firefox webkit
 cargo build --locked
+cargo run -- browsers install --engine all
 cargo run -- doctor --engine all
 ```
-
-On Linux, Playwright may also require operating-system packages. Its
-`install --with-deps` command can install both the browser builds and those
-packages.
 
 `doctor --engine all` is the capability gate. Run it on a new machine or after
 changing Playwright or the installed browsers. Every doctor launches its browser
@@ -84,13 +113,14 @@ node scripts/package-release.ts --install
 bperf --version
 ```
 
-The packaging script builds the locked Cargo release and installs the
-versioned TypeScript sidecar under Cargo's user `bin` directory. Node bundles
-and hosts TypeScript benchmarks but does not launch browsers. Rust reads the
-sidecar's pinned Playwright registry and directly launches and captures
-Chromium, Firefox, and WebKit. The sidecar runs directly in Node; there is no
-transpiled JavaScript tree. The bundle also contains the documentation,
-examples, license, and `bperf-agent-loop` skill.
+The packaging script builds a target-triple archive, embeds the locked
+TypeScript benchmark runtime in the executable, and installs that executable
+under Cargo's user `bin` directory. Node bundles and hosts TypeScript
+benchmarks but does not launch browsers. Rust reads the embedded Playwright
+registry and directly launches and captures Chromium, Firefox, and WebKit.
+The benchmark runtime runs directly in Node; there is no transpiled JavaScript
+tree. The archive also contains the documentation, examples, license, and
+`bperf-agent-loop` skill.
 
 ## Write a benchmark
 
