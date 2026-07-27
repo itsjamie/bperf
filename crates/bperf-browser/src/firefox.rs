@@ -1459,19 +1459,12 @@ fn display_json_scalar(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::RefCell,
-        collections::VecDeque,
-        io::{Read as _, Write as _},
-        net::{TcpListener, TcpStream},
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        thread,
-    };
+    use std::{cell::RefCell, collections::VecDeque};
 
-    use crate::lab::{BrowserLab, Engine};
+    use crate::{
+        lab::{BrowserLab, Engine},
+        test_support::FreshContextServer,
+    };
 
     use super::*;
 
@@ -1500,77 +1493,6 @@ mod tests {
 
         fn terminate(&mut self) -> Result<()> {
             Ok(())
-        }
-    }
-
-    struct FreshStateServer {
-        url: String,
-        running: Arc<AtomicBool>,
-        thread: Option<thread::JoinHandle<()>>,
-    }
-
-    impl FreshStateServer {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let address = listener.local_addr().unwrap();
-            let running = Arc::new(AtomicBool::new(true));
-            let thread_running = Arc::clone(&running);
-            let thread = thread::spawn(move || {
-                let document = br#"<!doctype html><script>
-const previous = localStorage.getItem("bperf-context");
-localStorage.setItem("bperf-context", "used");
-globalThis.__bperfDescription = { fresh: previous === null };
-globalThis.__bperf = {
-  run() {
-    let total = 0;
-    const deadline = performance.now() + 100;
-    while (performance.now() < deadline) {
-      for (let index = 0; index < 10_000; index += 1) {
-        total += Math.sqrt(index % 1_000);
-      }
-    }
-    globalThis.__bperfParityHeap ??= [];
-    globalThis.__bperfParityHeap.push(new Array(1_000).fill(total));
-    return previous === null;
-  }
-};
-</script>"#;
-                while thread_running.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let mut request = [0_u8; 4096];
-                            let _ = stream.read(&mut request);
-                            let headers = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                document.len()
-                            );
-                            let _ = stream.write_all(headers.as_bytes());
-                            let _ = stream.write_all(document);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                url: format!("http://{address}/"),
-                running,
-                thread: Some(thread),
-            }
-        }
-    }
-
-    impl Drop for FreshStateServer {
-        fn drop(&mut self) {
-            self.running.store(false, Ordering::Release);
-            let _ =
-                TcpStream::connect(self.url.trim_end_matches('/').trim_start_matches("http://"));
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
         }
     }
 
@@ -1741,14 +1663,14 @@ globalThis.__bperf = {
     #[test]
     #[ignore = "launches the pinned Playwright Firefox browser"]
     fn browser_lab_uses_fresh_contexts_and_recovers_after_failure() {
-        let server = FreshStateServer::start();
+        let server = FreshContextServer::start();
         let mut browser_lab = BrowserLab::start(RuntimeInstallation::discover().unwrap()).unwrap();
 
         let first = browser_lab
-            .inspect_benchmark(Engine::Firefox, &server.url, None)
+            .inspect_benchmark(Engine::Firefox, server.url(), None)
             .unwrap();
         let second = browser_lab
-            .inspect_benchmark(Engine::Firefox, &server.url, None)
+            .inspect_benchmark(Engine::Firefox, server.url(), None)
             .unwrap();
         assert_eq!(first.description["fresh"], true);
         assert_eq!(second.description["fresh"], true);
@@ -1758,7 +1680,7 @@ globalThis.__bperf = {
             .unwrap_err();
 
         let reopened = browser_lab
-            .inspect_benchmark(Engine::Firefox, &server.url, None)
+            .inspect_benchmark(Engine::Firefox, server.url(), None)
             .unwrap();
         assert_eq!(reopened.description["fresh"], true);
         browser_lab.finish().unwrap();
