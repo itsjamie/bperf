@@ -26,9 +26,9 @@ cargo run -- doctor --engine all
 These checks do not launch browsers:
 
 ```text
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 npm --prefix sidecar run check
 ```
 
@@ -41,15 +41,17 @@ The ignored tests launch pinned Chromium, Firefox, and WebKit builds and write
 large diagnostic artifacts:
 
 ```text
-cargo test every_engine_satisfies_the_capture_contract -- --ignored --exact
-cargo test --test browser_contract chromium_doctor_does_not_spawn_node -- --ignored --exact
 cargo test --test browser_contract firefox_doctor_does_not_spawn_node -- --ignored --exact
-cargo test --test browser_contract webkit_doctor_does_not_spawn_node -- --ignored --exact
-cargo test -p bperf-browser chromium::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
 cargo test -p bperf-browser firefox::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+cargo test -p bperf-browser --test child_realms firefox_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
+cargo test --test browser_contract chromium_doctor_does_not_spawn_node -- --ignored --exact
+cargo test -p bperf-browser chromium::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+cargo test -p bperf-browser --test child_realms chromium_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
+cargo test --test browser_contract webkit_doctor_does_not_spawn_node -- --ignored --exact
 cargo test -p bperf-browser webkit::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+cargo test -p bperf-browser --test child_realms webkit_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
+cargo test every_engine_satisfies_the_capture_contract -- --ignored --exact
 cargo test -p bperf-browser lab::tests::retained_lanes_keep_one_root_pid_and_shutdown_all_contained_processes -- --ignored --exact
-cargo test -p bperf-browser --test child_realms -- --ignored
 cargo test --test measurement_contract variants_can_be_measured_and_compared_on_every_engine -- --ignored --exact
 cargo test managed_benchmark_satisfies_every_engine_contract -- --ignored
 ```
@@ -67,7 +69,11 @@ session. The child-realm gate must prove that named page, dedicated-worker, and
 cross-origin iframe work appears in native evidence on every engine.
 
 Run the direct Chromium, Firefox, and WebKit gates on every platform targeted
-by the release.
+by the release. CI gives every engine its own fresh Ubuntu, Windows, and macOS
+job, then runs the all-engine orchestration and comparison gates on Ubuntu.
+Browser failures are reported directly; the workflow does not retry them or
+disable an engine sandbox.
+
 `crates/bperf-browser/src/browser_process.rs` owns platform launch and
 process-tree cleanup;
 `crates/bperf-browser/src/artifacts.rs` owns artifact identity and the common Speedscope

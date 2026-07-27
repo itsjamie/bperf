@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fast:
+    name: Fast checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install sidecar dependencies
+        run: npm --prefix sidecar ci
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Lint every Rust target
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test the Rust workspace
+        run: cargo test --workspace --locked
+      - name: Check the Node sidecar
+        run: npm --prefix sidecar run check
+
+  engine-contract:
+    name: ${{ matrix.engine }} / ${{ matrix.os }}
+    needs: fast
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        engine:
+          - chromium
+          - firefox
+          - webkit
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install sidecar dependencies
+        run: npm --prefix sidecar ci
+      - name: Install ${{ matrix.engine }} and Linux dependencies
+        if: runner.os == 'Linux'
+        run: npm --prefix sidecar exec -- playwright install --with-deps ${{ matrix.engine }}
+      - name: Install ${{ matrix.engine }}
+        if: runner.os != 'Linux'
+        run: npm --prefix sidecar exec -- playwright install ${{ matrix.engine }}
+      - name: Prove the ${{ matrix.engine }} capture contract without Node
+        env:
+          BPERF_NODE: bperf-node-must-not-be-started
+        run: cargo run --locked -- doctor --engine ${{ matrix.engine }} --artifact-dir .bperf/ci-doctor
+      - name: Prove retained-lane recovery
+        run: cargo test --locked -p bperf-browser ${{ matrix.engine }}::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
+      - name: Capture dedicated-worker and iframe evidence
+        run: cargo test --locked -p bperf-browser --test child_realms ${{ matrix.engine }}_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
+      - name: Upload doctor evidence after failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: doctor-${{ matrix.engine }}-${{ matrix.os }}
+          path: .bperf
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cross-engine-contract:
+    name: Cross-engine contract / ubuntu
+    needs: fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install sidecar dependencies
+        run: npm --prefix sidecar ci
+      - name: Install all browsers and Linux dependencies
+        run: npm --prefix sidecar exec -- playwright install --with-deps chromium firefox webkit
+      - name: Prove all-engine doctor orchestration
+        env:
+          BPERF_NODE: bperf-node-must-not-be-started
+        run: cargo run --locked -- doctor --engine all --artifact-dir .bperf/ci-doctor-all
+      - name: Check the complete capture summary
+        run: cargo test --locked --test browser_contract every_engine_satisfies_the_capture_contract -- --ignored --exact
+      - name: Check retained process containment
+        run: cargo test --locked -p bperf-browser lab::tests::retained_lanes_keep_one_root_pid_and_shutdown_all_contained_processes -- --ignored --exact
+      - name: Measure and compare both variants
+        run: cargo test --locked --test measurement_contract variants_can_be_measured_and_compared_on_every_engine -- --ignored --exact
+      - name: Run the managed TypeScript benchmark contract
+        run: cargo test --locked managed_benchmark::tests::managed_benchmark_satisfies_every_engine_contract -- --ignored --exact
+      - name: Upload doctor evidence after failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: doctor-all-ubuntu
+          path: .bperf
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
