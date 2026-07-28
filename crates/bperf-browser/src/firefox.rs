@@ -44,6 +44,7 @@ pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const PROFILER_SETUP_ATTEMPTS: usize = 3;
 const FIREFOX_STARTUP_PREFERENCES: &str =
     "user_pref(\"extensions.systemAddon.update.url\", \"\");\n";
 
@@ -292,11 +293,7 @@ impl FirefoxLane {
             let batch_size =
                 decode_batch_size(selected).context("Firefox batch calibration failed")?;
 
-            let setup_source = debug.capture_profile()?;
-            let setup_profile = record_profile(&artifacts, &setup_source)?;
-            if !profile_has_target_samples(&setup_profile, request.target_url)? {
-                bail!("Firefox profiler did not sample the benchmark process during capture setup");
-            }
+            complete_profiler_setup(&mut debug, &artifacts, request.target_url)?;
             debug.start_profiler()?;
             let workload = decode_workload(
                 self.connection
@@ -1164,6 +1161,27 @@ fn record_profile(artifacts: &CaptureArtifacts, source: &str) -> Result<GeckoPro
     parse_profile(source)
 }
 
+fn complete_profiler_setup(
+    debug: &mut FirefoxDebugSession,
+    artifacts: &CaptureArtifacts,
+    target_url: &str,
+) -> Result<()> {
+    for attempt in 1..=PROFILER_SETUP_ATTEMPTS {
+        let source = debug.capture_profile()?;
+        let profile = record_profile(artifacts, &source)?;
+        if profile_has_target_samples(&profile, target_url) {
+            return Ok(());
+        }
+        if attempt < PROFILER_SETUP_ATTEMPTS {
+            debug.start_profiler()?;
+        }
+    }
+    bail!(
+        "Firefox profiler did not sample the benchmark process after \
+         {PROFILER_SETUP_ATTEMPTS} capture setup attempts"
+    )
+}
+
 fn cpu_active_milliseconds(profile: &GeckoProfile, target_url: &str) -> Result<f64> {
     fn process_duration(
         profile: &GeckoProfile,
@@ -1248,20 +1266,24 @@ fn target_window_ids(profile: &GeckoProfile, target_url: &str) -> HashSet<u64> {
         .collect()
 }
 
-fn profile_has_target_samples(profile: &GeckoProfile, target_url: &str) -> Result<bool> {
+fn profile_has_target_samples(profile: &GeckoProfile, target_url: &str) -> bool {
     if profile.pages.iter().any(|page| page.url == target_url) {
         for thread in &profile.threads {
-            if !thread_samples(thread)?.is_empty() {
-                return Ok(true);
+            if thread.samples.data.iter().any(|row| {
+                row.get(thread.samples.schema.time)
+                    .and_then(Value::as_f64)
+                    .is_some_and(f64::is_finite)
+            }) {
+                return true;
             }
         }
     }
     for child in &profile.processes {
-        if profile_has_target_samples(child, target_url)? {
-            return Ok(true);
+        if profile_has_target_samples(child, target_url) {
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 fn stack_belongs_to_target(
@@ -1611,8 +1633,14 @@ mod tests {
         .to_string();
         let profile = parse_profile(&source).unwrap();
 
-        assert!(profile_has_target_samples(&profile, "http://127.0.0.1:4317/").unwrap());
-        assert!(!profile_has_target_samples(&profile, "http://127.0.0.1:4318/").unwrap());
+        assert!(profile_has_target_samples(
+            &profile,
+            "http://127.0.0.1:4317/"
+        ));
+        assert!(!profile_has_target_samples(
+            &profile,
+            "http://127.0.0.1:4318/"
+        ));
         assert_eq!(
             cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").unwrap(),
             4.0
