@@ -44,6 +44,8 @@ pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const FIREFOX_STARTUP_PREFERENCES: &str =
+    "user_pref(\"extensions.systemAddon.update.url\", \"\");\n";
 
 #[cfg(target_os = "linux")]
 const FIREFOX_ENVIRONMENT_REMOVALS: &[&str] = &["SNAP_NAME", "SNAP_INSTANCE_NAME"];
@@ -149,6 +151,16 @@ fn firefox_launch_arguments(root: &Path, rdp_port: u16) -> Vec<String> {
     ]
 }
 
+fn prepare_firefox_profile(root: &Path) -> Result<()> {
+    let profile = root.join("profile");
+    fs::create_dir(&profile).context("failed to create the isolated Firefox profile")?;
+    // Juggler waits for XPI startup work before quitting. A background system
+    // add-on request can otherwise block process shutdown until its network
+    // timeout.
+    fs::write(profile.join("user.js"), FIREFOX_STARTUP_PREFERENCES)
+        .context("failed to configure the isolated Firefox profile")
+}
+
 pub(crate) struct FirefoxLane {
     connection: JugglerConnection<BrowserProcess>,
     snapshots: FirefoxHeapSnapshotFiles,
@@ -167,8 +179,7 @@ impl FirefoxLane {
             &installation.executable,
             FIREFOX_ENVIRONMENT_REMOVALS,
             |root| {
-                fs::create_dir(root.join("profile"))
-                    .context("failed to create the isolated Firefox profile")?;
+                prepare_firefox_profile(root)?;
                 fs::create_dir(root.join("downloads"))
                     .context("failed to create the isolated Firefox download directory")?;
                 Ok(firefox_launch_arguments(root, rdp_port))
@@ -1618,6 +1629,16 @@ mod tests {
                 "43210",
                 "-silent",
             ]
+        );
+    }
+
+    #[test]
+    fn launch_profile_disables_background_system_addon_updates() {
+        let root = tempfile::tempdir().unwrap();
+        prepare_firefox_profile(root.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("profile").join("user.js")).unwrap(),
+            FIREFOX_STARTUP_PREFERENCES
         );
     }
 
