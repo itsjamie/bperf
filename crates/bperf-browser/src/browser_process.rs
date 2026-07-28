@@ -18,7 +18,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tempfile::TempDir;
 
-const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+const FORCED_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct BrowserProcess {
     child: platform::ChildProcess,
@@ -149,7 +150,7 @@ impl BrowserProcess {
     }
 
     pub(crate) fn wait_for_exit(&mut self) -> Result<()> {
-        let deadline = Instant::now() + PROCESS_EXIT_TIMEOUT;
+        let deadline = Instant::now() + GRACEFUL_EXIT_TIMEOUT;
         loop {
             if self.child.try_wait()?.is_some() {
                 self.stop_contained_processes()?;
@@ -235,7 +236,7 @@ mod platform {
 
     use anyhow::{Context, Result, bail};
 
-    use super::{PROCESS_EXIT_TIMEOUT, SpawnedProcess};
+    use super::{FORCED_EXIT_TIMEOUT, SpawnedProcess};
 
     pub(super) struct ChildProcess {
         child: Child,
@@ -269,7 +270,7 @@ mod platform {
         }
 
         pub(super) fn wait_until_empty(&self) -> Result<()> {
-            let deadline = Instant::now() + PROCESS_EXIT_TIMEOUT;
+            let deadline = Instant::now() + FORCED_EXIT_TIMEOUT;
             loop {
                 let result = unsafe { libc::kill(-self.process_group, 0) };
                 if result == -1 {
@@ -444,13 +445,13 @@ mod platform {
         },
     };
 
-    use super::{PROCESS_EXIT_TIMEOUT, SpawnedProcess};
+    use super::{FORCED_EXIT_TIMEOUT, SpawnedProcess};
 
     const FD_COUNT: usize = 5;
     const CRT_FOPEN: u8 = 0x01;
     const CRT_FPIPE: u8 = 0x08;
     const CRT_FDEV: u8 = 0x40;
-    const PROCESS_EXIT_TIMEOUT_MS: u32 = 5_000;
+    const FORCED_EXIT_TIMEOUT_MS: u32 = 5_000;
 
     pub(super) struct ChildProcess {
         process: OwnedHandle,
@@ -485,7 +486,7 @@ mod platform {
 
         pub(super) fn wait(&mut self) -> Result<()> {
             let result =
-                unsafe { WaitForSingleObject(self.process_handle(), PROCESS_EXIT_TIMEOUT_MS) };
+                unsafe { WaitForSingleObject(self.process_handle(), FORCED_EXIT_TIMEOUT_MS) };
             if result == WAIT_TIMEOUT {
                 bail!("browser process did not exit after termination");
             }
@@ -504,7 +505,7 @@ mod platform {
         }
 
         pub(super) fn wait_until_empty(&self) -> Result<()> {
-            let deadline = Instant::now() + PROCESS_EXIT_TIMEOUT;
+            let deadline = Instant::now() + FORCED_EXIT_TIMEOUT;
             loop {
                 let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
                 if unsafe {
@@ -633,7 +634,7 @@ mod platform {
                 );
             }
             unsafe {
-                WaitForSingleObject(process.as_raw_handle() as HANDLE, PROCESS_EXIT_TIMEOUT_MS);
+                WaitForSingleObject(process.as_raw_handle() as HANDLE, FORCED_EXIT_TIMEOUT_MS);
             }
             bail!("failed to assign browser to its kill-on-close Job Object: {error}");
         }
