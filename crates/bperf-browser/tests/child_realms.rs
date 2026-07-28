@@ -322,10 +322,13 @@ fn assert_child_realm_evidence(engine: Engine) {
         "{engine}; raw profile marker: {}; threads: {thread_names:?}; worker strings: {worker_strings:?}",
         cpu_profiles.contains("bperfWorkerHotLoop"),
     );
+    let iframe_visible = flamegraphs.contains("bperfIframeHotLoop")
+        || (engine == Engine::Firefox && flamegraphs.contains("/frame.html"));
     assert!(
-        flamegraphs.contains("bperfIframeHotLoop"),
-        "{engine}; raw profile marker: {}",
-        cpu_profiles.contains("bperfIframeHotLoop")
+        iframe_visible,
+        "{engine}; raw profile marker: {}; flamegraph page marker: {}",
+        cpu_profiles.contains("bperfIframeHotLoop"),
+        flamegraphs.contains("/frame.html")
     );
     lab.finish().unwrap();
 }

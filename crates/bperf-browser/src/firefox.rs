@@ -1347,6 +1347,11 @@ fn firefox_speedscope(
         let target_window_ids = target_url
             .map(|target_url| target_window_ids(profile, target_url))
             .unwrap_or_default();
+        let page_urls = profile
+            .pages
+            .iter()
+            .map(|page| (page.inner_window_id, page.url.as_str()))
+            .collect::<HashMap<_, _>>();
         for thread in &profile.threads {
             let all_samples = thread_samples(thread)?;
             let mut stack_cache = HashMap::new();
@@ -1369,6 +1374,7 @@ fn firefox_speedscope(
                 samples.push(speedscope_stack(
                     thread,
                     sample.stack_index,
+                    &page_urls,
                     &mut stack_cache,
                     builder,
                     &mut HashSet::new(),
@@ -1416,6 +1422,7 @@ fn firefox_speedscope(
 fn speedscope_stack(
     thread: &GeckoThread,
     stack_index: usize,
+    page_urls: &HashMap<u64, &str>,
     cache: &mut HashMap<usize, Vec<usize>>,
     builder: &mut SpeedscopeBuilder,
     visiting: &mut HashSet<usize>,
@@ -1436,7 +1443,7 @@ fn speedscope_stack(
         .and_then(Value::as_f64)
         .and_then(numeric_index);
     let mut stack = if let Some(prefix) = prefix {
-        speedscope_stack(thread, prefix, cache, builder, visiting)?
+        speedscope_stack(thread, prefix, page_urls, cache, builder, visiting)?
     } else {
         Vec::new()
     };
@@ -1445,16 +1452,27 @@ fn speedscope_stack(
         .and_then(Value::as_f64)
         .and_then(numeric_index);
     if let Some(frame_index) = frame_index {
-        let location = thread
-            .frame_table
-            .data
-            .get(frame_index)
+        let frame = thread.frame_table.data.get(frame_index);
+        let location = frame
             .and_then(|row| row.get(thread.frame_table.schema.location))
             .and_then(Value::as_f64)
             .and_then(numeric_index)
             .and_then(|index| thread.string_table.get(index))
             .map_or("(unknown)", String::as_str);
-        stack.push(builder.frame(SpeedscopeFrame::named(location)));
+        let page_url = frame
+            .and_then(|row| {
+                thread
+                    .frame_table
+                    .schema
+                    .inner_window_id
+                    .and_then(|column| row.get(column))
+            })
+            .and_then(Value::as_u64)
+            .and_then(|id| page_urls.get(&id).copied());
+        let name = page_url
+            .filter(|url| !location.contains(*url))
+            .map_or_else(|| location.to_owned(), |url| format!("{location} ({url})"));
+        stack.push(builder.frame(SpeedscopeFrame::named(name)));
     }
     visiting.remove(&stack_index);
     cache.insert(stack_index, stack.clone());
@@ -1581,6 +1599,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(speedscope["profiles"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            speedscope["shared"]["frames"][0]["name"],
+            "js::RunScript (http://127.0.0.1:4317/)"
+        );
     }
 
     #[test]
