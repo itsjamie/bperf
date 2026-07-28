@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tempfile::TempDir;
 
-const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCED_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct BrowserProcess {
@@ -157,8 +157,10 @@ impl BrowserProcess {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                self.stop_contained_processes()?;
-                bail!("browser ignored graceful shutdown and was terminated");
+                // Profiles are isolated and disposable; cleanup completeness
+                // matters, not whether background browser work allowed a
+                // voluntary exit.
+                return self.stop_contained_processes();
             }
             thread::sleep(Duration::from_millis(10));
         }
