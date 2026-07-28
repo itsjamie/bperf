@@ -281,6 +281,8 @@ impl FirefoxLane {
                 PAGE_READY_TIMEOUT,
             )?;
             let script = WorkloadScript::new(request.operations)?;
+            let mut debug = FirefoxDebugSession::connect(self.rdp_port)?;
+            debug.start_profiler()?;
             self.connection
                 .evaluate(&page.session_id, &script.prepare())?;
             let selected = self.connection.evaluate(
@@ -290,7 +292,11 @@ impl FirefoxLane {
             let batch_size =
                 decode_batch_size(selected).context("Firefox batch calibration failed")?;
 
-            let mut debug = FirefoxDebugSession::connect(self.rdp_port)?;
+            let setup_source = debug.capture_profile()?;
+            let setup_profile = record_profile(&artifacts, &setup_source)?;
+            if !profile_has_target_samples(&setup_profile, request.target_url)? {
+                bail!("Firefox profiler did not sample the benchmark process during capture setup");
+            }
             debug.start_profiler()?;
             let workload = decode_workload(
                 self.connection
@@ -1242,6 +1248,22 @@ fn target_window_ids(profile: &GeckoProfile, target_url: &str) -> HashSet<u64> {
         .collect()
 }
 
+fn profile_has_target_samples(profile: &GeckoProfile, target_url: &str) -> Result<bool> {
+    if profile.pages.iter().any(|page| page.url == target_url) {
+        for thread in &profile.threads {
+            if !thread_samples(thread)?.is_empty() {
+                return Ok(true);
+            }
+        }
+    }
+    for child in &profile.processes {
+        if profile_has_target_samples(child, target_url)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn stack_belongs_to_target(
     thread: &GeckoThread,
     stack_index: usize,
@@ -1589,6 +1611,8 @@ mod tests {
         .to_string();
         let profile = parse_profile(&source).unwrap();
 
+        assert!(profile_has_target_samples(&profile, "http://127.0.0.1:4317/").unwrap());
+        assert!(!profile_has_target_samples(&profile, "http://127.0.0.1:4318/").unwrap());
         assert_eq!(
             cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").unwrap(),
             4.0
