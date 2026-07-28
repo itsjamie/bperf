@@ -9,7 +9,7 @@ use crate::lab::{
     BrowserTrialConfig, RuntimeAnchorEvidence, TrialBatchConfig, Viewport, WorkloadEvidence,
 };
 
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 pub(crate) const RUNTIME_ANCHOR_EXPRESSION: &str = "globalThis.__bperfHarness.runtimeAnchor()";
 pub(crate) const DOCTOR_PROBE_EXPRESSION: &str = "globalThis.__bperfHarness.doctorProbe()";
 pub(crate) const SETTLE_EXPRESSION: &str =

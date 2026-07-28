@@ -3,7 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const BROWSER_WORKLOAD_VERSION = 1;
+const BROWSER_WORKLOAD_VERSION = 2;
 const BROWSER_WORKLOAD_SOURCE = fs.readFileSync(
   new URL("../src/browser-workload.js", import.meta.url),
   "utf8",
@@ -19,8 +19,12 @@ interface Harness {
   ): Promise<number>;
 }
 
-function harness(run: (operation: unknown) => unknown): Harness {
+function harness(
+  run: (operation: unknown) => unknown,
+  elapsed: (invocation: number) => number = () => 2,
+): Harness {
   let now = 0;
+  let invocations = 0;
   const context = {
     performance: {
       now() {
@@ -29,7 +33,8 @@ function harness(run: (operation: unknown) => unknown): Harness {
     },
     __bperf: {
       run(operation: unknown) {
-        now += 2;
+        now += elapsed(invocations);
+        invocations += 1;
         return run(operation);
       },
     },
@@ -56,7 +61,29 @@ test("shared browser workload selects one bounded captured batch", async () => {
     ),
     5,
   );
-  assert.equal(attempted.length, 6);
+  assert.equal(attempted.length, 11);
+});
+
+test("shared browser workload confirms sizing after warmup", async () => {
+  let calls = 0;
+  const workload = harness(
+    () => {
+      calls += 1;
+      return { value: 42 };
+    },
+    (invocation) => invocation === 0 ? 12 : 1,
+  );
+
+  assert.equal(
+    await workload.selectBatchSize(
+      [{ case_id: "fixture" }],
+      1,
+      10,
+      20,
+    ),
+    10,
+  );
+  assert.equal(calls, 22);
 });
 
 test("shared browser workload does not size a locked final batch", async () => {

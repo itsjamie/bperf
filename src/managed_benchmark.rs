@@ -1175,6 +1175,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_stream_fixture_has_platform_stable_bytes() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("managed")
+            .join("fixtures")
+            .join("segment.txt");
+        let bytes = fs::read(fixture).unwrap();
+
+        assert_eq!(bytes.len(), 556);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "39ba339f0bc97c962ea67ae5c18953b16385d9f4b2d592e345815755425d18f1"
+        );
+    }
+
+    #[test]
     fn managed_discovery_rejects_engine_description_mismatches() {
         let mut common = None;
         let description = json!({"id": "parser", "cases": [], "fixtures": []});

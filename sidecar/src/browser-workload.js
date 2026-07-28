@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = 1;
+  const VERSION = 2;
   const RUNTIME_ANCHOR = Object.freeze({
     workload: "javascript_cpu_v1",
     samples: 31,
@@ -94,14 +94,20 @@
     if (targetMs === undefined || targetMs === null) return initialSize;
 
     let batchSize = initialSize;
+    let confirmedSize;
     while (true) {
       const workload = await execute(operations, batchSize);
-      if (
-        workload.batch_wall_ms >= targetMs ||
-        batchSize === maximumSize
-      ) {
+      if (workload.batch_wall_ms >= targetMs) {
+        if (confirmedSize === batchSize || batchSize === maximumSize) {
+          return batchSize;
+        }
+        confirmedSize = batchSize;
+        continue;
+      }
+      if (batchSize === maximumSize) {
         return batchSize;
       }
+      confirmedSize = undefined;
       const estimated = workload.batch_wall_ms > 0
         ? Math.ceil(
             batchSize * targetMs / workload.batch_wall_ms,

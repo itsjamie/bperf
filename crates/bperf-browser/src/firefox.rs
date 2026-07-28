@@ -253,12 +253,12 @@ impl FirefoxLane {
             self.connection
                 .evaluate(&page.session_id, DOCTOR_PROBE_EXPRESSION)?;
             let profile_source = debug.capture_profile()?;
-            let profile = parse_profile(&profile_source)?;
+            let profile = record_profile(&artifacts, &profile_source)?;
             self.connection
                 .evaluate(&page.session_id, SETTLE_EXPRESSION)?;
             let heap_path = artifacts.heap_snapshot_path();
             debug.capture_heap(&heap_path, &mut self.snapshots)?;
-            let artifacts = finish_capture_artifacts(artifacts, &profile_source, &profile, None)?;
+            let artifacts = finish_capture_artifacts(artifacts, &profile, None)?;
             Ok(ProbeCapture {
                 adapter: self.adapter.clone(),
                 browser: self.browser.clone(),
@@ -298,19 +298,15 @@ impl FirefoxLane {
             )
             .context("Firefox workload execution failed")?;
             let profile_source = debug.capture_profile()?;
-            let profile = parse_profile(&profile_source)?;
+            let profile = record_profile(&artifacts, &profile_source)?;
             let cpu_active_ms =
                 cpu_active_milliseconds(&profile, request.target_url)? / f64::from(batch_size);
             self.connection
                 .evaluate(&page.session_id, SETTLE_EXPRESSION)?;
             let heap_path = artifacts.heap_snapshot_path();
             let heap_bytes = debug.capture_heap(&heap_path, &mut self.snapshots)?;
-            let artifacts = finish_capture_artifacts(
-                artifacts,
-                &profile_source,
-                &profile,
-                Some(request.target_url),
-            )?;
+            let artifacts =
+                finish_capture_artifacts(artifacts, &profile, Some(request.target_url))?;
             Ok(TrialCapture {
                 workload,
                 cpu_active_ms,
@@ -1157,6 +1153,11 @@ fn parse_profile(source: &str) -> Result<GeckoProfile> {
     serde_json::from_value(value).context("Firefox emitted an invalid Gecko Profiler document")
 }
 
+fn record_profile(artifacts: &CaptureArtifacts, source: &str) -> Result<GeckoProfile> {
+    artifacts.write_cpu_profile(source)?;
+    parse_profile(source)
+}
+
 fn cpu_active_milliseconds(profile: &GeckoProfile, target_url: &str) -> Result<f64> {
     fn process_duration(
         profile: &GeckoProfile,
@@ -1314,11 +1315,9 @@ fn benchmark_worker_entry(location: &str) -> bool {
 
 fn finish_capture_artifacts(
     artifacts: CaptureArtifacts,
-    profile_source: &str,
     profile: &GeckoProfile,
     target_url: Option<&str>,
 ) -> Result<Vec<ArtifactEvidence>> {
-    artifacts.write_cpu_profile(profile_source)?;
     let speedscope = firefox_speedscope(profile, target_url)?;
     artifacts.write_flamegraph(&speedscope)?;
     artifacts.finish()
@@ -1602,6 +1601,26 @@ mod tests {
         assert_eq!(
             speedscope["shared"]["frames"][0]["name"],
             "js::RunScript (http://127.0.0.1:4317/)"
+        );
+    }
+
+    #[test]
+    fn raw_profile_survives_attribution_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts = CaptureArtifacts::prepare(Engine::Firefox, directory.path()).unwrap();
+        let source = json!({
+            "meta": {"interval": 1},
+            "pages": [],
+            "threads": [],
+            "processes": []
+        })
+        .to_string();
+
+        let profile = record_profile(&artifacts, &source).unwrap();
+        assert!(cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").is_err());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("firefox.cpu.json")).unwrap(),
+            source
         );
     }
 

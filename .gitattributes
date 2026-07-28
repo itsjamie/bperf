@@ -1,0 +1,2 @@
+# The benchmark expectation covers the fixture's exact bytes.
+examples/managed/fixtures/segment.txt text eol=lf

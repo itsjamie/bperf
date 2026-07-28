@@ -1,6 +1,6 @@
 import { startVariant } from "./server.mjs";
 
 startVariant({
-  cpuRounds: 8_000,
+  cpuRounds: 240_000,
   retainedObjects: 8_000,
 });
