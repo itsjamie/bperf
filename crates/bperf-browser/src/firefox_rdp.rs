@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 const RDP_TIMEOUT: Duration = Duration::from_secs(10);
 const RDP_CONNECT_ATTEMPTS: usize = 50;
 const RDP_CONNECT_DELAY: Duration = Duration::from_millis(100);
+const PROFILER_CHILD_START_DELAY: Duration = Duration::from_millis(100);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_SNAPSHOT_PREFIX: &str = "Firefox emitted an invalid .fxsnapshot: ";
 const MAX_PROTOBUF_FIELD_NUMBER: u64 = (1 << 29) - 1;
@@ -100,6 +101,11 @@ impl FirefoxDebugSession {
         if !started {
             bail!("Firefox profiler did not start");
         }
+        // PerfActor returns after starting the parent profiler and drops the
+        // promise that resolves when child profilers are ready. Keeping the
+        // content process idle here lets it process that IPC before benchmark
+        // JavaScript can occupy its main thread.
+        thread::sleep(PROFILER_CHILD_START_DELAY);
         Ok(())
     }
 
