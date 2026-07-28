@@ -232,6 +232,48 @@ fn gecko_worker_strings(profile: &serde_json::Value, strings: &mut Vec<String>) 
     }
 }
 
+fn gecko_profile_marks_url(profile: &serde_json::Value, url_suffix: &str) -> bool {
+    let window_ids = profile["pages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|page| {
+            page["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with(url_suffix))
+        })
+        .filter_map(|page| page["innerWindowID"].as_u64())
+        .collect::<BTreeSet<_>>();
+    if !window_ids.is_empty() {
+        for thread in profile["threads"].as_array().into_iter().flatten() {
+            let markers = &thread["markers"];
+            let Some(data_column) = markers["schema"]["data"]
+                .as_u64()
+                .and_then(|column| usize::try_from(column).ok())
+            else {
+                continue;
+            };
+            if markers["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_array)
+                .filter_map(|marker| marker.get(data_column))
+                .filter(|data| data["type"] == "DOMEvent" && data["eventType"] == "message")
+                .filter_map(|data| data["innerWindowID"].as_u64())
+                .any(|id| window_ids.contains(&id))
+            {
+                return true;
+            }
+        }
+    }
+    profile["processes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|child| gecko_profile_marks_url(child, url_suffix))
+}
+
 fn assert_child_realm_evidence(engine: Engine) {
     let server = RealmServer::start();
     let directory = tempdir().unwrap();
@@ -307,10 +349,12 @@ fn assert_child_realm_evidence(engine: Engine) {
     }
     let mut thread_names = Vec::new();
     let mut worker_strings = Vec::new();
+    let mut iframe_marked = false;
     if engine == Engine::Firefox {
         let profile = serde_json::from_str(&cpu_profiles).unwrap();
         gecko_thread_names(&profile, &mut thread_names);
         gecko_worker_strings(&profile, &mut worker_strings);
+        iframe_marked = gecko_profile_marks_url(&profile, "/frame.html");
     }
     let worker_visible = if engine == Engine::Firefox {
         flamegraphs.contains("WorkerThreadPrimaryRunnable::Run /worker.js")
@@ -323,14 +367,41 @@ fn assert_child_realm_evidence(engine: Engine) {
         cpu_profiles.contains("bperfWorkerHotLoop"),
     );
     let iframe_visible = flamegraphs.contains("bperfIframeHotLoop")
-        || (engine == Engine::Firefox && flamegraphs.contains("/frame.html"));
+        || (engine == Engine::Firefox && (flamegraphs.contains("/frame.html") || iframe_marked));
     assert!(
         iframe_visible,
-        "{engine}; raw profile marker: {}; flamegraph page marker: {}",
+        "{engine}; raw profile marker: {}; flamegraph page marker: {}; profiler realm marker: {iframe_marked}",
         cpu_profiles.contains("bperfIframeHotLoop"),
         flamegraphs.contains("/frame.html")
     );
     lab.finish().unwrap();
+}
+
+#[test]
+fn gecko_iframe_profiler_markers_retain_realm_identity() {
+    let profile = json!({
+        "pages": [{
+            "innerWindowID": 42,
+            "url": "http://localhost:4317/frame.html"
+        }],
+        "threads": [{
+            "markers": {
+                "schema": {"data": 1},
+                "data": [[
+                    "DOMEvent",
+                    {
+                        "type": "DOMEvent",
+                        "eventType": "message",
+                        "innerWindowID": 42
+                    }
+                ]]
+            }
+        }],
+        "processes": []
+    });
+
+    assert!(gecko_profile_marks_url(&profile, "/frame.html"));
+    assert!(!gecko_profile_marks_url(&profile, "/other.html"));
 }
 
 #[test]
