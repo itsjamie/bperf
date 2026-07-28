@@ -21,6 +21,10 @@ use tempfile::tempdir;
 
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+// A single operation can finish before Gecko emits its first attributed sample
+// on fast CI hosts. Repetition keeps both child realms active across many
+// profiler intervals without changing the operation or its result.
+const CAPTURE_OPERATION_COUNT: usize = 16;
 const EXPECTED_WORKER_VALUE: u32 = 667_023_402;
 const EXPECTED_IFRAME_VALUE: u32 = 2_974_158_890;
 const MAIN_DOCUMENT: &str = r#"<!doctype html>
@@ -289,22 +293,26 @@ fn assert_child_realm_evidence(engine: Engine) {
     };
 
     let root = directory.path().join(engine.as_str());
+    let operations = vec![json!({"seed": 42}); CAPTURE_OPERATION_COUNT];
     let evidence = lab
         .measure_trial(BrowserTrialRequest {
             engine,
             artifact_root: &root,
             target_url: &server.url,
-            operations: &[json!({"seed": 42})],
+            operations: &operations,
             browser: &browser,
             batches: TrialBatchConfig::SINGLE,
         })
         .unwrap();
     assert_eq!(
         evidence.workload.result,
-        vec![json!({
-            "workerValue": EXPECTED_WORKER_VALUE,
-            "frameValue": EXPECTED_IFRAME_VALUE
-        })],
+        vec![
+            json!({
+                "workerValue": EXPECTED_WORKER_VALUE,
+                "frameValue": EXPECTED_IFRAME_VALUE
+            });
+            CAPTURE_OPERATION_COUNT
+        ],
         "{engine}"
     );
 
