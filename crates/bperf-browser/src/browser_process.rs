@@ -282,8 +282,17 @@ mod platform {
             let result = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
             if result == -1 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error).context("failed to terminate the browser process group");
+                match error.raw_os_error() {
+                    Some(libc::ESRCH) => {}
+                    Some(libc::EPERM) if cfg!(target_os = "macos") && self.root_has_exited()? => {
+                        // XNU excludes zombies from process-group signaling and
+                        // reports EPERM when no live member can be signaled.
+                        // Reaping the retained leader before the emptiness check
+                        // distinguishes that state from inaccessible live members.
+                    }
+                    _ => {
+                        return Err(error).context("failed to terminate the browser process group");
+                    }
                 }
             }
             Ok(())

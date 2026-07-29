@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use anyhow::Context;
 use anyhow::{Result, bail};
 
@@ -61,10 +61,28 @@ fn install_apt(
         "Installing {} operating-system packages for the selected browsers...",
         packages.len()
     );
-    run_apt(&["update"])?;
+    let update_error = run_apt(&["update"]).err();
     let mut arguments = vec!["install", "-y", "--no-install-recommends"];
     arguments.extend(packages);
-    run_apt(&arguments)
+    complete_apt_install(update_error, run_apt(&arguments))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn complete_apt_install(
+    update_error: Option<anyhow::Error>,
+    install_result: Result<()>,
+) -> Result<()> {
+    match (update_error, install_result) {
+        (None, result) => result,
+        (Some(update_error), Ok(())) => {
+            eprintln!(
+                "warning: apt package index refresh failed, but the requested browser dependencies were installed from authenticated cached indexes: {update_error:#}"
+            );
+            Ok(())
+        }
+        (Some(update_error), Err(install_error)) => Err(install_error)
+            .with_context(|| format!("apt package index refresh also failed: {update_error:#}")),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -149,5 +167,29 @@ mod tests {
             assert!(!groups.firefox.is_empty());
             assert!(!groups.webkit.is_empty());
         }
+    }
+
+    #[test]
+    fn successful_install_accepts_an_unrelated_index_refresh_failure() {
+        assert!(
+            complete_apt_install(
+                Some(anyhow::anyhow!("third-party mirror is synchronizing")),
+                Ok(())
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_install_preserves_the_index_refresh_failure() {
+        let error = complete_apt_install(
+            Some(anyhow::anyhow!("index refresh failed")),
+            Err(anyhow::anyhow!("package install failed")),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("index refresh failed"));
+        assert!(message.contains("package install failed"));
     }
 }
