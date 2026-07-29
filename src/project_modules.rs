@@ -16,6 +16,7 @@ use rolldown::{
     SourceMapPathTransform, SourceMapType, TreeshakeOptions, TsConfig,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Builder;
 
 const ROLLDOWN_VERSION: &str = env!("BPERF_ROLLDOWN_VERSION");
@@ -143,18 +144,7 @@ pub(crate) fn bundle(
     let entry = project_file(&root, entry, "benchmark module")?;
     fs::create_dir_all(output_root)
         .with_context(|| format!("failed to create bundle output {}", output_root.display()))?;
-    let mut browser_sdk = tempfile::Builder::new()
-        .prefix("bperf-browser-")
-        .suffix(".ts")
-        .tempfile_in(output_root)
-        .context("failed to materialize the embedded browser authoring module")?;
-    browser_sdk
-        .write_all(BROWSER_SDK_SOURCE.as_bytes())
-        .context("failed to write the embedded browser authoring module")?;
-    browser_sdk
-        .flush()
-        .context("failed to flush the embedded browser authoring module")?;
-    let browser_sdk_path = canonical_file(browser_sdk.path(), "browser authoring module")?;
+    let browser_sdk_path = materialize_browser_sdk(output_root)?;
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -183,6 +173,39 @@ pub(crate) fn bundle(
     )?;
 
     BrowserProjectBundle::open(&root, &entry, &bundle_file, &metadata_file)
+}
+
+fn materialize_browser_sdk(output_root: &Path) -> Result<PathBuf> {
+    let source = BROWSER_SDK_SOURCE.as_bytes();
+    let path = output_root.join(format!("bperf-browser-sdk-{:x}.ts", Sha256::digest(source)));
+    if !path.exists() {
+        let mut staged = tempfile::NamedTempFile::new_in(output_root)
+            .context("failed to stage the embedded browser authoring module")?;
+        staged
+            .write_all(source)
+            .context("failed to write the embedded browser authoring module")?;
+        match staged.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error.error).with_context(|| {
+                    format!(
+                        "failed to persist the embedded browser authoring module {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    let materialized = fs::read(&path)
+        .with_context(|| format!("failed to read browser authoring module {}", path.display()))?;
+    if materialized != source {
+        bail!(
+            "content-addressed browser authoring module is corrupt: {}",
+            path.display()
+        );
+    }
+    canonical_file(&path, "browser authoring module")
 }
 
 async fn bundle_source(
@@ -510,5 +533,26 @@ mod tests {
         let error = bundle(project.path(), &entry, &output).unwrap_err();
 
         assert!(format!("{error:#}").contains("benchmark module is outside benchmark root"));
+    }
+
+    #[test]
+    fn repeated_bundles_are_byte_for_byte_identical() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let output_root = root.join(".bperf");
+        let entry = root.join("sample.bench.ts");
+        fs::write(
+            &entry,
+            "import { exact } from 'bperf/browser';\nexport default exact(42);\n",
+        )
+        .unwrap();
+
+        let first = bundle(root, &entry, &output_root).unwrap();
+        let first_source = fs::read(first.bundle_file()).unwrap();
+        let first_metadata = fs::read(first.metadata_file()).unwrap();
+        let second = bundle(root, &entry, &output_root).unwrap();
+
+        assert_eq!(fs::read(second.bundle_file()).unwrap(), first_source);
+        assert_eq!(fs::read(second.metadata_file()).unwrap(), first_metadata);
     }
 }

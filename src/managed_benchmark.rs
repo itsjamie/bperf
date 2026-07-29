@@ -152,13 +152,33 @@ fn confirm_with_policy(
     let original = MeasurementSet::open(target.candidate_measurement_path())?;
     let current_benchmark = BenchmarkManifest::load(&inputs.benchmark)?;
     let current_variant = VariantDescriptor::load(&inputs.variant)?;
-    if current_benchmark.benchmark_id() != target.benchmark_id()
-        || current_benchmark.source_sha256() != original.benchmark_sha256()
-        || current_variant.source_sha256() != original.variant_sha256()
-    {
+    let mut source_mismatches = Vec::new();
+    if current_benchmark.benchmark_id() != target.benchmark_id() {
+        source_mismatches.push(format!(
+            "benchmark id expected {}, current {}",
+            target.benchmark_id(),
+            current_benchmark.benchmark_id()
+        ));
+    }
+    if current_benchmark.source_sha256() != original.benchmark_sha256() {
+        source_mismatches.push(format!(
+            "benchmark SHA-256 expected {}, current {}",
+            original.benchmark_sha256(),
+            current_benchmark.source_sha256()
+        ));
+    }
+    if current_variant.source_sha256() != original.variant_sha256() {
+        source_mismatches.push(format!(
+            "variant SHA-256 expected {}, current {}",
+            original.variant_sha256(),
+            current_variant.source_sha256()
+        ));
+    }
+    if !source_mismatches.is_empty() {
         bail!(
-            "current benchmark source does not match cycle {}",
-            target.cycle_id()
+            "current benchmark source does not match cycle {}: {}",
+            target.cycle_id(),
+            source_mismatches.join("; ")
         );
     }
 
