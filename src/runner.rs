@@ -12,7 +12,7 @@ use bperf_measurement::{
     schedule::ScheduledTrial,
     store::{self as measurement, MeasurementSet, TrialResult},
 };
-use bperf_runtime::installation::RuntimeInstallation;
+use bperf_runtime::installation::BrowserInstallation;
 use serde::Serialize;
 
 use crate::benchmark_runtime::BenchmarkRuntime;
@@ -22,7 +22,7 @@ pub struct MeasureOptions {
     pub variant: PathBuf,
     pub sampling: SamplingMode,
     pub artifact_root: PathBuf,
-    pub runtime: RuntimeInstallation,
+    pub runtime: BrowserInstallation,
 }
 
 pub(crate) enum SamplingMode {

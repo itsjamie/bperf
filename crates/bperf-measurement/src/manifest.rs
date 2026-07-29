@@ -858,11 +858,7 @@ mod tests {
 
     #[test]
     fn built_in_exact_verification_needs_no_process_configuration() {
-        let source = BENCHMARK.replace(
-            "      command:\n        - node\n        - fixtures/checkout-flow/verify.mjs\n      timeout_seconds: 30\n      identity_files:\n        - fixtures/checkout-flow/verify.mjs",
-            "      builtin: exact",
-        );
-        let benchmark = parse_benchmark(&source).unwrap();
+        let benchmark = parse_benchmark(BENCHMARK).unwrap();
         assert!(matches!(
             benchmark.workload("checkout-flow").unwrap().verifier,
             VerifierInvocation::Exact

@@ -800,8 +800,7 @@ mod tests {
     #[test]
     fn parses_the_checked_in_firefox_heap_fixture() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("sidecar/test/fixtures/captures/firefox/heap.fxsnapshot");
+            .join("tests/fixtures/captures/firefox/heap.fxsnapshot");
         assert_eq!(firefox_heap_snapshot_live_bytes(&path).unwrap(), 301);
     }
 
@@ -851,8 +850,7 @@ mod tests {
     fn truncated_gzip_snapshots_fail_explicitly() {
         let source = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("sidecar/test/fixtures/captures/firefox/heap.fxsnapshot"),
+                .join("tests/fixtures/captures/firefox/heap.fxsnapshot"),
         )
         .unwrap();
         let directory = tempdir().unwrap();

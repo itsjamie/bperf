@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bperf_runtime::installation::RuntimeInstallation;
+use bperf_runtime::installation::BrowserInstallation;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -61,7 +61,7 @@ pub struct BrowserLab {
 }
 
 impl BrowserLab {
-    pub fn start(installation: RuntimeInstallation) -> Result<Self> {
+    pub fn start(installation: BrowserInstallation) -> Result<Self> {
         Ok(Self {
             chromium: RetainedAdapter::new(installation.clone()),
             firefox: RetainedAdapter::new(installation.clone()),
@@ -168,7 +168,7 @@ trait BrowserAdapter {
 pub(crate) trait EngineAdapter: Sized {
     type Lane: EngineLane;
 
-    fn discover(installation: &RuntimeInstallation) -> Result<Self>;
+    fn discover(installation: &BrowserInstallation) -> Result<Self>;
     fn launch(&self) -> Result<Self::Lane>;
 }
 
@@ -186,13 +186,13 @@ pub(crate) trait EngineLane {
 }
 
 struct RetainedAdapter<A: EngineAdapter> {
-    installation: RuntimeInstallation,
+    installation: BrowserInstallation,
     adapter: Option<A>,
     lane: Option<A::Lane>,
 }
 
 impl<A: EngineAdapter> RetainedAdapter<A> {
-    fn new(installation: RuntimeInstallation) -> Self {
+    fn new(installation: BrowserInstallation) -> Self {
         Self {
             installation,
             adapter: None,
@@ -759,7 +759,7 @@ mod tests {
     impl EngineAdapter for FakeAdapter {
         type Lane = FakeLane;
 
-        fn discover(_installation: &RuntimeInstallation) -> Result<Self> {
+        fn discover(_installation: &BrowserInstallation) -> Result<Self> {
             DISCOVERIES.fetch_add(1, Ordering::SeqCst);
             Ok(Self)
         }
@@ -812,9 +812,7 @@ mod tests {
     #[test]
     fn golden_capture_fixtures_satisfy_every_engine_contract() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("sidecar")
-            .join("test")
+            .join("tests")
             .join("fixtures")
             .join("captures");
         for engine in Engine::ALL {
@@ -930,7 +928,7 @@ mod tests {
             counter.store(0, Ordering::SeqCst);
         }
         let mut adapter =
-            RetainedAdapter::<FakeAdapter>::new(RuntimeInstallation::discover().unwrap());
+            RetainedAdapter::<FakeAdapter>::new(BrowserInstallation::discover().unwrap());
         assert_eq!(DISCOVERIES.load(Ordering::SeqCst), 0);
 
         let first = adapter.inspect_benchmark("ok", None).unwrap();
@@ -958,7 +956,7 @@ mod tests {
     #[ignore = "launches all three pinned Playwright browsers"]
     fn retained_lanes_keep_one_root_pid_and_shutdown_all_contained_processes() {
         let artifacts = tempdir().unwrap();
-        let mut browser_lab = BrowserLab::start(RuntimeInstallation::discover().unwrap()).unwrap();
+        let mut browser_lab = BrowserLab::start(BrowserInstallation::discover().unwrap()).unwrap();
 
         for engine in Engine::ALL {
             let first = browser_lab

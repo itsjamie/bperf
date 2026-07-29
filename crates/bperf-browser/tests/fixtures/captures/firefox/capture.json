@@ -1,0 +1,30 @@
+{
+  "schema_version": 2,
+  "engine": "firefox",
+  "artifacts": [
+    {
+      "capture_scope": "browser-context",
+      "kind": "cpu_profile",
+      "path": "cpu.json",
+      "size_bytes": 358,
+      "sha256": "6f864da2f8e3492044f7d8b8e8ec4e8554b7bc401152445c7967f512433a97c7",
+      "format": "Gecko Profiler JSON"
+    },
+    {
+      "capture_scope": "browser-context",
+      "kind": "js_heap",
+      "path": "heap.fxsnapshot",
+      "size_bytes": 62,
+      "sha256": "1ae291df0d3d6bfba281ff89eca2e5038dd87f25859c7dcc4fdbe4e854cdca5c",
+      "format": "Firefox .fxsnapshot"
+    },
+    {
+      "capture_scope": "browser-context",
+      "kind": "flamegraph",
+      "path": "flamegraph.json",
+      "size_bytes": 390,
+      "sha256": "5a06feceed3648de8beb70bc9b3098c74333c2c28b2f8d4b5b5dc7d480505c16",
+      "format": "Speedscope sampled profiles"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": 2,
+  "engine": "chromium",
+  "artifacts": [
+    {
+      "capture_scope": "page",
+      "kind": "cpu_profile",
+      "path": "cpu.json",
+      "size_bytes": 276,
+      "sha256": "a0900395518ec5379d58b367310b857303d0f5cf8a8914a2ee4a0ce2f7342961",
+      "format": "V8 CPU profile"
+    },
+    {
+      "capture_scope": "page",
+      "kind": "js_heap",
+      "path": "heap.json",
+      "size_bytes": 99,
+      "sha256": "9cc6634bc7e92459abdee9d68334f10de96a7919bda929cae388039fbde71740",
+      "format": "V8 heap snapshot"
+    },
+    {
+      "capture_scope": "page",
+      "kind": "flamegraph",
+      "path": "flamegraph.json",
+      "size_bytes": 449,
+      "sha256": "8facdec9ea2343d78ef52ce82e746e80cd338ca5d3b00f3d93e91a4e6c455a6d",
+      "format": "Speedscope sampled profile"
+    }
+  ]
+}

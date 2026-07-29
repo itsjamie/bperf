@@ -8,7 +8,7 @@ description: Runs browser performance optimization loops with bperf while preser
 ## Preconditions
 
 1. Read the repository's `AGENTS.md` and benchmark source.
-2. Run `bperf --version` and require Node 24.12 or newer.
+2. Run `bperf --version`.
 3. Locate the relevant `*.bench.ts`. If none exists, use the repository's
    bperf authoring guide when present, then the minimal shape in
    [REFERENCE.md](REFERENCE.md).

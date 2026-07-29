@@ -1,6 +1,6 @@
 # ADR 0009: Release one self-contained executable per native target
 
-Status: accepted · 2026-07-27
+Status: superseded in part by ADR 0013 · 2026-07-27
 
 ## Context
 

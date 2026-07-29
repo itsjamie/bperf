@@ -6,13 +6,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::{BrowserLab, CaptureEvidence, Engine};
-use bperf_runtime::installation::RuntimeInstallation;
+use bperf_runtime::installation::BrowserInstallation;
 use serde::Serialize;
 
 pub struct DoctorOptions {
     pub engines: Vec<Engine>,
     pub artifact_root: PathBuf,
-    pub runtime: RuntimeInstallation,
+    pub runtime: BrowserInstallation,
     pub json: bool,
 }
 

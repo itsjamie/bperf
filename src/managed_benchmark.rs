@@ -3,12 +3,8 @@
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, mpsc},
-    thread,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -23,13 +19,18 @@ use bperf_measurement::{
     sampling::RunBudget,
     store::MeasurementSet,
 };
-use bperf_runtime::installation::{RuntimeInstallation, node_path as path_value};
+use bperf_runtime::installation::{BrowserInstallation, portable_path as path_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tempfile::{NamedTempFile, tempdir_in};
+use tempfile::tempdir_in;
 
-use crate::runner::{self, MeasureOptions, SamplingMode};
+use crate::{
+    benchmark_host::BenchmarkHost,
+    fixtures::{self, FixtureDescriptor},
+    project_modules::{self, BrowserProjectBundle},
+    runner::{self, MeasureOptions, SamplingMode},
+};
 
 const STANDARD_TRIAL_POLICY: TrialPolicy = TrialPolicy {
     warmup_samples: 0,
@@ -54,8 +55,6 @@ pub struct ExecutionOptions {
     pub comparison_root: PathBuf,
     pub lineage_root: PathBuf,
     pub budget: RunBudget,
-    pub node: Option<PathBuf>,
-    pub sidecar: Option<PathBuf>,
 }
 
 pub struct RunOptions {
@@ -66,18 +65,15 @@ pub struct RunOptions {
 
 pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
     let execution = options.execution;
-    let node = execution
-        .node
-        .clone()
-        .or_else(|| std::env::var_os("BPERF_NODE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("node"));
-    let sidecar = runtime_installation(execution.sidecar.as_deref())?;
+    let installation = BrowserInstallation::discover()?;
+    let host_executable =
+        std::env::current_exe().context("failed to locate the bperf executable")?;
     let inputs = materialize(
         &options.benchmark,
         &execution.state_root,
         &execution.object_root,
-        &node,
-        &sidecar,
+        &installation,
+        &host_executable,
         STANDARD_TRIAL_POLICY,
     )?;
     let measurement = runner::run(MeasureOptions {
@@ -88,7 +84,7 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
             cohort: None,
         },
         artifact_root: execution.artifact_root,
-        runtime: sidecar.clone(),
+        runtime: installation.clone(),
     })?;
     let comparison = compare_current(
         &measurement,
@@ -132,27 +128,25 @@ pub struct ConfirmOptions {
 }
 
 pub(crate) fn confirm(options: ConfirmOptions) -> Result<ConfirmOutcome> {
-    confirm_with_policy(options, STANDARD_TRIAL_POLICY)
+    let host_executable =
+        std::env::current_exe().context("failed to locate the bperf executable")?;
+    confirm_with_policy(options, STANDARD_TRIAL_POLICY, &host_executable)
 }
 
 fn confirm_with_policy(
     options: ConfirmOptions,
     trial_policy: TrialPolicy,
+    host_executable: &Path,
 ) -> Result<ConfirmOutcome> {
     let execution = options.execution;
     let target = lineage::confirmation_target(&execution.lineage_root, &options.cycle_id)?;
-    let node = execution
-        .node
-        .clone()
-        .or_else(|| std::env::var_os("BPERF_NODE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("node"));
-    let sidecar = runtime_installation(execution.sidecar.as_deref())?;
+    let installation = BrowserInstallation::discover()?;
     let inputs = materialize(
         &options.benchmark,
         &execution.state_root,
         &execution.object_root,
-        &node,
-        &sidecar,
+        &installation,
+        host_executable,
         trial_policy,
     )?;
     let original = MeasurementSet::open(target.candidate_measurement_path())?;
@@ -189,7 +183,7 @@ fn confirm_with_policy(
             cohort: Some(format!("confirmation:{}", target.cycle_id())),
         },
         artifact_root: execution.artifact_root,
-        runtime: sidecar.clone(),
+        runtime: installation.clone(),
     })?;
     let comparison = comparison::run(comparison::CompareOptions {
         candidate_root: measurement.measurement_root().to_owned(),
@@ -464,12 +458,19 @@ impl ManagedExpectation {
     }
 }
 
+struct PreparedBenchmarkProject<'a> {
+    root: &'a Path,
+    benchmark: &'a Path,
+    bundle: &'a BrowserProjectBundle,
+    host_executable: &'a Path,
+}
+
 fn materialize(
     benchmark: &Path,
     state_root: &Path,
     object_root: &Path,
-    node: &Path,
-    sidecar: &RuntimeInstallation,
+    installation: &BrowserInstallation,
+    host_executable: &Path,
     trial_policy: TrialPolicy,
 ) -> Result<MaterializedInputs> {
     let root = fs::canonicalize(std::env::current_dir()?)
@@ -492,31 +493,33 @@ fn materialize(
         .with_context(|| format!("failed to create {}", generated_root.display()))?;
     let generated_root = fs::canonicalize(&generated_root)?;
     let fixture_lock = generated_root.join("fixture-lock.json");
+    let project_bundle = project_modules::bundle(&root, &benchmark, &generated_root)?;
+    let project = PreparedBenchmarkProject {
+        root: &root,
+        benchmark: &benchmark,
+        bundle: &project_bundle,
+        host_executable,
+    };
 
-    let description = describe(
-        &root,
-        &benchmark,
-        &fixture_lock,
-        &object_root,
-        node,
-        sidecar,
-    )?;
+    let description = describe(&project, &fixture_lock, &object_root, installation)?;
+    let hosted_sources = BTreeSet::from_iter(description.source_files.iter());
+    let bundled_sources = BTreeSet::from_iter(project_bundle.source_files());
+    if hosted_sources != bundled_sources {
+        let missing = bundled_sources
+            .difference(&hosted_sources)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let unexpected = hosted_sources
+            .difference(&bundled_sources)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        bail!(
+            "benchmark host reported a different source graph than the project bundler \
+             (missing: {missing:?}; unexpected: {unexpected:?})"
+        );
+    }
     validate_description(&description)?;
-    write_inputs(
-        &root,
-        &benchmark,
-        &generated_root,
-        node,
-        sidecar,
-        &description,
-        trial_policy,
-    )
-}
-
-fn runtime_installation(configured: Option<&Path>) -> Result<RuntimeInstallation> {
-    configured.map_or_else(RuntimeInstallation::discover, |root| {
-        RuntimeInstallation::from_root(root.to_owned())
-    })
+    write_inputs(&project, &generated_root, &description, trial_policy)
 }
 
 fn absolute_directory(path: &Path) -> Result<PathBuf> {
@@ -532,23 +535,14 @@ fn benchmark_key(path: &Path) -> String {
 }
 
 fn describe(
-    root: &Path,
-    benchmark: &Path,
+    project: &PreparedBenchmarkProject<'_>,
     fixture_lock: &Path,
     object_root: &Path,
-    node: &Path,
-    sidecar: &RuntimeInstallation,
+    installation: &BrowserInstallation,
 ) -> Result<ManagedDescription> {
-    let mut browser_lab = BrowserLab::start(sidecar.clone())?;
-    let discovery = discover_managed_benchmark(
-        root,
-        benchmark,
-        fixture_lock,
-        object_root,
-        node,
-        sidecar,
-        &mut browser_lab,
-    );
+    let mut browser_lab = BrowserLab::start(installation.clone())?;
+    let discovery =
+        discover_managed_benchmark(project, fixture_lock, object_root, &mut browser_lab);
     let shutdown = browser_lab.finish();
     match (discovery, shutdown) {
         (Ok(description), Ok(())) => Ok(description),
@@ -560,180 +554,18 @@ fn describe(
     }
 }
 
-const BENCHMARK_HOST_PROTOCOL_VERSION: u32 = 2;
-const BENCHMARK_HOST_READY_TIMEOUT: Duration = Duration::from_secs(15);
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrowserDescription {
     id: String,
     cases: Vec<ManagedCase>,
-    fixtures: Vec<Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResolvedFixtures {
-    fixture_files: Vec<PathBuf>,
-    fixture_lock: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BenchmarkHostReady {
-    protocol_version: u32,
-    url: String,
-    source_files: Vec<PathBuf>,
-}
-
-struct BenchmarkHostProcess {
-    child: Child,
-    url: String,
-    source_files: Vec<PathBuf>,
-    stderr_lines: Arc<Mutex<Vec<String>>>,
-}
-
-impl BenchmarkHostProcess {
-    fn start(
-        root: &Path,
-        benchmark: &Path,
-        fixture_lock: &Path,
-        node: &Path,
-        sidecar: &RuntimeInstallation,
-    ) -> Result<Self> {
-        let host = sidecar.benchmark_host();
-        let mut child = Command::new(node)
-            .arg("--disable-warning=ExperimentalWarning")
-            .arg(path_value(&host))
-            .arg("host")
-            .arg(path_value(benchmark))
-            .arg("--root")
-            .arg(path_value(root))
-            .arg("--lock")
-            .arg(path_value(fixture_lock))
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start benchmark host with Node executable {}",
-                    node.display()
-                )
-            })?;
-
-        let readiness = (|| -> Result<(BenchmarkHostReady, Arc<Mutex<Vec<String>>>)> {
-            let stdout = child
-                .stdout
-                .take()
-                .context("benchmark host stdout was unavailable")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("benchmark host stderr was unavailable")?;
-            let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-            let captured_lines = Arc::clone(&stderr_lines);
-            thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
-                    eprintln!("[benchmark-host] {line}");
-                    if let Ok(mut lines) = captured_lines.lock() {
-                        lines.push(line);
-                    }
-                }
-            });
-
-            let (sender, receiver) = mpsc::sync_channel(1);
-            thread::spawn(move || {
-                let mut line = String::new();
-                let result = BufReader::new(stdout)
-                    .read_line(&mut line)
-                    .map(|count| (count, line));
-                let _ = sender.send(result);
-            });
-            let line = match receiver.recv_timeout(BENCHMARK_HOST_READY_TIMEOUT) {
-                Ok(Ok((0, _))) => {
-                    let status = child.try_wait().ok().flatten();
-                    bail!("benchmark host closed before readiness (status: {status:?})")
-                }
-                Ok(Ok((_, line))) => line,
-                Ok(Err(error)) => {
-                    return Err(error).context("failed to read benchmark host readiness");
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => bail!(
-                    "benchmark host did not become ready within {:?}",
-                    BENCHMARK_HOST_READY_TIMEOUT
-                ),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("benchmark host readiness reader stopped")
-                }
-            };
-            let ready: BenchmarkHostReady = serde_json::from_str(&line)
-                .context("benchmark host emitted invalid readiness JSON")?;
-            if ready.protocol_version != BENCHMARK_HOST_PROTOCOL_VERSION {
-                bail!(
-                    "benchmark host protocol mismatch: expected {}, received {}",
-                    BENCHMARK_HOST_PROTOCOL_VERSION,
-                    ready.protocol_version
-                );
-            }
-            if ready.url.trim().is_empty() {
-                bail!("benchmark host readiness URL is empty");
-            }
-            if ready.source_files.is_empty() {
-                bail!("benchmark host resolved no source files");
-            }
-            Ok((ready, stderr_lines))
-        })();
-        let (ready, stderr_lines) = match readiness {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        Ok(Self {
-            child,
-            url: ready.url,
-            source_files: ready.source_files,
-            stderr_lines,
-        })
-    }
-
-    fn url(&self) -> &str {
-        &self.url
-    }
-
-    fn source_files(&self) -> &[PathBuf] {
-        &self.source_files
-    }
-}
-
-impl Drop for BenchmarkHostProcess {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        if let Ok(lines) = self.stderr_lines.lock()
-            && !lines.is_empty()
-        {
-            eprintln!(
-                "[benchmark-host] stopped after reporting {} diagnostic line(s)",
-                lines.len()
-            );
-        }
-    }
+    fixtures: Vec<FixtureDescriptor>,
 }
 
 fn discover_managed_benchmark(
-    root: &Path,
-    benchmark: &Path,
+    project: &PreparedBenchmarkProject<'_>,
     fixture_lock: &Path,
     object_root: &Path,
-    node: &Path,
-    sidecar: &RuntimeInstallation,
     browser_lab: &mut BrowserLab,
 ) -> Result<ManagedDescription> {
     let temporary = tempdir_in(
@@ -745,31 +577,27 @@ fn discover_managed_benchmark(
     let unresolved_lock = temporary.path().join("unresolved-fixture-lock.json");
 
     let (unresolved_description, mut source_files) = {
-        let host = BenchmarkHostProcess::start(root, benchmark, &unresolved_lock, node, sidecar)?;
+        let host = BenchmarkHost::start(project.bundle, &unresolved_lock)?;
         let description =
             inspect_description_in_every_engine(browser_lab, host.url(), "unresolved")?;
-        (
-            description,
-            BTreeSet::from_iter(host.source_files().iter().cloned()),
-        )
+        let source_files = BTreeSet::from_iter(host.source_files().iter().cloned());
+        host.close()
+            .context("unresolved benchmark host failed to close")?;
+        (description, source_files)
     };
 
-    let mut description_file =
-        NamedTempFile::new_in(temporary.path()).context("failed to create description file")?;
-    serde_json::to_writer(&mut description_file, &unresolved_description)
-        .context("failed to serialize the browser-owned benchmark description")?;
-    let resolved = resolve_fixtures(
-        root,
-        benchmark,
+    let parsed: BrowserDescription = serde_json::from_value(unresolved_description.clone())
+        .context("browser returned an invalid managed benchmark description")?;
+    let resolved = fixtures::resolve(
+        project.root,
+        project.benchmark,
         fixture_lock,
         object_root,
-        node,
-        sidecar,
-        description_file.path(),
+        &parsed.fixtures,
     )?;
 
     {
-        let host = BenchmarkHostProcess::start(root, benchmark, fixture_lock, node, sidecar)?;
+        let host = BenchmarkHost::start(project.bundle, fixture_lock)?;
         source_files.extend(host.source_files().iter().cloned());
         let resolved_description =
             inspect_description_in_every_engine(browser_lab, host.url(), "resolved")?;
@@ -777,11 +605,9 @@ fn discover_managed_benchmark(
             bail!("fixture resolution changed the managed benchmark description");
         }
 
-        let parsed: BrowserDescription = serde_json::from_value(resolved_description.clone())
-            .context("browser returned an invalid managed benchmark description")?;
         if parsed.fixtures.len() != resolved.fixture_files.len() {
             bail!(
-                "fixture resolver returned {} files for {} browser fixtures",
+                "fixture acquisition returned {} files for {} browser fixtures",
                 resolved.fixture_files.len(),
                 parsed.fixtures.len()
             );
@@ -792,6 +618,8 @@ fn discover_managed_benchmark(
             &resolved_description,
             &parsed.cases,
         )?;
+        host.close()
+            .context("resolved benchmark host failed to close")?;
         Ok(ManagedDescription {
             schema_version: 1,
             benchmark_id: parsed.id,
@@ -889,56 +717,6 @@ fn validate_case_inspection(
     Ok(())
 }
 
-fn resolve_fixtures(
-    root: &Path,
-    benchmark: &Path,
-    fixture_lock: &Path,
-    object_root: &Path,
-    node: &Path,
-    sidecar: &RuntimeInstallation,
-    description_file: &Path,
-) -> Result<ResolvedFixtures> {
-    let host = sidecar.benchmark_host();
-    let output = Command::new(node)
-        .arg("--disable-warning=ExperimentalWarning")
-        .arg(path_value(&host))
-        .arg("resolve")
-        .arg(path_value(benchmark))
-        .arg("--root")
-        .arg(path_value(root))
-        .arg("--lock")
-        .arg(path_value(fixture_lock))
-        .arg("--cache")
-        .arg(path_value(object_root))
-        .arg("--description")
-        .arg(path_value(description_file))
-        .current_dir(root)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to resolve benchmark fixtures with Node executable {}",
-                node.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "benchmark fixture resolution failed with {}{}",
-            output.status,
-            if output.stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", String::from_utf8_lossy(&output.stderr))
-            }
-        );
-    }
-    serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "benchmark host {} emitted invalid fixture resolution",
-            host.display()
-        )
-    })
-}
-
 fn validate_description(description: &ManagedDescription) -> Result<()> {
     if description.schema_version != 1 {
         bail!(
@@ -974,20 +752,16 @@ fn validate_description(description: &ManagedDescription) -> Result<()> {
 }
 
 fn write_inputs(
-    root: &Path,
-    benchmark_module: &Path,
+    project: &PreparedBenchmarkProject<'_>,
     generated_root: &Path,
-    node: &Path,
-    sidecar: &RuntimeInstallation,
     description: &ManagedDescription,
     trial_policy: TrialPolicy,
 ) -> Result<MaterializedInputs> {
-    let benchmark_host = sidecar.benchmark_host();
     let workload_root = generated_root.join("workloads");
     fs::create_dir_all(&workload_root)?;
 
     let mut benchmark_identity_files = BTreeSet::from([
-        path_value(benchmark_module),
+        path_value(project.benchmark),
         path_value(&description.fixture_lock),
     ]);
     benchmark_identity_files.extend(
@@ -1077,9 +851,9 @@ fn write_inputs(
     let benchmark_path = generated_root.join("benchmark.json");
     write_json(&benchmark_path, &benchmark)?;
 
-    let mut implementation_files = BTreeSet::from([path_value(benchmark_module)]);
-    implementation_files.extend(sidecar.identity_files().iter().map(|file| path_value(file)));
+    let mut implementation_files = BTreeSet::from([path_value(project.benchmark)]);
     implementation_files.extend(description.source_files.iter().map(|file| path_value(file)));
+    implementation_files.extend(project.bundle.identity_files().into_iter().map(path_value));
     let variant = json!({
         "schema_version": 1,
         "id": "worktree",
@@ -1091,15 +865,18 @@ fn write_inputs(
         },
         "adapter": {
             "command": [
-                path_value(node),
-                "--disable-warning=ExperimentalWarning",
-                path_value(&benchmark_host),
-                "serve",
-                path_value(benchmark_module),
+                path_value(project.host_executable),
+                "__benchmark-host",
                 "--root",
-                path_value(root),
-                "--lock",
+                path_value(project.root),
+                "--benchmark",
+                path_value(project.benchmark),
+                "--fixture-lock",
                 path_value(&description.fixture_lock),
+                "--bundle",
+                path_value(project.bundle.bundle_file()),
+                "--bundle-metadata",
+                path_value(project.bundle.metadata_file()),
             ],
             "ready": {
                 "protocol": "stdio-json",
@@ -1113,7 +890,7 @@ fn write_inputs(
     Ok(MaterializedInputs {
         benchmark: benchmark_path,
         variant: variant_path,
-        workspace_root: root.to_owned(),
+        workspace_root: project.root.to_owned(),
         source_files: description.source_files.clone(),
     })
 }
@@ -1154,7 +931,7 @@ fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, process::Command};
 
     use tempfile::tempdir;
 
@@ -1163,7 +940,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn paths_crossing_into_node_do_not_use_windows_verbatim_syntax() {
+    fn generated_paths_do_not_use_windows_verbatim_syntax() {
         assert_eq!(
             path_value(Path::new(r"\\?\C:\workspace\benchmark.ts")),
             r"C:\workspace\benchmark.ts"
@@ -1315,21 +1092,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Node and all three Playwright browsers"]
+    #[ignore = "requires all three pinned Playwright browsers"]
     fn managed_benchmark_satisfies_every_engine_contract() {
-        let node = PathBuf::from(std::env::var_os("BPERF_NODE").unwrap_or_else(|| "node".into()));
         let temporary = tempdir().unwrap();
         let benchmark = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")
             .join("managed")
             .join("fragment-parser.bench.ts");
-        let sidecar = RuntimeInstallation::discover().unwrap();
+        let installation = BrowserInstallation::discover().unwrap();
+        let host_executable = build_bperf_executable();
         let inputs = materialize(
             &benchmark,
             &temporary.path().join("managed"),
             &temporary.path().join("objects"),
-            &node,
-            &sidecar,
+            &installation,
+            &host_executable,
             TrialPolicy {
                 warmup_samples: 0,
                 pilot_samples: 2,
@@ -1339,6 +1116,17 @@ mod tests {
         )
         .unwrap();
         let variant = fs::read_to_string(&inputs.variant).unwrap();
+        let variant_value: Value = serde_json::from_str(&variant).unwrap();
+        let adapter_command = variant_value["adapter"]["command"].as_array().unwrap();
+        assert_eq!(
+            adapter_command[0],
+            path_value(&host_executable),
+            "the generated adapter must run the current bperf executable"
+        );
+        assert_eq!(
+            adapter_command[1], "__benchmark-host",
+            "the native benchmark host must serve discovery and trial traffic"
+        );
         assert!(
             variant.contains("fragment-checksum.ts"),
             "modules loaded by setup or measurement must participate in variant identity"
@@ -1354,7 +1142,7 @@ mod tests {
                 cohort: None,
             },
             artifact_root: measurement_root.clone(),
-            runtime: RuntimeInstallation::discover().unwrap(),
+            runtime: BrowserInstallation::discover().unwrap(),
         })
         .unwrap();
 
@@ -1473,8 +1261,6 @@ mod tests {
                     comparison_root: temporary.path().join("comparisons"),
                     lineage_root: temporary.path().join("lineages"),
                     budget: "2m".parse().unwrap(),
-                    node: Some(node),
-                    sidecar: None,
                 },
             },
             TrialPolicy {
@@ -1483,6 +1269,7 @@ mod tests {
                 min_final_samples: 1,
                 max_final_samples: 2,
             },
+            &host_executable,
         )
         .unwrap();
         assert!(
@@ -1500,5 +1287,30 @@ mod tests {
             "confirmation anchors were not stable: {:#?}",
             confirmation_summary.engines
         );
+    }
+
+    fn build_bperf_executable() -> PathBuf {
+        let cargo = std::env::var_os("CARGO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cargo"));
+        let mut command = Command::new(cargo);
+        command.args(["build", "--locked", "--bin", "bperf"]);
+        if !cfg!(debug_assertions) {
+            command.arg("--release");
+        }
+        let status = command
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "failed to build the benchmark host binary"
+        );
+
+        let test_executable = std::env::current_exe().unwrap();
+        let profile_root = test_executable.parent().unwrap().parent().unwrap();
+        let executable = profile_root.join(if cfg!(windows) { "bperf.exe" } else { "bperf" });
+        assert!(executable.is_file(), "{}", executable.display());
+        executable
     }
 }

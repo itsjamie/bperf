@@ -245,10 +245,11 @@ Import the subject as project code normally does:
 import { parseInitSegment } from "../src/utils/mp4-tools.ts";
 ```
 
-bperf creates an in-memory browser ESM bundle using the project's installed
+bperf materializes one browser ESM bundle using the project's installed
 packages and TypeScript configuration. It handles TypeScript syntax, ESM,
 CommonJS dependencies, package export maps, and path aliases without changing
-the project's package type.
+the project's package type. The browser authoring module is inlined, so the
+Rust host serves one JavaScript response without runtime module resolution.
 
 The measured variant includes:
 
@@ -257,7 +258,7 @@ The measured variant includes:
 - TypeScript or JavaScript configuration that affects emitted semantics.
 
 Statically resolvable dynamic imports are part of the bundle graph. Runtime
-ports, generated fixture URLs, and bperf's own sidecar source do not become
+ports, generated fixture URLs, and bperf's embedded runtime sources do not become
 part of the project checkpoint.
 
 The source graph is read twice before a cycle is recorded. If the graph changes

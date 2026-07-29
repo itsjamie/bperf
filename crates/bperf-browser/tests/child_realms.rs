@@ -15,7 +15,7 @@ use bperf_browser::lab::{
     ArtifactKind, BrowserLab, BrowserTrialConfig, BrowserTrialRequest, Engine, TrialBatchConfig,
     Viewport,
 };
-use bperf_runtime::installation::RuntimeInstallation;
+use bperf_runtime::installation::BrowserInstallation;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -281,7 +281,7 @@ fn gecko_profile_marks_url(profile: &serde_json::Value, url_suffix: &str) -> boo
 fn assert_child_realm_evidence(engine: Engine) {
     let server = RealmServer::start();
     let directory = tempdir().unwrap();
-    let mut lab = BrowserLab::start(RuntimeInstallation::discover().unwrap()).unwrap();
+    let mut lab = BrowserLab::start(BrowserInstallation::discover().unwrap()).unwrap();
     let browser = BrowserTrialConfig {
         viewport: Viewport {
             width: 1_280,

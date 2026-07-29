@@ -1,0 +1,16 @@
+[package]
+name = "bperf-build"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+flate2 = "1.1"
+ring = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+ureq = "3.3"

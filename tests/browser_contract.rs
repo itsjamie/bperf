@@ -7,7 +7,7 @@ use tempfile::tempdir;
 /// browsers and writes large diagnostic artifacts. Release/CI environments
 /// that advertise browser support must run it.
 #[test]
-#[ignore = "requires the pinned sidecar installation and all three Playwright browsers"]
+#[ignore = "requires all three pinned Playwright browser builds"]
 fn every_engine_satisfies_the_capture_contract() {
     let artifact_root = tempdir().expect("create conformance artifact directory");
     let output = Command::new(env!("CARGO_BIN_EXE_bperf"))
@@ -55,15 +55,13 @@ fn every_engine_satisfies_the_capture_contract() {
     }
 }
 
-/// A nonexistent Node executable proves the WebKit route performs capture
-/// without starting Node. This remains an ignored release gate because it
-/// launches the pinned WebKit browser.
+/// This remains an ignored release gate because it launches the pinned WebKit
+/// browser.
 #[test]
 #[ignore = "requires the pinned Playwright WebKit browser"]
-fn webkit_doctor_does_not_spawn_node() {
+fn webkit_doctor_uses_the_native_adapter() {
     let artifact_root = tempdir().expect("create conformance artifact directory");
     let output = Command::new(env!("CARGO_BIN_EXE_bperf"))
-        .env("BPERF_NODE", "bperf-node-must-not-be-started")
         .args(["doctor", "--engine", "webkit", "--json"])
         .arg("--artifact-dir")
         .arg(artifact_root.path())
@@ -82,14 +80,11 @@ fn webkit_doctor_does_not_spawn_node() {
     assert_eq!(summary["engines"][0]["adapter"]["kind"], "rust-webkit");
 }
 
-/// A nonexistent Node executable proves the Chromium route performs capture
-/// without starting Node.
 #[test]
 #[ignore = "requires the pinned Playwright Chromium browser"]
-fn chromium_doctor_does_not_spawn_node() {
+fn chromium_doctor_uses_the_native_adapter() {
     let artifact_root = tempdir().expect("create conformance artifact directory");
     let output = Command::new(env!("CARGO_BIN_EXE_bperf"))
-        .env("BPERF_NODE", "bperf-node-must-not-be-started")
         .args(["doctor", "--engine", "chromium", "--json"])
         .arg("--artifact-dir")
         .arg(artifact_root.path())
@@ -108,14 +103,11 @@ fn chromium_doctor_does_not_spawn_node() {
     assert_eq!(summary["engines"][0]["adapter"]["kind"], "rust-chromium");
 }
 
-/// A nonexistent Node executable proves the Firefox route is owned entirely by
-/// the Rust browser laboratory.
 #[test]
 #[ignore = "requires the pinned Playwright Firefox browser"]
-fn firefox_doctor_does_not_spawn_node() {
+fn firefox_doctor_uses_the_native_adapter() {
     let artifact_root = tempdir().expect("create conformance artifact directory");
     let output = Command::new(env!("CARGO_BIN_EXE_bperf"))
-        .env("BPERF_NODE", "bperf-node-must-not-be-started")
         .args(["doctor", "--engine", "firefox", "--json"])
         .arg("--artifact-dir")
         .arg(artifact_root.path())

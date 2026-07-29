@@ -55,25 +55,26 @@ TypeScript authoring API may still change.
 
 ## Requirements
 
-- Node.js 24.12 or newer
 - Rust with edition 2024 support when installing from source
 - The Chromium, Firefox, and WebKit builds pinned by bperf's Playwright version
+
+Node.js is not required to build, install, test, or run bperf.
 
 ## Install
 
 Every `v*` tag publishes native archives for x86-64 Linux and Windows, plus
 Apple Silicon and Intel macOS. Each archive contains one bperf executable with
-the benchmark host, project bundler, and pinned Playwright registry embedded
-inside it. Extract the archive, put its directory on `PATH`, then install the
-browser builds:
+the Rust project bundler, fixture acquisition, benchmark host, browser
+authoring module, and pinned browser registry. Extract the archive, put its
+directory on `PATH`, then install the browser builds:
 
 ```text
 bperf browsers install --engine all
 bperf doctor --engine all
 ```
 
-On Linux, pass `--with-deps` to let Playwright install required operating-system
-packages as well:
+On Linux, pass `--with-deps` to let bperf install the required
+operating-system packages as well:
 
 ```text
 bperf browsers install --engine all --with-deps
@@ -88,15 +89,9 @@ bperf browsers install --engine all
 bperf doctor --engine all
 ```
 
-The first command that needs the benchmark runtime materializes its embedded,
-versioned files beside the executable. A release binary already contains the
-production Node packages. A source-built Cargo installation resolves those
-locked packages with `npm ci` during first use.
-
 From a source checkout:
 
 ```text
-npm --prefix sidecar ci
 cargo build --locked
 cargo run -- browsers install --engine all
 cargo run -- doctor --engine all
@@ -104,23 +99,23 @@ cargo run -- doctor --engine all
 
 `doctor --engine all` is the capability gate. Run it on a new machine or after
 changing Playwright or the installed browsers. Every doctor launches its browser
-directly from Rust; the Node runtime is not part of browser capture.
+directly from Rust.
 
 To create and install an optimized build for the current platform:
 
 ```text
-node scripts/package-release.ts --install
+cargo run --locked -p bperf-build -- package --install
 bperf --version
 ```
 
-The packaging script builds a target-triple archive, embeds the locked
-TypeScript benchmark runtime in the executable, and installs that executable
-under Cargo's user `bin` directory. Node bundles and hosts TypeScript
-benchmarks but does not launch browsers. Rust reads the embedded Playwright
-registry and directly launches and captures Chromium, Firefox, and WebKit.
-The benchmark runtime runs directly in Node; there is no transpiled JavaScript
-tree. The archive also contains the documentation, examples, license, and
-`bperf-agent-loop` skill.
+The Rust packaging tool builds a target-triple archive and installs its
+executable under Cargo's user `bin` directory. Rust bundles benchmark projects
+with Rolldown, acquires and pins local or remote fixtures, serves the generated
+bundle and locked fixture bodies, downloads and extracts the pinned browser
+archives, and directly launches and captures Chromium, Firefox, and WebKit.
+The browser authoring module is inlined into the generated bundle; there is no
+transpiled JavaScript tree. The archive also contains the documentation,
+examples, license, and `bperf-agent-loop` skill.
 
 ## Write a benchmark
 
@@ -277,8 +272,8 @@ The design and the reasons behind these boundaries are in
 ## Advanced integration
 
 The original YAML benchmark, variant descriptor, JSONL operation stream, local
-adapter, and verifier process remain available for subjects that cannot use the
-TypeScript authoring path:
+adapter, and built-in or custom verifier remain available for subjects that
+cannot use the TypeScript authoring path:
 
 ```text
 cargo run -- validate examples/browser-benchmark.yaml --variant examples/browser-variant-baseline.yaml

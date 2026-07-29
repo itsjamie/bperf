@@ -1,124 +1,411 @@
-//! Playwright browser discovery for an installed bperf runtime.
+//! Rust-native installation of the browser builds published for Playwright.
 //!
-//! Engine adapters ask for an installed browser by registry name. Cache location,
-//! host-specific revision overrides, and Playwright's on-disk naming convention
-//! remain private to this module.
+//! bperf consumes Playwright's patched browser archives, but does not load or
+//! execute the Playwright package. This module fixes the exact build registry,
+//! translates it into one host-specific artifact, and installs that artifact
+//! atomically into the conventional Playwright cache.
 
 use std::{
-    collections::BTreeMap,
-    ffi::OsStr,
-    fs,
+    collections::BTreeSet,
+    fs::{self, File},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use anyhow::{Context, Result, bail};
+use tempfile::tempdir_in;
+use zip::ZipArchive;
 
-use crate::installation::{BrowserName, InstalledBrowser};
+use crate::{
+    installation::{BrowserName, InstalledBrowser},
+    native_dependencies,
+    registry::Registry,
+};
 
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::collections::HashMap;
+const INSTALLATION_MARKER: &str = "INSTALLATION_COMPLETE";
+const INSTALLATION_METADATA: &str = "BPERF_INSTALLATION";
+const MAX_ARCHIVE_ENTRIES: usize = 500_000;
+const MAX_UNCOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlaywrightInstallation {
-    browsers: Vec<BrowserDescriptor>,
+    distribution: Registry,
     host_platform: String,
-    registry: PathBuf,
-    version: String,
+    browser_cache: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserArtifact {
+    browser_version: String,
+    directory: PathBuf,
+    executable: PathBuf,
+    name: BrowserName,
+    revision: String,
+    urls: Vec<String>,
 }
 
 impl PlaywrightInstallation {
-    pub(crate) fn discover(sidecar_root: &Path) -> Result<Self> {
-        let core = sidecar_root.join("node_modules").join("playwright-core");
-        let browsers_path = core.join("browsers.json");
-        let browsers: BrowsersJson = serde_json::from_slice(
-            &fs::read(&browsers_path)
-                .with_context(|| format!("failed to read {}", browsers_path.display()))?,
-        )
-        .with_context(|| {
-            format!(
-                "invalid Playwright browser registry {}",
-                browsers_path.display()
-            )
-        })?;
-        let package_path = core.join("package.json");
-        let package: PackageJson = serde_json::from_slice(
-            &fs::read(&package_path)
-                .with_context(|| format!("failed to read {}", package_path.display()))?,
-        )
-        .with_context(|| format!("invalid Playwright package {}", package_path.display()))?;
-
+    pub(crate) fn discover() -> Result<Self> {
         Ok(Self {
-            browsers: browsers.browsers,
+            distribution: Registry::embedded()?,
             host_platform: playwright_host_platform()?,
-            registry: playwright_registry_directory(&core)?,
-            version: package.version,
+            browser_cache: browser_registry_directory()?,
         })
     }
 
     pub(crate) fn browser(&self, name: BrowserName) -> Result<InstalledBrowser> {
-        let name = name.registry_name();
-        let descriptor = self
-            .browsers
-            .iter()
-            .find(|browser| browser.name == name)
-            .with_context(|| format!("pinned Playwright registry has no {name} descriptor"))?;
-        let overridden_revision = descriptor.revision_overrides.get(&self.host_platform);
-        let revision = overridden_revision
-            .cloned()
-            .unwrap_or_else(|| descriptor.revision.clone());
-        let directory_prefix = if overridden_revision.is_some() {
-            format!("{name}_{}_special", self.host_platform)
-        } else {
-            name.to_owned()
-        };
-
+        let artifact = self.artifact(name)?;
         Ok(InstalledBrowser {
-            directory: self
-                .registry
-                .join(playwright_browser_directory(&directory_prefix, &revision)),
-            revision,
-            browser_version: descriptor
-                .browser_version
-                .clone()
-                .with_context(|| format!("Playwright {name} descriptor has no browser version"))?,
+            browser_version: artifact.browser_version,
+            directory: artifact.directory,
+            executable: artifact.executable,
+            revision: artifact.revision,
         })
     }
 
+    pub(crate) fn install(&self, browsers: &[BrowserName], with_dependencies: bool) -> Result<()> {
+        let browsers = browsers.iter().copied().collect::<BTreeSet<_>>();
+        if browsers.is_empty() {
+            bail!("at least one browser must be selected for installation");
+        }
+        if with_dependencies {
+            native_dependencies::install(&self.host_platform, &browsers, &self.distribution)?;
+        }
+        fs::create_dir_all(&self.browser_cache).with_context(|| {
+            format!(
+                "failed to create browser registry {}",
+                self.browser_cache.display()
+            )
+        })?;
+        for browser in browsers {
+            self.install_browser(self.artifact(browser)?)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn version(&self) -> &str {
-        &self.version
+        self.distribution.version()
+    }
+
+    fn artifact(&self, name: BrowserName) -> Result<BrowserArtifact> {
+        let descriptor = self
+            .distribution
+            .artifact(&self.host_platform, name.registry_name())?;
+        let directory = self.browser_cache.join(&descriptor.directory);
+        let executable = directory.join(descriptor.executable.iter().collect::<PathBuf>());
+        let urls = download_urls(name, &descriptor.download_path, &descriptor.mirrors);
+        Ok(BrowserArtifact {
+            browser_version: descriptor.browser_version.clone(),
+            directory,
+            executable,
+            name,
+            revision: descriptor.revision.clone(),
+            urls,
+        })
+    }
+
+    fn install_browser(&self, artifact: BrowserArtifact) -> Result<()> {
+        if artifact.executable.is_file() && artifact.directory.join(INSTALLATION_MARKER).is_file() {
+            println!(
+                "{} {} is already installed at {}",
+                artifact.name.registry_name(),
+                artifact.browser_version,
+                artifact.directory.display()
+            );
+            return Ok(());
+        }
+
+        let temporary = tempdir_in(&self.browser_cache).with_context(|| {
+            format!(
+                "failed to create browser installation staging area in {}",
+                self.browser_cache.display()
+            )
+        })?;
+        let archive_path = temporary.path().join("browser.zip");
+        let source_url = download(&artifact, &archive_path)?;
+        let staged = temporary.path().join("browser");
+        fs::create_dir(&staged)?;
+        extract_zip(&archive_path, &staged)?;
+
+        let relative_executable = artifact
+            .executable
+            .strip_prefix(&artifact.directory)
+            .context("browser executable escaped its installation directory")?;
+        let staged_executable = staged.join(relative_executable);
+        if !staged_executable.is_file() {
+            bail!(
+                "{} archive did not contain its expected executable {}",
+                artifact.name.registry_name(),
+                relative_executable.display()
+            );
+        }
+        ensure_executable(&staged_executable)?;
+        fs::write(staged.join(INSTALLATION_MARKER), b"")?;
+        fs::write(
+            staged.join(INSTALLATION_METADATA),
+            format!(
+                "provider=playwright\nprovider_version={}\nbrowser={}\nbrowser_version={}\nrevision={}\nhost={}\nsource={source_url}\n",
+                self.version(),
+                artifact.name.registry_name(),
+                artifact.browser_version,
+                artifact.revision,
+                self.host_platform,
+            ),
+        )?;
+
+        if artifact.directory.exists() {
+            let incomplete = artifact.directory.with_extension("incomplete");
+            if incomplete.exists() {
+                fs::remove_dir_all(&incomplete).with_context(|| {
+                    format!(
+                        "failed to remove stale browser staging directory {}",
+                        incomplete.display()
+                    )
+                })?;
+            }
+            fs::rename(&artifact.directory, &incomplete).with_context(|| {
+                format!(
+                    "failed to quarantine incomplete browser installation {}",
+                    artifact.directory.display()
+                )
+            })?;
+            if let Err(error) = fs::rename(&staged, &artifact.directory) {
+                let _ = fs::rename(&incomplete, &artifact.directory);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to activate browser installation {}",
+                        artifact.directory.display()
+                    )
+                });
+            }
+            fs::remove_dir_all(&incomplete).with_context(|| {
+                format!(
+                    "failed to remove replaced browser installation {}",
+                    incomplete.display()
+                )
+            })?;
+        } else if let Err(error) = fs::rename(&staged, &artifact.directory) {
+            if artifact.executable.is_file()
+                && artifact.directory.join(INSTALLATION_MARKER).is_file()
+            {
+                return Ok(());
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to activate browser installation {}",
+                    artifact.directory.display()
+                )
+            });
+        }
+
+        println!(
+            "Installed {} {} at {}",
+            artifact.name.registry_name(),
+            artifact.browser_version,
+            artifact.directory.display()
+        );
+        Ok(())
     }
 }
 
-#[derive(Deserialize)]
-struct BrowsersJson {
-    browsers: Vec<BrowserDescriptor>,
+fn download_urls(name: BrowserName, path: &str, default_mirrors: &[String]) -> Vec<String> {
+    let specific_override = match name {
+        BrowserName::ChromiumHeadlessShell => "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST",
+        BrowserName::Firefox => "PLAYWRIGHT_FIREFOX_DOWNLOAD_HOST",
+        BrowserName::Webkit => "PLAYWRIGHT_WEBKIT_DOWNLOAD_HOST",
+    };
+    let override_host =
+        nonempty_env(specific_override).or_else(|| nonempty_env("PLAYWRIGHT_DOWNLOAD_HOST"));
+    let mirrors = if let Some(host) = override_host.as_deref() {
+        vec![host]
+    } else {
+        default_mirrors.iter().map(String::as_str).collect()
+    };
+    mirrors
+        .into_iter()
+        .map(|mirror| format!("{}/{}", mirror.trim_end_matches('/'), path))
+        .collect()
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserDescriptor {
-    name: String,
-    revision: String,
-    #[serde(default)]
-    revision_overrides: BTreeMap<String, String>,
-    browser_version: Option<String>,
+fn download(artifact: &BrowserArtifact, destination: &Path) -> Result<String> {
+    let agent = ureq::agent();
+    let mut failures = Vec::new();
+    for url in &artifact.urls {
+        print!(
+            "Downloading {} {} from {url} ... ",
+            artifact.name.registry_name(),
+            artifact.browser_version
+        );
+        io::stdout().flush().ok();
+        let result = (|| -> Result<()> {
+            let mut response = agent
+                .get(url)
+                .call()
+                .with_context(|| format!("request failed for {url}"))?;
+            let mut output = File::create(destination)?;
+            io::copy(&mut response.body_mut().as_reader(), &mut output)
+                .with_context(|| format!("failed to download {url}"))?;
+            output.sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                println!("done");
+                return Ok(url.clone());
+            }
+            Err(error) => {
+                println!("failed");
+                failures.push(format!("{url}: {error:#}"));
+            }
+        }
+    }
+    bail!(
+        "failed to download {} {}:\n{}",
+        artifact.name.registry_name(),
+        artifact.browser_version,
+        failures.join("\n")
+    )
 }
 
-#[derive(Deserialize)]
-struct PackageJson {
-    version: String,
+fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
+    let archive_file = File::open(archive_path)
+        .with_context(|| format!("failed to open {}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(archive_file)
+        .with_context(|| format!("invalid browser archive {}", archive_path.display()))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!("browser archive contains too many entries");
+    }
+    let mut total_size = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        total_size = total_size
+            .checked_add(entry.size())
+            .context("browser archive size overflow")?;
+        if total_size > MAX_UNCOMPRESSED_BYTES {
+            bail!("browser archive exceeds the uncompressed size limit");
+        }
+        let relative = entry
+            .enclosed_name()
+            .with_context(|| format!("unsafe browser archive path {}", entry.name()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(&relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&target)?;
+            set_mode(&target, entry.unix_mode())?;
+            continue;
+        }
+        if entry.is_symlink() {
+            install_symlink(&mut entry, destination, &relative)?;
+            continue;
+        }
+        fs::create_dir_all(
+            target
+                .parent()
+                .context("browser archive entry has no parent")?,
+        )?;
+        let mut output = File::create(&target)
+            .with_context(|| format!("failed to create {}", target.display()))?;
+        io::copy(&mut entry, &mut output)
+            .with_context(|| format!("failed to extract {}", target.display()))?;
+        set_mode(&target, entry.unix_mode())?;
+    }
+    Ok(())
 }
 
-fn playwright_browser_directory(prefix: &str, revision: &str) -> String {
-    format!("{}-{revision}", prefix.replace('-', "_"))
+#[cfg(unix)]
+fn install_symlink(entry: &mut impl Read, root: &Path, relative: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let mut value = String::new();
+    entry.read_to_string(&mut value)?;
+    let link = Path::new(&value);
+    if link.is_absolute() {
+        bail!("browser archive symlink has an absolute target");
+    }
+    let parent = relative
+        .parent()
+        .context("browser archive symlink has no parent")?;
+    validate_relative_target(parent, link)?;
+    let target = root.join(relative);
+    fs::create_dir_all(
+        target
+            .parent()
+            .context("browser archive symlink has no parent")?,
+    )?;
+    symlink(link, &target).with_context(|| format!("failed to create symlink {}", target.display()))
 }
 
-fn playwright_registry_directory(core: &Path) -> Result<PathBuf> {
-    let configured = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH");
+#[cfg(not(unix))]
+fn install_symlink(_entry: &mut impl Read, _root: &Path, relative: &Path) -> Result<()> {
+    bail!(
+        "browser archive contains unsupported symlink {}",
+        relative.display()
+    )
+}
+
+#[cfg(any(unix, test))]
+fn validate_relative_target(parent: &Path, link: &Path) -> Result<()> {
+    let mut depth = parent.components().count();
+    for component in link.components() {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if depth > 0 => depth -= 1,
+            std::path::Component::ParentDir => {
+                bail!("browser archive symlink escapes its installation")
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                bail!("browser archive symlink target is not relative")
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(mode) = mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o755))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn browser_registry_directory() -> Result<PathBuf> {
+    let configured =
+        nonempty_env("BPERF_BROWSERS_PATH").or_else(|| nonempty_env("PLAYWRIGHT_BROWSERS_PATH"));
     let path = match configured.as_deref() {
-        Some(value) if value == OsStr::new("0") => core.join(".local-browsers"),
-        Some(value) if !value.is_empty() => {
+        Some("0") => std::env::current_exe()?
+            .parent()
+            .context("bperf executable has no parent directory")?
+            .join("bperf-browsers"),
+        Some(value) => {
             let configured = PathBuf::from(value);
             if configured.is_absolute() {
                 configured
@@ -128,7 +415,7 @@ fn playwright_registry_directory(core: &Path) -> Result<PathBuf> {
                     .join(configured)
             }
         }
-        _ => {
+        None => {
             #[cfg(windows)]
             {
                 nonempty_env_path("LOCALAPPDATA")
@@ -136,7 +423,7 @@ fn playwright_registry_directory(core: &Path) -> Result<PathBuf> {
                         nonempty_env_path("USERPROFILE")
                             .map(|home| home.join("AppData").join("Local"))
                     })
-                    .context("cannot locate the Windows Playwright browser cache")?
+                    .context("cannot locate the Windows browser cache")?
                     .join("ms-playwright")
             }
             #[cfg(target_os = "macos")]
@@ -157,6 +444,10 @@ fn playwright_registry_directory(core: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 fn nonempty_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
@@ -165,8 +456,7 @@ fn nonempty_env_path(name: &str) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn home_directory() -> Result<PathBuf> {
-    nonempty_env_path("HOME")
-        .context("cannot locate the Playwright browser cache because HOME is unset")
+    nonempty_env_path("HOME").context("cannot locate the browser cache because HOME is unset")
 }
 
 fn playwright_host_platform() -> Result<String> {
@@ -179,6 +469,9 @@ fn playwright_host_platform() -> Result<String> {
     }
     #[cfg(windows)]
     {
+        if !cfg!(target_arch = "x86_64") {
+            bail!("Playwright browser builds require x86-64 Windows");
+        }
         Ok("win64".to_owned())
     }
     #[cfg(target_os = "macos")]
@@ -188,7 +481,7 @@ fn playwright_host_platform() -> Result<String> {
             .output()
             .context("failed to determine the macOS kernel release")?;
         if !output.status.success() {
-            anyhow::bail!("uname -r failed while locating Playwright browsers");
+            bail!("uname -r failed while locating browser builds");
         }
         let kernel_major: u32 = String::from_utf8(output.stdout)?
             .trim()
@@ -208,12 +501,7 @@ fn playwright_host_platform() -> Result<String> {
         } else {
             (kernel_major + 1).min(26).to_string()
         };
-        let apple_silicon = std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains("Apple"));
+        let apple_silicon = cfg!(target_arch = "aarch64");
         Ok(format!(
             "mac{mac_major}{}",
             if apple_silicon { "-arm64" } else { "" }
@@ -221,12 +509,14 @@ fn playwright_host_platform() -> Result<String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        use std::collections::HashMap;
+
         let arch = if cfg!(target_arch = "aarch64") {
             "arm64"
         } else if cfg!(target_arch = "x86_64") {
             "x64"
         } else {
-            anyhow::bail!("Playwright browsers are unsupported on this Linux architecture");
+            bail!("Playwright browsers are unsupported on this Linux architecture");
         };
         let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
         let fields = release
@@ -248,7 +538,7 @@ fn playwright_host_platform() -> Result<String> {
             .unwrap_or(24);
         let distribution = match id {
             "ubuntu" | "pop" | "neon" | "tuxedo" => match major {
-                0..=19 => "ubuntu18.04".to_owned(),
+                0..=19 => "ubuntu20.04".to_owned(),
                 20..=21 => "ubuntu20.04".to_owned(),
                 22..=23 => "ubuntu22.04".to_owned(),
                 24..=25 => "ubuntu24.04".to_owned(),
@@ -274,18 +564,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_overrides_use_playwright_directory_names() {
+    fn pinned_registry_matches_playwright_directory_names() {
+        let installation = PlaywrightInstallation {
+            distribution: Registry::embedded().unwrap(),
+            host_platform: "win64".to_owned(),
+            browser_cache: PathBuf::from("browsers"),
+        };
+        let chromium = installation
+            .artifact(BrowserName::ChromiumHeadlessShell)
+            .unwrap();
         assert_eq!(
-            playwright_browser_directory("webkit_mac14-arm64_special", "2251"),
-            "webkit_mac14_arm64_special-2251"
+            chromium.directory,
+            Path::new("browsers").join("chromium_headless_shell-1228")
         );
+        assert_eq!(
+            chromium.urls,
+            [
+                "https://cdn.playwright.dev/builds/cft/149.0.7827.55/win64/chrome-headless-shell-win64.zip"
+            ]
+        );
+    }
 
-        let core = Path::new("sidecar")
-            .join("node_modules")
-            .join("playwright-core");
-        if std::env::var_os("PLAYWRIGHT_BROWSERS_PATH").is_none() {
-            let path = playwright_registry_directory(&core).unwrap();
-            assert!(path.ends_with("ms-playwright"));
-        }
+    #[test]
+    fn frozen_webkit_revision_uses_platform_specific_directory() {
+        let installation = PlaywrightInstallation {
+            distribution: Registry::embedded().unwrap(),
+            host_platform: "ubuntu20.04-x64".to_owned(),
+            browser_cache: PathBuf::from("browsers"),
+        };
+        let webkit = installation.artifact(BrowserName::Webkit).unwrap();
+        assert_eq!(webkit.revision, "2092");
+        assert_eq!(
+            webkit.directory,
+            Path::new("browsers").join("webkit_ubuntu20.04_x64_special-2092")
+        );
+        assert!(webkit.urls[0].ends_with("/builds/webkit/2092/webkit-ubuntu-20.04.zip"));
+    }
+
+    #[test]
+    fn symlink_targets_cannot_escape_the_archive() {
+        assert!(validate_relative_target(Path::new("one/two"), Path::new("../target")).is_ok());
+        assert!(validate_relative_target(Path::new("one"), Path::new("../../target")).is_err());
+        assert!(validate_relative_target(Path::new("one"), Path::new("/target")).is_err());
     }
 }

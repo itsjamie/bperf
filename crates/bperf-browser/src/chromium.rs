@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bperf_runtime::installation::{BrowserName, RuntimeInstallation};
+use bperf_runtime::installation::{BrowserInstallation, BrowserName};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -56,12 +56,12 @@ pub(crate) struct ChromiumAdapter {
 impl EngineAdapter for ChromiumAdapter {
     type Lane = ChromiumLane;
 
-    fn discover(installation: &RuntimeInstallation) -> Result<Self> {
+    fn discover(installation: &BrowserInstallation) -> Result<Self> {
         let chromium = installation.browser(BrowserName::ChromiumHeadlessShell)?;
-        let executable = chromium_executable(chromium.directory())?;
+        let executable = chromium.executable().to_owned();
         if !executable.is_file() {
             bail!(
-                "Playwright Chromium revision {} is not installed at {}; run `npx playwright install chromium` for the pinned sidecar",
+                "Playwright Chromium revision {} is not installed at {}; run `bperf browsers install --engine chromium`",
                 chromium.revision(),
                 executable.display()
             );
@@ -104,50 +104,6 @@ impl ChromiumAdapter {
             protocol_version: ADAPTER_PROTOCOL_VERSION,
             browser_workload_version: BROWSER_WORKLOAD_VERSION,
         }
-    }
-}
-
-fn chromium_executable(browser_directory: &Path) -> Result<PathBuf> {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        Ok(browser_directory
-            .join("chrome-headless-shell-win64")
-            .join("chrome-headless-shell.exe"))
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        Ok(browser_directory
-            .join("chrome-headless-shell-linux64")
-            .join("chrome-headless-shell"))
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        Ok(browser_directory
-            .join("chrome-linux")
-            .join("headless_shell"))
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        Ok(browser_directory
-            .join("chrome-headless-shell-mac-x64")
-            .join("chrome-headless-shell"))
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        Ok(browser_directory
-            .join("chrome-headless-shell-mac-arm64")
-            .join("chrome-headless-shell"))
-    }
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64"),
-    )))]
-    {
-        let _ = browser_directory;
-        bail!("Playwright Chromium is unsupported on this platform")
     }
 }
 
@@ -1506,7 +1462,7 @@ fn chromium_speedscope(
     let target_nodes = target_url
         .map(|target_url| target_nodes(profile, target_url))
         .transpose()?;
-    let mut builder = SpeedscopeBuilder::new("Chromium CPU", "bperf Playwright sidecar");
+    let mut builder = SpeedscopeBuilder::new("Chromium CPU", "bperf Chromium adapter");
     let mut stack_cache = HashMap::<u64, Vec<usize>>::new();
     let mut samples = Vec::new();
     let mut weights = Vec::new();
@@ -1629,9 +1585,7 @@ mod tests {
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("sidecar")
-            .join("test")
+            .join("tests")
             .join("fixtures")
             .join("captures")
             .join("chromium")
@@ -1734,7 +1688,7 @@ mod tests {
     #[ignore = "launches the pinned Playwright Chromium browser"]
     fn browser_lab_uses_fresh_contexts_and_recovers_after_failure() {
         let server = FreshContextServer::start();
-        let mut browser_lab = BrowserLab::start(RuntimeInstallation::discover().unwrap()).unwrap();
+        let mut browser_lab = BrowserLab::start(BrowserInstallation::discover().unwrap()).unwrap();
 
         let first = browser_lab
             .inspect_benchmark(Engine::Chromium, server.url(), None)

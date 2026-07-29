@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bperf_runtime::installation::{BrowserName, RuntimeInstallation};
+use bperf_runtime::installation::{BrowserInstallation, BrowserName};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -65,12 +65,12 @@ pub(crate) struct FirefoxAdapter {
 impl EngineAdapter for FirefoxAdapter {
     type Lane = FirefoxLane;
 
-    fn discover(installation: &RuntimeInstallation) -> Result<Self> {
+    fn discover(installation: &BrowserInstallation) -> Result<Self> {
         let firefox = installation.browser(BrowserName::Firefox)?;
-        let executable = firefox_executable(firefox.directory())?;
+        let executable = firefox.executable().to_owned();
         if !executable.is_file() {
             bail!(
-                "Playwright Firefox revision {} is not installed at {}; run `npx playwright install firefox` for the pinned sidecar",
+                "Playwright Firefox revision {} is not installed at {}; run `bperf browsers install --engine firefox`",
                 firefox.revision(),
                 executable.display()
             );
@@ -111,31 +111,6 @@ impl FirefoxAdapter {
             protocol_version: ADAPTER_PROTOCOL_VERSION,
             browser_workload_version: BROWSER_WORKLOAD_VERSION,
         }
-    }
-}
-
-fn firefox_executable(browser_directory: &Path) -> Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        Ok(browser_directory.join("firefox").join("firefox.exe"))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Ok(browser_directory.join("firefox").join("firefox"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(browser_directory
-            .join("firefox")
-            .join("Nightly.app")
-            .join("Contents")
-            .join("MacOS")
-            .join("firefox"))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        let _ = browser_directory;
-        bail!("Playwright Firefox is unsupported on this platform")
     }
 }
 
@@ -1451,7 +1426,7 @@ fn firefox_speedscope(
         Ok(())
     }
 
-    let mut builder = SpeedscopeBuilder::new("Firefox CPU", "bperf Playwright sidecar");
+    let mut builder = SpeedscopeBuilder::new("Firefox CPU", "bperf Firefox adapter");
     add_process(
         profile,
         &[],
@@ -1571,9 +1546,7 @@ mod tests {
     #[test]
     fn checked_in_profile_preserves_cpu_duration_and_flamegraph_shape() {
         let source = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("sidecar/test/fixtures/captures/firefox/cpu.json"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/captures/firefox/cpu.json"),
         )
         .unwrap();
         let profile = parse_profile(&source).unwrap();
@@ -1588,8 +1561,7 @@ mod tests {
         let expected: Value = serde_json::from_slice(
             &fs::read(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join("sidecar/test/fixtures/captures/firefox/flamegraph.json"),
+                    .join("tests/fixtures/captures/firefox/flamegraph.json"),
             )
             .unwrap(),
         )
@@ -1778,7 +1750,7 @@ mod tests {
     #[ignore = "launches the pinned Playwright Firefox browser"]
     fn browser_lab_uses_fresh_contexts_and_recovers_after_failure() {
         let server = FreshContextServer::start();
-        let mut browser_lab = BrowserLab::start(RuntimeInstallation::discover().unwrap()).unwrap();
+        let mut browser_lab = BrowserLab::start(BrowserInstallation::discover().unwrap()).unwrap();
 
         let first = browser_lab
             .inspect_benchmark(Engine::Firefox, server.url(), None)

@@ -86,8 +86,14 @@ designing and reviewing this repository.
 - Compare results within an engine. Do not pool raw measurements across engines
   by default.
 
-## Sidecar runtime
+## Runtime distribution
 
-- Run the TypeScript ESM sidecar directly on Node 24.12 or newer.
-- Do not add a transpilation step, generated JavaScript, or a `dist` directory.
-- Keep `tsc` in no-emit mode for static checking only.
+- Node.js and npm are not build, test, packaging, installation, or runtime
+  dependencies.
+- Browser-side TypeScript is bundled with Rolldown inside Rust.
+- Browser builds and Linux packages are installed by `bperf-runtime`; do not
+  reintroduce a package-manager CLI or external browser automation process.
+- `crates/bperf-runtime/playwright-registry.json` is generated from an
+  authenticated `playwright-core` package. Do not edit distribution paths or
+  dependency lists by hand; update it through the `bperf-build`
+  `playwright-registry` command.

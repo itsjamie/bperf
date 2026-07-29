@@ -8,12 +8,7 @@ workloads:
   - id: checkout-flow
     trace_file: fixtures/checkout-flow/actions.jsonl
     verifier:
-      command:
-        - node
-        - fixtures/checkout-flow/verify.mjs
-      timeout_seconds: 30
-      identity_files:
-        - fixtures/checkout-flow/verify.mjs
+      builtin: exact
 
 browser:
   engines:

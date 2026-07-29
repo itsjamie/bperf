@@ -1,6 +1,7 @@
-//! Discovery and validation of the installed bperf runtime.
+//! Pinned browser distribution support for bperf.
 
 pub mod installation;
 
-mod embedded;
+mod native_dependencies;
 mod playwright;
+mod registry;

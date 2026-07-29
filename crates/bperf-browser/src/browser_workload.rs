@@ -20,7 +20,7 @@ pub(crate) const BENCHMARK_READY_EXPRESSION: &str =
     "Boolean(globalThis.__bperfDescription && globalThis.__bperf)";
 pub(crate) const BENCHMARK_DESCRIPTION_EXPRESSION: &str = "globalThis.__bperfDescription";
 
-const SOURCE: &str = include_str!("../../../sidecar/src/browser-workload.js");
+const SOURCE: &str = include_str!("browser-workload.js");
 
 pub(crate) fn bootstrap_source() -> String {
     format!(

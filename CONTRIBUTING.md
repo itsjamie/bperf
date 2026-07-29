@@ -7,10 +7,9 @@ release gate.
 
 ## Set up the checkout
 
-You need Rust with edition 2024 support and Node.js 24.12 or newer.
+You need Rust with edition 2024 support.
 
 ```text
-npm --prefix sidecar ci
 cargo build --locked
 cargo run -- browsers install --engine all
 ```
@@ -29,11 +28,32 @@ These checks do not launch browsers:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-npm --prefix sidecar run check
 ```
 
 Run focused tests while developing, then run the complete fast suite before
 opening a pull request.
+
+## Update the browser registry
+
+The checked-in
+`crates/bperf-runtime/playwright-registry.json` file is generated and embedded
+in the bperf executable. To change the pinned Playwright provider version, run:
+
+```text
+cargo run --locked -p bperf-build -- playwright-registry update VERSION
+cargo run --locked -p bperf-build -- playwright-registry check
+```
+
+The Rust generator downloads the `playwright-core` package record, accepts only
+a signature from a pinned npm ECDSA key, verifies the signed SHA-512 tarball
+integrity, and extracts the static browser and Linux dependency registries
+without executing package JavaScript. Review the generated diff, then run every
+platform package and live-browser contract. Do not edit download paths,
+executable layouts, revisions, mirrors, or dependency lists by hand.
+
+An npm signing-key rotation fails explicitly. Review the replacement key
+through npm's documented key distribution before changing the pinned trust
+root in `crates/bperf-build/src/playwright_registry.rs`.
 
 ## Real-browser release gates
 
@@ -41,13 +61,13 @@ The ignored tests launch pinned Chromium, Firefox, and WebKit builds and write
 large diagnostic artifacts:
 
 ```text
-cargo test --test browser_contract firefox_doctor_does_not_spawn_node -- --ignored --exact
+cargo test --test browser_contract firefox_doctor_uses_the_native_adapter -- --ignored --exact
 cargo test -p bperf-browser firefox::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
 cargo test -p bperf-browser --test child_realms firefox_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
-cargo test --test browser_contract chromium_doctor_does_not_spawn_node -- --ignored --exact
+cargo test --test browser_contract chromium_doctor_uses_the_native_adapter -- --ignored --exact
 cargo test -p bperf-browser chromium::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
 cargo test -p bperf-browser --test child_realms chromium_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
-cargo test --test browser_contract webkit_doctor_does_not_spawn_node -- --ignored --exact
+cargo test --test browser_contract webkit_doctor_uses_the_native_adapter -- --ignored --exact
 cargo test -p bperf-browser webkit::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
 cargo test -p bperf-browser --test child_realms webkit_dedicated_workers_and_iframes_contribute_native_evidence -- --ignored --exact
 cargo test every_engine_satisfies_the_capture_contract -- --ignored --exact
@@ -55,9 +75,6 @@ cargo test -p bperf-browser lab::tests::retained_lanes_keep_one_root_pid_and_shu
 cargo test --test measurement_contract variants_can_be_measured_and_compared_on_every_engine -- --ignored --exact
 cargo test managed_benchmark_satisfies_every_engine_contract -- --ignored
 ```
-
-The tests use `node` from `PATH` by default. Set `BPERF_NODE` to an absolute
-executable path only when validating a different Node installation.
 
 Run them with normal browser process permissions. Firefox uses its own content
 process sandbox; do not disable it to make a test pass.
@@ -78,10 +95,9 @@ The package contract additionally builds the native target-triple archive,
 installs only its executable into a clean Cargo root, downloads the pinned
 browsers through that installed executable, runs `doctor --engine all`, and
 measures the managed example. It runs on x86-64 Linux and Windows, plus Apple
-Silicon and Intel macOS. This proves that release builds materialize their
-embedded benchmark runtime instead of borrowing the checkout. The same job also
-runs stock `cargo install --path`, provisions its source-embedded runtime, and
-proves Chromium capture from that installation.
+Silicon and Intel macOS. This proves that the single release executable does
+not borrow files from the checkout. The same job also runs stock
+`cargo install --path` and proves Chromium capture from that installation.
 
 A `v*` tag must exactly match the Cargo package version. After the fast,
 per-engine, cross-engine, and package contracts pass, CI publishes the four
@@ -95,12 +111,15 @@ viewer schema;
 `crates/bperf-browser/src/chromium.rs`, `firefox.rs`, `firefox_rdp.rs`, and
 `webkit.rs`
 own their engine protocols and native capture formats.
-`crates/bperf-runtime` owns release-runtime embedding, atomic materialization,
-Playwright registry discovery, and pinned browser installation.
-`sidecar/src/benchmark-host.ts` may bundle and serve benchmarks but must not
-launch a browser.
+`crates/bperf-runtime` owns the pinned browser registry, platform downloads,
+atomic extraction, cache discovery, and Linux dependency installation.
+`src/project_modules.rs` owns project bundling, and
+`src/benchmark_host.rs` owns loopback serving of the generated bundle and
+locked fixtures. `src/fixtures.rs` owns local containment, remote acquisition,
+content-addressed bodies, and fixture-lock validation.
 
-The TypeScript runtime contains no browser adapter or capture transport. The
+The TypeScript browser authoring module contains no browser adapter, fixture
+acquisition, or capture transport. The
 retained-PID gate must show one healthy root per engine, and successful shutdown
 must prove that its process group or Job Object contains no active process.
 

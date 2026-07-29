@@ -377,8 +377,14 @@ are captured around one execution rather than scheduled as independent streams.
 
 ## Native browser adapters
 
-All engines use builds pinned by the sidecar's Playwright package. Rust owns
-each browser process and native capture adapter. Playwright WebKit is not the
+All engines use browser archives published for one pinned Playwright version.
+An authenticated Rust maintenance job verifies the npm registry signature and
+signed SHA-512 integrity of `playwright-core`, extracts its static distribution
+data without executing package JavaScript, and emits the checked-in registry
+embedded in the executable. The compiled registry owns revisions, platform
+overrides, download URLs, archive layout, Linux dependencies, and installation.
+CI regenerates it from the signed package and rejects drift. Rust also owns each
+browser process and native capture adapter. Playwright WebKit is not the
 installed Safari application.
 
 | Concern | Chromium | Firefox | WebKit |
@@ -401,8 +407,9 @@ The Rust Chromium adapter owns its CDP sessions, target attachment, request
 interception, V8 capture sequencing, and normalization. The Rust Firefox
 adapter owns its Juggler sessions, RDP actors, Gecko profile normalization, and
 `.fxsnapshot` lifecycle. The Rust WebKit adapter owns its pinned private
-inspector bridge. They share only process containment, Playwright installation
-discovery, browser-workload policy, immutable artifact description, and
+inspector bridge. They share only process containment, pinned browser
+installation discovery, browser-workload policy, immutable artifact
+description, and
 Speedscope document construction. The capture-artifact module prepares three
 contained output paths for each capture scope, replaces stale files, and
 returns complete validated descriptor groups. Each adapter still decides which
@@ -645,9 +652,14 @@ inventing an optimization cycle. It remains available for advanced workflows.
 ```mermaid
 flowchart LR
     CALLER["Agent, human, or CI"] --> CLI["bperf application"]
-    BENCH["TypeScript benchmark"] --> HOST["Node benchmark host"]
-    FIXTURES["Fixture objects and lock"] --> HOST
-    HOST --> CLI
+    BENCH["TypeScript benchmark"] --> BUNDLER["Rust project bundler"]
+    FIXTURES["Fixture declarations"] --> RESOLVER["Rust fixture acquisition"]
+    CLI --> BUNDLER
+    CLI --> RESOLVER
+    BUNDLER --> HOST["Rust benchmark host"]
+    RESOLVER --> HOST
+    CLI --> HOST
+    HOST --> LAB
     CLI --> DECISION["bperf-decision"]
     CLI --> MEASURE["bperf-measurement"]
     CLI --> LAB["bperf-browser"]
@@ -677,7 +689,7 @@ hides knowledge that would otherwise spread through the application:
 | Crate / Module | Interface and hidden knowledge |
 |---|---|
 | `bperf` application | `doctor`, `run`, and `confirm` orchestration. It composes the library Interfaces but is not a dependency of them. |
-| `bperf-runtime::installation` | Validated runtime discovery, embedded-runtime materialization, benchmark-host identity, pinned browser installation and selection, Playwright version, and Node-safe paths. Release layout, cache conventions, and registry parsing stay private. |
+| `bperf-runtime::installation` | Pinned browser selection and installation. Playwright version, revisions, platform archives, executable paths, cache conventions, atomic extraction, and Linux packages stay private. |
 | `bperf-browser::lab` | Engine-neutral configurations and evidence, retained lane lifecycle, complete capture validation, and managed benchmark inspection. |
 | `bperf-browser::artifacts` | Complete per-scope artifact-set and file validation. Construction helpers and Speedscope representation stay crate-private. |
 | Private browser Modules | Chromium CDP, Firefox Juggler/RDP, WebKit inspector protocol, native formats, workload injection, and process containment. |
@@ -691,8 +703,9 @@ hides knowledge that would otherwise spread through the application:
 | `bperf-decision::baseline` | Append-only current-baseline references. |
 | `bperf-decision::lineage` | Content-addressed source states, deltas, cycles, confirmations, and promotions. |
 | `managed_benchmark` | The common `run` and `confirm` workflows, two-pass cross-engine discovery, generated private inputs, comparison attachment, and cycle recording. |
-| `benchmark-host` | Browser-independent benchmark bundling, fixture resolution and serving, and reporting the bundled project source graph. |
-| `project-modules` | TypeScript, package, CommonJS, alias, and browser-bundle resolution. |
+| `benchmark_host` | Concurrent loopback serving of one validated browser bundle and immutable fixture lock, including byte-range and paced-stream responses. |
+| `project_modules` | Rolldown-backed TypeScript, package, CommonJS, alias, and browser-bundle resolution plus materialized bundle identity. |
+| `fixtures` | Local project containment, HTTPS acquisition and redirects, content-addressed body caching, pinned-remote reuse, and immutable fixture-lock validation. |
 | `benchmark_runtime` | The prepared workload and verifier contract used by the measurement engine. |
 | `runner` | Resumable progression of pending attempts into terminal trial evidence. |
 
@@ -703,13 +716,18 @@ supplies a domain operation, not generated YAML or a transport endpoint.
 Managed discovery serves the unresolved bundle and compares descriptions from
 Chromium, Firefox, and WebKit. After fixture resolution locks the inputs,
 it serves the resolved bundle, compares descriptions again, and exercises every
-case in a fresh context on every engine. The Node host does not launch browsers.
-Release binaries embed that host, the benchmark authoring module, the project
-bundler, package manifests, production Node packages, and the pinned Playwright
-registry. The installation module materializes those versioned files atomically
-beside the executable. Debug builds use the checkout; release builds never
-depend on the build machine's source path. Browser binaries remain separate and
-are downloaded through `bperf browsers install`.
+case in a fresh context on every engine. Rolldown inlines the browser authoring
+module into one materialized ESM bundle. A Rust loopback host serves that bundle
+and the locked fixture bodies during both discovery and every trial. Rust also
+acquires local or remote fixture bodies and finalizes the lock between the two
+discovery passes.
+
+The browser authoring module and registry are compiled into the executable.
+`bperf browsers install` downloads the selected upstream archives over HTTPS,
+validates their paths and expected executable, preserves native permissions,
+and activates each cache directory atomically. Linux `--with-deps` installs the
+package set fixed by the same registry. Browser binaries remain separate
+because they are platform-specific and substantially larger than bperf.
 
 Capture protocol 13, benchmark-host protocol 2, environment schema 6,
 measurement schema 5, and doctor schema 2 identify the child-realm-capable
@@ -753,7 +771,7 @@ The advanced path uses:
 - one stdout readiness object;
 - `globalThis.__bperf.run(operation)` in the page;
 - JSONL operations;
-- an independent verifier process.
+- the built-in exact verifier or an independent verifier process.
 
 This protocol proved the workload and three-engine capture design before the
 TypeScript authoring layer existed. It remains useful when a project cannot fit

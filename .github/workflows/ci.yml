@@ -28,28 +28,31 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.12.0
-          cache: npm
-          cache-dependency-path: sidecar/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install sidecar dependencies
-        run: npm --prefix sidecar ci
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Lint every Rust target
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test the Rust workspace
         run: cargo test --workspace --locked
-      - name: Check the Node sidecar
-        run: npm --prefix sidecar run check
+
+  registry-contract:
+    name: Authenticated Playwright registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reproduce the embedded registry from the signed npm package
+        run: cargo run --locked -p bperf-build -- playwright-registry check
 
   engine-contract:
     name: ${{ matrix.engine }} / ${{ matrix.os }}
-    needs: fast
+    needs:
+      - fast
+      - registry-contract
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -65,23 +68,14 @@ jobs:
           - webkit
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.12.0
-          cache: npm
-          cache-dependency-path: sidecar/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install sidecar dependencies
-        run: npm --prefix sidecar ci
       - name: Install ${{ matrix.engine }} and Linux dependencies
         if: runner.os == 'Linux'
-        run: npm --prefix sidecar exec -- playwright install --with-deps ${{ matrix.engine }}
+        run: cargo run --locked -- browsers install --with-deps --engine ${{ matrix.engine }}
       - name: Install ${{ matrix.engine }}
         if: runner.os != 'Linux'
-        run: npm --prefix sidecar exec -- playwright install ${{ matrix.engine }}
-      - name: Prove the ${{ matrix.engine }} capture contract without Node
-        env:
-          BPERF_NODE: bperf-node-must-not-be-started
+        run: cargo run --locked -- browsers install --engine ${{ matrix.engine }}
+      - name: Prove the ${{ matrix.engine }} capture contract
         run: cargo run --locked -- doctor --engine ${{ matrix.engine }} --artifact-dir .bperf/ci-doctor
       - name: Prove retained-lane recovery
         run: cargo test --locked -p bperf-browser ${{ matrix.engine }}::tests::browser_lab_uses_fresh_contexts_and_recovers_after_failure -- --ignored --exact
@@ -99,24 +93,17 @@ jobs:
 
   cross-engine-contract:
     name: Cross-engine contract / ubuntu
-    needs: fast
+    needs:
+      - fast
+      - registry-contract
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.12.0
-          cache: npm
-          cache-dependency-path: sidecar/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install sidecar dependencies
-        run: npm --prefix sidecar ci
       - name: Install all browsers and Linux dependencies
-        run: npm --prefix sidecar exec -- playwright install --with-deps chromium firefox webkit
+        run: cargo run --locked -- browsers install --with-deps --engine all
       - name: Prove all-engine doctor orchestration
-        env:
-          BPERF_NODE: bperf-node-must-not-be-started
         run: cargo run --locked -- doctor --engine all --artifact-dir .bperf/ci-doctor-all
       - name: Check the complete capture summary
         run: cargo test --locked --test browser_contract every_engine_satisfies_the_capture_contract -- --ignored --exact
@@ -138,7 +125,9 @@ jobs:
 
   package-contract:
     name: Package / ${{ matrix.target }}
-    needs: fast
+    needs:
+      - fast
+      - registry-contract
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -155,31 +144,24 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.12.0
-          cache: npm
-          cache-dependency-path: sidecar/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install sidecar dependencies
-        run: npm --prefix sidecar ci
       - name: Build and Cargo-install the release package
         env:
           BPERF_INSTALL_ROOT: ${{ runner.temp }}/bperf-cargo
           BPERF_RELEASE_TARGET: ${{ matrix.target }}
-        run: node scripts/package-release.ts --install
+        run: cargo run --locked -p bperf-build -- package --install
       - name: Prove the installed all-engine and managed benchmark contracts
         env:
           BPERF_TEST_CARGO_HOME: ${{ runner.temp }}/bperf-cargo
           BPERF_TEST_ROOT: ${{ runner.temp }}/bperf-package-test
-        run: node scripts/verify-install.ts release
+        run: cargo run --locked -p bperf-build -- verify-install release
       - name: Install from source through Cargo
         run: cargo install --path . --locked --root "${{ runner.temp }}/bperf-source-cargo"
       - name: Prove the Cargo source installation
         env:
           BPERF_TEST_CARGO_HOME: ${{ runner.temp }}/bperf-source-cargo
           BPERF_TEST_ROOT: ${{ runner.temp }}/bperf-source-cargo-test
-        run: node scripts/verify-install.ts source
+        run: cargo run --locked -p bperf-build -- verify-install source
       - name: Upload the tagged release package
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7

@@ -1,6 +1,9 @@
+mod benchmark_host;
 mod benchmark_runtime;
 mod doctor;
+mod fixtures;
 mod managed_benchmark;
+mod project_modules;
 mod runner;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -9,7 +12,7 @@ use anyhow::Result;
 use bperf_browser::lab::Engine;
 use bperf_decision::{baseline, comparison, lineage};
 use bperf_measurement::{sampling, store as measurement};
-use bperf_runtime::installation::{BrowserName, RuntimeInstallation};
+use bperf_runtime::installation::{BrowserInstallation, BrowserName};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -25,6 +28,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__benchmark-host", hide = true)]
+    BenchmarkHost(BenchmarkHostArgs),
     /// Prove that required browser capture capabilities work on this host.
     Doctor(DoctorArgs),
     /// Install the pinned browser builds used by bperf.
@@ -49,6 +54,24 @@ enum Command {
     Accept(AcceptArgs),
     /// Manage promoted baseline references.
     Baseline(BaselineArgs),
+}
+
+#[derive(Debug, Args)]
+struct BenchmarkHostArgs {
+    #[arg(long)]
+    root: PathBuf,
+
+    #[arg(long)]
+    benchmark: PathBuf,
+
+    #[arg(long)]
+    fixture_lock: PathBuf,
+
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    bundle_metadata: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -105,14 +128,6 @@ struct BrowserInstallArgs {
     /// Also install operating-system dependencies required by the browsers.
     #[arg(long)]
     with_deps: bool,
-
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled benchmark runtime directory.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -124,10 +139,6 @@ struct DoctorArgs {
     /// Root directory for immutable doctor-run artifacts.
     #[arg(long, default_value = ".bperf/doctor")]
     artifact_dir: PathBuf,
-
-    /// Override the runtime directory used to locate pinned Playwright browsers.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 
     /// Emit the complete summary JSON to stdout.
     #[arg(long)]
@@ -184,10 +195,6 @@ struct MeasureArgs {
     /// Root directory for immutable measurement sets.
     #[arg(long, default_value = ".bperf/measurements")]
     artifact_dir: PathBuf,
-
-    /// Override the runtime directory used to locate pinned Playwright browsers.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 
     /// Emit the measurement summary as JSON.
     #[arg(long)]
@@ -256,14 +263,6 @@ struct ExecutionArgs {
     /// Approximate measurement-time budget. The minimum evidence floor still applies.
     #[arg(long, default_value = "5m")]
     budget: sampling::RunBudget,
-
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled benchmark runtime directory.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 }
 
 impl ExecutionArgs {
@@ -276,8 +275,6 @@ impl ExecutionArgs {
             comparison_root: self.comparison_dir,
             lineage_root: self.lineage_dir,
             budget: self.budget,
-            node: self.node,
-            sidecar: self.sidecar,
         }
     }
 }
@@ -420,14 +417,21 @@ struct BaselineShowArgs {
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
+        Command::BenchmarkHost(args) => {
+            benchmark_host::run_adapter(benchmark_host::AdapterOptions {
+                root: args.root,
+                benchmark: args.benchmark,
+                fixture_lock: args.fixture_lock,
+                bundle: args.bundle,
+                bundle_metadata: args.bundle_metadata,
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Doctor(args) => {
             let options = doctor::DoctorOptions {
                 engines: args.engine.engines(),
                 artifact_root: args.artifact_dir,
-                runtime: args.sidecar.map_or_else(
-                    RuntimeInstallation::discover,
-                    RuntimeInstallation::from_root,
-                )?,
+                runtime: BrowserInstallation::discover()?,
                 json: args.json,
             };
             doctor::run(options)?;
@@ -435,15 +439,8 @@ fn main() -> Result<ExitCode> {
         }
         Command::Browsers(args) => match args.command {
             BrowsersCommand::Install(args) => {
-                let runtime = args.sidecar.map_or_else(
-                    RuntimeInstallation::discover,
-                    RuntimeInstallation::from_root,
-                )?;
-                let node = args
-                    .node
-                    .or_else(|| std::env::var_os("BPERF_NODE").map(PathBuf::from))
-                    .unwrap_or_else(|| PathBuf::from("node"));
-                runtime.install_browsers(&node, &args.engine.browsers(), args.with_deps)?;
+                let runtime = BrowserInstallation::discover()?;
+                runtime.install_browsers(&args.engine.browsers(), args.with_deps)?;
                 Ok(ExitCode::SUCCESS)
             }
         },
@@ -471,10 +468,7 @@ fn main() -> Result<ExitCode> {
                 variant: args.variant,
                 sampling: runner::SamplingMode::Fixed(args.final_samples),
                 artifact_root: args.artifact_dir,
-                runtime: args.sidecar.map_or_else(
-                    RuntimeInstallation::discover,
-                    RuntimeInstallation::from_root,
-                )?,
+                runtime: BrowserInstallation::discover()?,
             })?;
             outcome.report("measure", args.json)?;
             Ok(ExitCode::SUCCESS)

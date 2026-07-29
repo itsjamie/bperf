@@ -10,20 +10,20 @@ bperf does not require changing the package type, editing its TypeScript
 configuration, building hls.js, or adding bperf as an npm dependency.
 
 The benchmark can still use TypeScript and imports because bperf bundles the
-entry for the browser without changing how Node loads the rest of hls.js.
+entry with Rolldown using hls.js's package and TypeScript resolution rules.
+bperf does not execute a JavaScript host to load or serve that source graph.
 
 ## Prepare the checkout
 
 From the bperf source checkout, install a complete local build:
 
 ```text
-node scripts/package-release.ts --install
+cargo run --locked -p bperf-build -- package --install
 bperf --version
 ```
 
-The installer places the executable in Cargo's user `bin` directory and keeps
-its versioned Node sidecar beside it. Ensure that directory is on `PATH` before
-continuing.
+The installer places the self-contained executable in Cargo's user `bin`
+directory. Ensure that directory is on `PATH` before continuing.
 
 Prepare hls.js normally:
 

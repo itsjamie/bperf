@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bperf_runtime::installation::{BrowserName, RuntimeInstallation};
+use bperf_runtime::installation::{BrowserInstallation, BrowserName};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -145,18 +145,14 @@ pub(crate) struct WebKitAdapter {
 impl EngineAdapter for WebKitAdapter {
     type Lane = WebKitLane;
 
-    fn discover(installation: &RuntimeInstallation) -> Result<Self> {
+    fn discover(installation: &BrowserInstallation) -> Result<Self> {
         let webkit = installation.browser(BrowserName::Webkit)?;
         let browser_directory = webkit.directory().to_owned();
         validate_private_protocol(&browser_directory.join("protocol.json"))?;
-        let executable = browser_directory.join(if cfg!(windows) {
-            "Playwright.exe"
-        } else {
-            "pw_run.sh"
-        });
+        let executable = webkit.executable().to_owned();
         if !executable.is_file() {
             bail!(
-                "Playwright WebKit revision {} is not installed at {}; run `npx playwright install webkit` for the pinned sidecar",
+                "Playwright WebKit revision {} is not installed at {}; run `bperf browsers install --engine webkit`",
                 webkit.revision(),
                 executable.display()
             );
@@ -2225,7 +2221,7 @@ fn webkit_speedscope(profile: &Value, target_url: Option<&str>) -> Result<Speeds
         }
         bail!("WebKit CPU profile contains no Speedscope samples");
     }
-    let mut builder = SpeedscopeBuilder::new("WebKit CPU", "bperf Rust WebKit adapter");
+    let mut builder = SpeedscopeBuilder::new("WebKit CPU", "bperf WebKit adapter");
     let mut samples = Vec::with_capacity(traces.len());
     for trace in &traces {
         let mut stack = Vec::with_capacity(trace.stack_frames.len());
@@ -2381,9 +2377,7 @@ mod tests {
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("sidecar")
-            .join("test")
+            .join("tests")
             .join("fixtures")
             .join("captures")
             .join("webkit")
@@ -2471,7 +2465,7 @@ mod tests {
         .unwrap();
         let mut expected: Value =
             serde_json::from_slice(&fs::read(fixture("flamegraph.json")).unwrap()).unwrap();
-        expected["exporter"] = Value::String("bperf Rust WebKit adapter".to_owned());
+        expected["exporter"] = Value::String("bperf WebKit adapter".to_owned());
         assert_eq!(actual, expected);
     }
 
@@ -2902,7 +2896,7 @@ mod tests {
     #[ignore = "launches the pinned Playwright WebKit browser"]
     fn browser_lab_uses_fresh_contexts_and_recovers_after_failure() {
         let server = FreshContextServer::start();
-        let mut browser_lab = BrowserLab::start(RuntimeInstallation::discover().unwrap()).unwrap();
+        let mut browser_lab = BrowserLab::start(BrowserInstallation::discover().unwrap()).unwrap();
 
         let first = browser_lab
             .inspect_benchmark(Engine::Webkit, server.url(), None)
