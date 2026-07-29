@@ -3,8 +3,9 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -74,6 +75,7 @@ pub(crate) struct LockedFixtures {
 
 pub(crate) struct LockedFixture {
     entry: FixtureLockEntry,
+    body: Arc<[u8]>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,9 +88,18 @@ impl LockedFixtures {
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let mut entries = BTreeMap::new();
         for entry in read_lock(path)? {
-            let entry = validate_body(entry, "pinned benchmark fixture")?;
+            let (entry, body) = validate_body(entry, "pinned benchmark fixture")?;
             let key = fixture_key(&entry.descriptor)?;
-            if entries.insert(key, LockedFixture { entry }).is_some() {
+            if entries
+                .insert(
+                    key,
+                    LockedFixture {
+                        entry,
+                        body: body.into(),
+                    },
+                )
+                .is_some()
+            {
                 bail!("fixture lock contains duplicate descriptors");
             }
         }
@@ -103,16 +114,8 @@ impl LockedFixtures {
 }
 
 impl LockedFixture {
-    pub(crate) fn body_path(&self) -> &Path {
-        &self.entry.body_path
-    }
-
-    pub(crate) fn size_bytes(&self) -> u64 {
-        self.entry.size_bytes
-    }
-
-    pub(crate) fn source(&self) -> &str {
-        &self.entry.descriptor.source
+    pub(crate) fn body(&self) -> Arc<[u8]> {
+        Arc::clone(&self.body)
     }
 
     pub(crate) fn content_type(&self) -> &str {
@@ -173,7 +176,7 @@ pub(crate) fn resolve(
                     .is_some_and(|source_url| !source_url.is_empty())
             })
             .cloned()
-            .map(|entry| validate_body(entry, "pinned remote fixture"))
+            .map(|entry| validate_body(entry, "pinned remote fixture").map(|(entry, _body)| entry))
             .transpose()?;
         entries.push(match pinned {
             Some(entry) => entry,
@@ -196,7 +199,7 @@ pub(crate) fn resolve(
     })?;
     let body = format!("{}\n", serde_json::to_string_pretty(&lock)?);
     if !fs::read(lock_path).is_ok_and(|existing| existing == body.as_bytes()) {
-        fs::write(lock_path, body)
+        bperf_storage::replace_file(lock_path, body.as_bytes())
             .with_context(|| format!("failed to write fixture lock {}", lock_path.display()))?;
     }
     let fixture_lock = fs::canonicalize(lock_path)
@@ -272,23 +275,12 @@ fn acquire(
 fn cache_body(cache_root: &Path, digest: &str, body: &[u8]) -> Result<PathBuf> {
     let body_path = cache_root.join(digest);
     if !body_path.exists() {
-        let mut staged = tempfile::NamedTempFile::new_in(cache_root)
-            .context("failed to stage content-addressed fixture body")?;
-        staged
-            .write_all(body)
-            .context("failed to write content-addressed fixture body")?;
-        match staged.persist_noclobber(&body_path) {
-            Ok(_) => {}
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error.error).with_context(|| {
-                    format!(
-                        "failed to persist benchmark fixture {}",
-                        body_path.display()
-                    )
-                });
-            }
-        }
+        bperf_storage::publish_immutable(&body_path, body).with_context(|| {
+            format!(
+                "failed to persist benchmark fixture {}",
+                body_path.display()
+            )
+        })?;
     }
     let cached = fs::read(&body_path)
         .with_context(|| format!("failed to read benchmark fixture {}", body_path.display()))?;
@@ -327,7 +319,7 @@ fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
     Ok(lock.fixtures)
 }
 
-fn validate_body(mut entry: FixtureLockEntry, label: &str) -> Result<FixtureLockEntry> {
+fn validate_body(mut entry: FixtureLockEntry, label: &str) -> Result<(FixtureLockEntry, Vec<u8>)> {
     let body = fs::read(&entry.body_path)
         .with_context(|| format!("{label} is missing: {}", entry.descriptor.source))?;
     if body.len() as u64 != entry.size_bytes
@@ -341,7 +333,7 @@ fn validate_body(mut entry: FixtureLockEntry, label: &str) -> Result<FixtureLock
             entry.body_path.display()
         )
     })?;
-    Ok(entry)
+    Ok((entry, body))
 }
 
 fn validate_descriptor(descriptor: &FixtureDescriptor) -> Result<()> {

@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::json;
 use tiny_http::{Header, Request, Response, ResponseBox, Server, StatusCode};
 
@@ -253,20 +253,7 @@ impl HostedBenchmark {
             );
         };
 
-        let complete_body: Arc<[u8]> = fs::read(entry.body_path())
-            .with_context(|| {
-                format!(
-                    "failed to read benchmark fixture {}",
-                    entry.body_path().display()
-                )
-            })?
-            .into();
-        if complete_body.len() as u64 != entry.size_bytes() {
-            bail!(
-                "pinned benchmark fixture is missing or corrupt: {}",
-                entry.source()
-            );
-        }
+        let complete_body = entry.body();
 
         let range_header = request
             .headers()
@@ -481,6 +468,7 @@ mod tests {
         let bundle =
             BrowserProjectBundle::open(root, &benchmark, &bundle_file, &metadata_file).unwrap();
         let host = BenchmarkHost::start(&bundle, &lock_file).unwrap();
+        fs::write(&body_file, b"mutated after validation").unwrap();
 
         let page = request(host.url(), "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
         assert!(page.starts_with("HTTP/1.1 200"));

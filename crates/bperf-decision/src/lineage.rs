@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt::Write as FmtWrite,
-    fs::{self, OpenOptions},
+    fs,
     io::Write as IoWrite,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -798,9 +798,12 @@ impl LineageStore {
 
     fn read_events(&self, benchmark_id: &str) -> Result<Vec<LineageEvent>> {
         let path = self.history_path(benchmark_id);
-        let source = fs::read_to_string(&path)
-            .with_context(|| format!("no optimization history for benchmark {benchmark_id:?}"))?;
-        parse_events(&path, &source, benchmark_id)
+        if !path.exists() {
+            bail!("no optimization history for benchmark {benchmark_id:?}");
+        }
+        let events = bperf_storage::read_json_lines(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        validate_events(&path, events, benchmark_id)
     }
 
     fn read_events_if_present(&self, benchmark_id: &str) -> Result<Vec<LineageEvent>> {
@@ -808,22 +811,15 @@ impl LineageStore {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let source = fs::read_to_string(&path)
+        let events = bperf_storage::read_json_lines(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        parse_events(&path, &source, benchmark_id)
+        validate_events(&path, events, benchmark_id)
     }
 
     fn append_event(&self, benchmark_id: &str, event: &LineageEvent) -> Result<()> {
         let path = self.history_path(benchmark_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open optimization history {}", path.display()))?;
-        writeln!(file, "{}", serde_json::to_string(event)?)
-            .with_context(|| format!("failed to append optimization history {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to flush optimization history {}", path.display()))
+        bperf_storage::append_json_line(&path, event)
+            .with_context(|| format!("failed to append optimization history {}", path.display()))
     }
 
     fn find_cycle(
@@ -1109,23 +1105,8 @@ impl LineageStore {
     }
 
     fn write_immutable(&self, path: &Path, content: &[u8]) -> Result<()> {
-        if path.exists() {
-            let existing =
-                fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-            if existing == content {
-                return Ok(());
-            }
-            bail!("lineage object collision at {}", path.display());
-        }
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        file.write_all(content)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to flush {}", path.display()))
+        bperf_storage::publish_immutable(path, content)
+            .with_context(|| format!("failed to store lineage object {}", path.display()))
     }
 
     fn history_path(&self, benchmark_id: &str) -> PathBuf {
@@ -1145,19 +1126,17 @@ impl LineageStore {
     }
 }
 
-fn parse_events(path: &Path, source: &str, benchmark_id: &str) -> Result<Vec<LineageEvent>> {
-    let mut events = Vec::new();
+fn validate_events(
+    path: &Path,
+    events: Vec<LineageEvent>,
+    benchmark_id: &str,
+) -> Result<Vec<LineageEvent>> {
     let mut last_cycle: Option<String> = None;
     let mut last_source: Option<String> = None;
     let mut cycles = BTreeMap::new();
     let mut confirmations = HashSet::new();
-    for (index, line) in source.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: LineageEvent = serde_json::from_str(line)
-            .with_context(|| format!("invalid {} line {}", path.display(), index + 1))?;
-        match &event {
+    for event in &events {
+        match event {
             LineageEvent::Cycle(cycle) => {
                 if cycle.schema_version != SCHEMA_VERSION || cycle.benchmark_id != benchmark_id {
                     bail!(
@@ -1278,7 +1257,6 @@ fn parse_events(path: &Path, source: &str, benchmark_id: &str) -> Result<Vec<Lin
                 }
             }
         }
-        events.push(event);
     }
     if events.is_empty() {
         bail!("optimization history {} is empty", path.display());
@@ -1764,6 +1742,37 @@ mod tests {
 
         let error = store.render_change(&second.change_id).unwrap_err();
         assert!(error.to_string().contains("failed its content digest"));
+    }
+
+    #[test]
+    fn interrupted_lineage_event_is_ignored_and_replaced_on_resume() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let first_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        store.append_cycle(cycle(first_state, "measure-1")).unwrap();
+        let history = store.history_path("parser");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history)
+            .unwrap()
+            .write_all(br#"{"event":"#)
+            .unwrap();
+
+        assert_eq!(store.read_events("parser").unwrap().len(), 1);
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let second_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        store
+            .append_cycle(cycle(second_state, "measure-2"))
+            .unwrap();
+        assert_eq!(store.read_events("parser").unwrap().len(), 2);
     }
 
     #[test]

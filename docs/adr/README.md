@@ -18,6 +18,7 @@ decisions whose alternatives and tradeoffs still matter.
 | [0011](0011-rust-benchmark-host.md) | Serve materialized bundles and locked fixtures from Rust, leaving Node outside browser serving and trial execution. |
 | [0012](0012-rust-fixture-acquisition.md) | Acquire, cache, and lock local and remote fixtures in Rust so managed runs and confirmations never start Node. |
 | [0013](0013-rust-browser-distribution.md) | Generate an authenticated static Playwright registry and install browser archives entirely in Rust, removing Node.js from bperf. |
+| [0014](0014-crash-safe-local-persistence.md) | Publish local files atomically and make append-only histories recoverable without moving domain schemas into shared storage code. |
 
 Accepted records are not edited to make an old decision look current. If the
 decision changes, add a new ADR that supersedes the old one and update

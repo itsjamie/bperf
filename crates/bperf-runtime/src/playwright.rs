@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tempfile::tempdir_in;
+use ureq::ResponseExt;
 use zip::ZipArchive;
 
 use crate::{
@@ -24,14 +25,21 @@ use crate::{
 
 const INSTALLATION_MARKER: &str = "INSTALLATION_COMPLETE";
 const INSTALLATION_METADATA: &str = "BPERF_INSTALLATION";
+const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 500_000;
 const MAX_UNCOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlaywrightInstallation {
     distribution: Registry,
-    host_platform: String,
+    host: HostPlatform,
     browser_cache: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct HostPlatform {
+    browser_artifact: String,
+    native_dependencies: native_dependencies::Capability,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +56,7 @@ impl PlaywrightInstallation {
     pub(crate) fn discover() -> Result<Self> {
         Ok(Self {
             distribution: Registry::embedded()?,
-            host_platform: playwright_host_platform()?,
+            host: playwright_host_platform()?,
             browser_cache: browser_registry_directory()?,
         })
     }
@@ -69,7 +77,11 @@ impl PlaywrightInstallation {
             bail!("at least one browser must be selected for installation");
         }
         if with_dependencies {
-            native_dependencies::install(&self.host_platform, &browsers, &self.distribution)?;
+            native_dependencies::install(
+                &self.host.native_dependencies,
+                &browsers,
+                &self.distribution,
+            )?;
         }
         fs::create_dir_all(&self.browser_cache).with_context(|| {
             format!(
@@ -90,10 +102,10 @@ impl PlaywrightInstallation {
     fn artifact(&self, name: BrowserName) -> Result<BrowserArtifact> {
         let descriptor = self
             .distribution
-            .artifact(&self.host_platform, name.registry_name())?;
+            .artifact(&self.host.browser_artifact, name.registry_name())?;
         let directory = self.browser_cache.join(&descriptor.directory);
         let executable = directory.join(descriptor.executable.iter().collect::<PathBuf>());
-        let urls = download_urls(name, &descriptor.download_path, &descriptor.mirrors);
+        let urls = download_urls(name, &descriptor.download_path, &descriptor.mirrors)?;
         Ok(BrowserArtifact {
             browser_version: descriptor.browser_version.clone(),
             directory,
@@ -149,7 +161,7 @@ impl PlaywrightInstallation {
                 artifact.name.registry_name(),
                 artifact.browser_version,
                 artifact.revision,
-                self.host_platform,
+                self.host.browser_artifact,
             ),
         )?;
 
@@ -208,27 +220,84 @@ impl PlaywrightInstallation {
     }
 }
 
-fn download_urls(name: BrowserName, path: &str, default_mirrors: &[String]) -> Vec<String> {
+fn download_urls(name: BrowserName, path: &str, default_mirrors: &[String]) -> Result<Vec<String>> {
     let specific_override = match name {
         BrowserName::ChromiumHeadlessShell => "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST",
         BrowserName::Firefox => "PLAYWRIGHT_FIREFOX_DOWNLOAD_HOST",
         BrowserName::Webkit => "PLAYWRIGHT_WEBKIT_DOWNLOAD_HOST",
     };
-    let override_host =
-        nonempty_env(specific_override).or_else(|| nonempty_env("PLAYWRIGHT_DOWNLOAD_HOST"));
-    let mirrors = if let Some(host) = override_host.as_deref() {
-        vec![host]
+    let (override_host, override_name) = match nonempty_env(specific_override) {
+        Some(host) => (Some(host), specific_override),
+        None => (
+            nonempty_env("PLAYWRIGHT_DOWNLOAD_HOST"),
+            "PLAYWRIGHT_DOWNLOAD_HOST",
+        ),
+    };
+    download_urls_from(
+        path,
+        default_mirrors,
+        override_host.as_deref(),
+        override_name,
+    )
+}
+
+fn download_urls_from(
+    path: &str,
+    default_mirrors: &[String],
+    override_host: Option<&str>,
+    override_name: &str,
+) -> Result<Vec<String>> {
+    let mirrors = if let Some(host) = override_host {
+        vec![(host, override_name)]
     } else {
-        default_mirrors.iter().map(String::as_str).collect()
+        default_mirrors
+            .iter()
+            .map(|mirror| (mirror.as_str(), "embedded browser mirror"))
+            .collect()
     };
     mirrors
         .into_iter()
-        .map(|mirror| format!("{}/{}", mirror.trim_end_matches('/'), path))
+        .map(|(mirror, label)| DownloadSource::parse(mirror, label).map(|source| source.join(path)))
         .collect()
 }
 
+#[derive(Clone, Debug)]
+struct DownloadSource {
+    base_url: String,
+}
+
+impl DownloadSource {
+    fn parse(value: &str, label: &str) -> Result<Self> {
+        let uri = validate_https_url(value, label)?;
+        if uri
+            .path_and_query()
+            .is_some_and(|path| path.query().is_some())
+        {
+            bail!("{label} must not contain a query string");
+        }
+        Ok(Self {
+            base_url: value.trim_end_matches('/').to_owned(),
+        })
+    }
+
+    fn join(&self, path: &str) -> String {
+        format!("{}/{path}", self.base_url)
+    }
+}
+
+fn validate_https_url(value: &str, label: &str) -> Result<ureq::http::Uri> {
+    let uri = value
+        .parse::<ureq::http::Uri>()
+        .with_context(|| format!("{label} is not a valid URL"))?;
+    if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+        bail!("{label} must be an absolute HTTPS URL");
+    }
+    Ok(uri)
+}
+
 fn download(artifact: &BrowserArtifact, destination: &Path) -> Result<String> {
-    let agent = ureq::agent();
+    let agent =
+        ureq::Agent::new_with_config(ureq::Agent::config_builder().https_only(true).build());
     let mut failures = Vec::new();
     for url in &artifact.urls {
         print!(
@@ -237,21 +306,27 @@ fn download(artifact: &BrowserArtifact, destination: &Path) -> Result<String> {
             artifact.browser_version
         );
         io::stdout().flush().ok();
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<String> {
             let mut response = agent
                 .get(url)
                 .call()
                 .with_context(|| format!("request failed for {url}"))?;
+            let final_url = response.get_uri().to_string();
+            validate_https_url(&final_url, "browser download redirect target")?;
             let mut output = File::create(destination)?;
-            io::copy(&mut response.body_mut().as_reader(), &mut output)
+            let mut reader = response.body_mut().as_reader().take(MAX_ARCHIVE_BYTES + 1);
+            let downloaded = io::copy(&mut reader, &mut output)
                 .with_context(|| format!("failed to download {url}"))?;
+            if downloaded > MAX_ARCHIVE_BYTES {
+                bail!("browser archive exceeds the compressed size limit");
+            }
             output.sync_all()?;
-            Ok(())
+            Ok(final_url)
         })();
         match result {
-            Ok(()) => {
+            Ok(final_url) => {
                 println!("done");
-                return Ok(url.clone());
+                return Ok(final_url);
             }
             Err(error) => {
                 println!("failed");
@@ -459,20 +534,28 @@ fn home_directory() -> Result<PathBuf> {
     nonempty_env_path("HOME").context("cannot locate the browser cache because HOME is unset")
 }
 
-fn playwright_host_platform() -> Result<String> {
+fn playwright_host_platform() -> Result<HostPlatform> {
+    let mut host = detected_host_platform()?;
     if let Some(overridden) =
         std::env::var_os("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE").filter(|value| !value.is_empty())
     {
-        return overridden
+        host.browser_artifact = overridden
             .into_string()
-            .map_err(|_| anyhow::anyhow!("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE is not UTF-8"));
+            .map_err(|_| anyhow::anyhow!("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE is not UTF-8"))?;
     }
+    Ok(host)
+}
+
+fn detected_host_platform() -> Result<HostPlatform> {
     #[cfg(windows)]
     {
         if !cfg!(target_arch = "x86_64") {
             bail!("Playwright browser builds require x86-64 Windows");
         }
-        Ok("win64".to_owned())
+        Ok(HostPlatform {
+            browser_artifact: "win64".to_owned(),
+            native_dependencies: native_dependencies::Capability::NotRequired,
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -502,15 +585,16 @@ fn playwright_host_platform() -> Result<String> {
             (kernel_major + 1).min(26).to_string()
         };
         let apple_silicon = cfg!(target_arch = "aarch64");
-        Ok(format!(
-            "mac{mac_major}{}",
-            if apple_silicon { "-arm64" } else { "" }
-        ))
+        Ok(HostPlatform {
+            browser_artifact: format!(
+                "mac{mac_major}{}",
+                if apple_silicon { "-arm64" } else { "" }
+            ),
+            native_dependencies: native_dependencies::Capability::NotRequired,
+        })
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        use std::collections::HashMap;
-
         let arch = if cfg!(target_arch = "aarch64") {
             "arm64"
         } else if cfg!(target_arch = "x86_64") {
@@ -519,43 +603,70 @@ fn playwright_host_platform() -> Result<String> {
             bail!("Playwright browsers are unsupported on this Linux architecture");
         };
         let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let fields = release
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .map(|(key, value)| {
-                (
-                    key,
-                    value.trim_matches(|character| character == '"' || character == '\''),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let id = fields.get("ID").copied().unwrap_or("");
-        let version = fields.get("VERSION_ID").copied().unwrap_or("");
-        let major = version
-            .split('.')
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(24);
-        let distribution = match id {
-            "ubuntu" | "pop" | "neon" | "tuxedo" => match major {
-                0..=19 => "ubuntu20.04".to_owned(),
-                20..=21 => "ubuntu20.04".to_owned(),
-                22..=23 => "ubuntu22.04".to_owned(),
-                24..=25 => "ubuntu24.04".to_owned(),
-                26..=27 => "ubuntu26.04".to_owned(),
-                _ => format!("ubuntu{version}"),
-            },
-            "linuxmint" => match major {
-                0..=20 => "ubuntu20.04".to_owned(),
-                21 => "ubuntu22.04".to_owned(),
-                _ => "ubuntu24.04".to_owned(),
-            },
-            "debian" | "raspbian" if ["11", "12", "13", ""].contains(&version) => {
-                format!("debian{}", if version.is_empty() { "13" } else { version })
-            }
+        Ok(linux_host_platform(&release, arch))
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        bail!("Playwright browser builds are unsupported on this Unix platform")
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_host_platform(release: &str, arch: &str) -> HostPlatform {
+    use std::collections::HashMap;
+
+    let fields = release
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| {
+            (
+                key,
+                value.trim_matches(|character| character == '"' || character == '\''),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let id = fields.get("ID").copied().unwrap_or("");
+    let version = fields.get("VERSION_ID").copied().unwrap_or("");
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(24);
+    let distribution = match id {
+        "ubuntu" | "pop" | "neon" | "tuxedo" => Some(match major {
+            0..=21 => "ubuntu20.04".to_owned(),
+            22..=23 => "ubuntu22.04".to_owned(),
+            24..=25 => "ubuntu24.04".to_owned(),
+            26..=27 => "ubuntu26.04".to_owned(),
+            _ => format!("ubuntu{version}"),
+        }),
+        "linuxmint" => Some(match major {
+            0..=20 => "ubuntu20.04".to_owned(),
+            21 => "ubuntu22.04".to_owned(),
             _ => "ubuntu24.04".to_owned(),
+        }),
+        "debian" | "raspbian" if ["11", "12", "13", ""].contains(&version) => Some(format!(
+            "debian{}",
+            if version.is_empty() { "13" } else { version }
+        )),
+        _ => None,
+    };
+    let browser_distribution = distribution.as_deref().unwrap_or("ubuntu24.04").to_owned();
+    let native_dependencies = if let Some(distribution) = distribution {
+        native_dependencies::Capability::Apt {
+            registry_platform: format!("{distribution}-{arch}"),
+        }
+    } else {
+        let distribution = match (id, version) {
+            ("", _) => "unknown Linux distribution".to_owned(),
+            (_, "") => id.to_owned(),
+            _ => format!("{id} {version}"),
         };
-        Ok(format!("{distribution}-{arch}"))
+        native_dependencies::Capability::Unsupported { distribution }
+    };
+    HostPlatform {
+        browser_artifact: format!("{browser_distribution}-{arch}"),
+        native_dependencies,
     }
 }
 
@@ -567,7 +678,10 @@ mod tests {
     fn pinned_registry_matches_playwright_directory_names() {
         let installation = PlaywrightInstallation {
             distribution: Registry::embedded().unwrap(),
-            host_platform: "win64".to_owned(),
+            host: HostPlatform {
+                browser_artifact: "win64".to_owned(),
+                native_dependencies: native_dependencies::Capability::NotRequired,
+            },
             browser_cache: PathBuf::from("browsers"),
         };
         let chromium = installation
@@ -589,7 +703,10 @@ mod tests {
     fn frozen_webkit_revision_uses_platform_specific_directory() {
         let installation = PlaywrightInstallation {
             distribution: Registry::embedded().unwrap(),
-            host_platform: "ubuntu20.04-x64".to_owned(),
+            host: HostPlatform {
+                browser_artifact: "ubuntu20.04-x64".to_owned(),
+                native_dependencies: native_dependencies::Capability::NotRequired,
+            },
             browser_cache: PathBuf::from("browsers"),
         };
         let webkit = installation.artifact(BrowserName::Webkit).unwrap();
@@ -599,6 +716,69 @@ mod tests {
             Path::new("browsers").join("webkit_ubuntu20.04_x64_special-2092")
         );
         assert!(webkit.urls[0].ends_with("/builds/webkit/2092/webkit-ubuntu-20.04.zip"));
+    }
+
+    #[test]
+    fn every_browser_download_source_requires_https() {
+        let insecure_defaults = vec!["http://cdn.example.test".to_owned()];
+        assert!(
+            download_urls_from(
+                "browser.zip",
+                &insecure_defaults,
+                None,
+                "PLAYWRIGHT_FIREFOX_DOWNLOAD_HOST"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("absolute HTTPS URL")
+        );
+
+        let secure_defaults = vec!["https://cdn.example.test/root".to_owned()];
+        assert!(
+            download_urls_from(
+                "browser.zip",
+                &secure_defaults,
+                Some("http://override.example.test"),
+                "PLAYWRIGHT_FIREFOX_DOWNLOAD_HOST"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("absolute HTTPS URL")
+        );
+        assert_eq!(
+            download_urls_from(
+                "browser.zip",
+                &secure_defaults,
+                Some("https://override.example.test/root/"),
+                "PLAYWRIGHT_FIREFOX_DOWNLOAD_HOST"
+            )
+            .unwrap(),
+            ["https://override.example.test/root/browser.zip"]
+        );
+    }
+
+    #[test]
+    fn unknown_linux_distribution_does_not_gain_apt_capability() {
+        let host = linux_host_platform("ID=fedora\nVERSION_ID=43\n", "x64");
+        assert_eq!(host.browser_artifact, "ubuntu24.04-x64");
+        assert_eq!(
+            host.native_dependencies,
+            native_dependencies::Capability::Unsupported {
+                distribution: "fedora 43".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn supported_linux_distribution_keeps_artifact_and_apt_decisions_distinct() {
+        let host = linux_host_platform("ID=ubuntu\nVERSION_ID=\"24.04\"\n", "arm64");
+        assert_eq!(host.browser_artifact, "ubuntu24.04-arm64");
+        assert_eq!(
+            host.native_dependencies,
+            native_dependencies::Capability::Apt {
+                registry_platform: "ubuntu24.04-arm64".to_owned()
+            }
+        );
     }
 
     #[test]

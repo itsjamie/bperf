@@ -10,6 +10,7 @@ repository = "https://github.com/itsjamie/bperf"
 anyhow = "1.0"
 bperf-browser = { path = "../bperf-browser" }
 bperf-measurement = { path = "../bperf-measurement" }
+bperf-storage = { path = "../bperf-storage" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

@@ -664,9 +664,12 @@ flowchart LR
     CLI --> MEASURE["bperf-measurement"]
     CLI --> LAB["bperf-browser"]
     CLI --> INSTALL["bperf-runtime"]
+    CLI --> STORAGE["bperf-storage"]
     DECISION --> MEASURE
     DECISION --> LAB
+    DECISION --> STORAGE
     MEASURE --> LAB
+    MEASURE --> STORAGE
     LAB --> INSTALL
     LAB --> CHROMIUM_ADAPTER["Rust Chromium adapter"]
     CHROMIUM_ADAPTER --> CHROMIUM["Chromium"]
@@ -690,20 +693,21 @@ hides knowledge that would otherwise spread through the application:
 |---|---|
 | `bperf` application | `doctor`, `run`, and `confirm` orchestration. It composes the library Interfaces but is not a dependency of them. |
 | `bperf-runtime::installation` | Pinned browser selection and installation. Playwright version, revisions, platform archives, executable paths, cache conventions, atomic extraction, and Linux packages stay private. |
+| `bperf-storage` | Atomic immutable publication, atomic replacement, and recoverable newline-committed journals. Domain schemas, identities, and path layouts stay with callers. |
 | `bperf-browser::lab` | Engine-neutral configurations and evidence, retained lane lifecycle, complete capture validation, and managed benchmark inspection. |
 | `bperf-browser::artifacts` | Complete per-scope artifact-set and file validation. Construction helpers and Speedscope representation stay crate-private. |
 | Private browser Modules | Chromium CDP, Firefox Juggler/RDP, WebKit inspector protocol, native formats, workload injection, and process containment. |
 | `bperf-measurement::manifest` | Benchmark and variant definitions. |
 | `bperf-measurement::schedule` | Deterministic fixed and adaptive trial schedules. |
 | `bperf-measurement::sampling` | Pilot stopping, batch selection, final-count sizing, and immutable sampling decisions. |
-| `bperf-measurement::store` | One-variant measurement-set preparation, resumption, evidence recording, frozen workloads, environment records, and finalization. Persistence paths and immutable-write mechanics stay private. |
+| `bperf-measurement::store` | One-variant measurement-set preparation, resumption, evidence recording, frozen workloads, environment records, and finalization. Measurement paths and schemas stay private. |
 | `bperf-measurement::retention` | Representative artifact selection and resumable payload cleanup. |
 | `bperf-decision::environment` | Host and adapter identity plus versioned per-engine runtime anchors. |
 | `bperf-decision::comparison` | Compatibility checks, independent statistics, guardrails, and strict engine-level verdict folding. |
 | `bperf-decision::baseline` | Append-only current-baseline references. |
 | `bperf-decision::lineage` | Content-addressed source states, deltas, cycles, confirmations, and promotions. |
 | `managed_benchmark` | The common `run` and `confirm` workflows, two-pass cross-engine discovery, generated private inputs, comparison attachment, and cycle recording. |
-| `benchmark_host` | Concurrent loopback serving of one validated browser bundle and immutable fixture lock, including byte-range and paced-stream responses. |
+| `benchmark_host` | Concurrent loopback serving of one validated browser bundle and validated fixture bodies, including byte-range and paced-stream responses. |
 | `project_modules` | Rolldown-backed TypeScript, package, CommonJS, alias, and browser-bundle resolution plus materialized bundle identity. |
 | `fixtures` | Local project containment, HTTPS acquisition and redirects, content-addressed body caching, pinned-remote reuse, and immutable fixture-lock validation. |
 | `benchmark_runtime` | The prepared workload and verifier contract used by the measurement engine. |

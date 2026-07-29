@@ -57,9 +57,8 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
         return finish(&measurement);
     }
 
-    let mut browser_lab = BrowserLab::start(options.runtime)?;
-    let execution = (|| {
-        let environment_fingerprint = environment::capture(&mut browser_lab, &measurement)?;
+    BrowserLab::run(options.runtime, |browser_lab| {
+        let environment_fingerprint = environment::capture(browser_lab, &measurement)?;
         if let Some(existing) = measurement.environment_fingerprint()
             && existing != environment_fingerprint
         {
@@ -80,7 +79,7 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
                 let started = Instant::now();
                 let result = benchmark.execute_trial(
                     &measurement,
-                    &mut browser_lab,
+                    browser_lab,
                     trial,
                     attempt,
                     &environment_fingerprint,
@@ -121,10 +120,7 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
             }
         }
         Ok(())
-    })();
-    let shutdown = browser_lab.finish();
-    execution?;
-    shutdown?;
+    })?;
 
     let completed = MeasurementSet::open(&measurement_root)?;
     finish(&completed)

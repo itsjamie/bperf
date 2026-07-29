@@ -2,8 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -245,26 +244,12 @@ fn cohort_key(value: &str) -> String {
 }
 
 pub(crate) fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
-    if path.exists() {
-        let existing =
-            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        if existing == content {
-            return Ok(());
-        }
-        bail!(
-            "refusing to overwrite immutable measurement artifact {}",
+    bperf_storage::publish_immutable(path, content).with_context(|| {
+        format!(
+            "failed to publish immutable measurement artifact {}",
             path.display()
-        );
-    }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush {}", path.display()))
+        )
+    })
 }
 
 pub struct MeasurementSet {
@@ -402,16 +387,8 @@ impl MeasurementSet {
 
         let encoded = serde_json::to_string_pretty(summary)?;
         let summary_path = self.root.join("summary.json");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&summary_path)
-            .with_context(|| format!("failed to open {}", summary_path.display()))?;
-        file.write_all(format!("{encoded}\n").as_bytes())
-            .with_context(|| format!("failed to write {}", summary_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to flush {}", summary_path.display()))?;
+        bperf_storage::replace_file(&summary_path, format!("{encoded}\n").as_bytes())
+            .with_context(|| format!("failed to store {}", summary_path.display()))?;
 
         if !complete {
             return Ok(());
@@ -700,18 +677,9 @@ impl MeasurementSet {
             );
         }
 
-        let mut encoded = serde_json::to_vec(result)?;
-        encoded.push(b'\n');
         let path = self.root.join("trials.jsonl");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        file.write_all(&encoded)
-            .with_context(|| format!("failed to append {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to flush {}", path.display()))
+        bperf_storage::append_json_line(&path, result)
+            .with_context(|| format!("failed to append {}", path.display()))
     }
 
     pub fn final_results(&self, engine: Engine) -> Vec<&TrialResult> {
@@ -917,23 +885,13 @@ fn ingest(
         .iter()
         .map(|trial| (trial.trial_id.as_str(), trial))
         .collect();
-    let source = if path.exists() {
-        fs::read_to_string(path)
-            .with_context(|| format!("failed to read trial results {}", path.display()))?
-    } else {
-        String::new()
-    };
+    let results: Vec<TrialResult> = bperf_storage::read_json_lines(path)
+        .with_context(|| format!("failed to read trial results {}", path.display()))?;
     let mut attempts: HashMap<String, Vec<TrialResult>> = HashMap::new();
     let mut seen = HashSet::new();
     let mut environment_fingerprints = HashSet::new();
 
-    for (line_index, line) in source.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let line_number = line_index + 1;
-        let result: TrialResult = serde_json::from_str(line)
-            .with_context(|| format!("invalid trial JSON at line {line_number}"))?;
+    for result in results {
         if result.schema_version != MEASUREMENT_SCHEMA_VERSION {
             bail!(
                 "trial result {} uses unsupported schema {}",
@@ -1147,6 +1105,8 @@ struct PlanSummary<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -1164,7 +1124,30 @@ mod tests {
         write_immutable(&path, b"first").unwrap();
         write_immutable(&path, b"first").unwrap();
         let error = write_immutable(&path, b"second").unwrap_err();
-        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(format!("{error:#}").contains("immutable file collision"));
+    }
+
+    #[test]
+    fn measurement_reopen_ignores_an_interrupted_trailing_result() {
+        let directory = tempdir().unwrap();
+        let root = prepare(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            Some(20),
+            directory.path(),
+        )
+        .unwrap();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        append_pending(&measurement);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("trials.jsonl"))
+            .unwrap()
+            .write_all(br#"{"schema_version":"#)
+            .unwrap();
+
+        let reopened = MeasurementSet::open(&root).unwrap();
+        assert!(reopened.final_is_complete());
     }
 
     #[test]

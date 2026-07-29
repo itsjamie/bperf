@@ -113,6 +113,8 @@ viewer schema;
 own their engine protocols and native capture formats.
 `crates/bperf-runtime` owns the pinned browser registry, platform downloads,
 atomic extraction, cache discovery, and Linux dependency installation.
+`crates/bperf-storage` owns atomic local publication and recoverable journals;
+domain crates retain their schemas and path layouts.
 `src/project_modules.rs` owns project bundling, and
 `src/benchmark_host.rs` owns loopback serving of the generated bundle and
 locked fixtures. `src/fixtures.rs` owns local containment, remote acquisition,

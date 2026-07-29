@@ -17,28 +17,33 @@ pub struct DoctorOptions {
 }
 
 pub fn run(options: DoctorOptions) -> Result<()> {
-    if options.engines.is_empty() {
+    let DoctorOptions {
+        engines,
+        artifact_root,
+        runtime,
+        json,
+    } = options;
+    if engines.is_empty() {
         bail!("at least one engine must be requested");
     }
 
     let run_id = unique_run_id()?;
-    let run_root = options.artifact_root.join(&run_id);
+    let run_root = artifact_root.join(&run_id);
     fs::create_dir_all(&run_root)
         .with_context(|| format!("failed to create {}", run_root.display()))?;
     let run_root = fs::canonicalize(&run_root)
         .with_context(|| format!("failed to resolve {}", run_root.display()))?;
 
-    let mut browser_lab = BrowserLab::start(options.runtime)?;
-    let mut results = Vec::with_capacity(options.engines.len());
-
-    for engine in options.engines {
-        eprintln!("[doctor] proving {engine}");
-        let result = browser_lab.probe(engine, &run_root)?;
-        eprintln!("[doctor] {engine} passed");
-        results.push(result);
-    }
-
-    browser_lab.finish()?;
+    let results = BrowserLab::run(runtime, |browser_lab| {
+        let mut results = Vec::with_capacity(engines.len());
+        for engine in engines {
+            eprintln!("[doctor] proving {engine}");
+            let result = browser_lab.probe(engine, &run_root)?;
+            eprintln!("[doctor] {engine} passed");
+            results.push(result);
+        }
+        Ok(results)
+    })?;
     let summary = DoctorSummary {
         schema_version: 2,
         run_id,
@@ -51,7 +56,7 @@ pub fn run(options: DoctorOptions) -> Result<()> {
     fs::write(&summary_path, format!("{encoded}\n"))
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
 
-    if options.json {
+    if json {
         println!("{encoded}");
     } else {
         println!("bperf doctor: supported");

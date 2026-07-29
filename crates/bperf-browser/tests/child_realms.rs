@@ -281,29 +281,30 @@ fn gecko_profile_marks_url(profile: &serde_json::Value, url_suffix: &str) -> boo
 fn assert_child_realm_evidence(engine: Engine) {
     let server = RealmServer::start();
     let directory = tempdir().unwrap();
-    let mut lab = BrowserLab::start(BrowserInstallation::discover().unwrap()).unwrap();
-    let browser = BrowserTrialConfig {
-        viewport: Viewport {
-            width: 1_280,
-            height: 720,
-        },
-        locale: "en-US".to_owned(),
-        timezone_id: "UTC".to_owned(),
-        color_scheme: "light".to_owned(),
-    };
+    let (root, evidence) = BrowserLab::run(BrowserInstallation::discover().unwrap(), |lab| {
+        let browser = BrowserTrialConfig {
+            viewport: Viewport {
+                width: 1_280,
+                height: 720,
+            },
+            locale: "en-US".to_owned(),
+            timezone_id: "UTC".to_owned(),
+            color_scheme: "light".to_owned(),
+        };
 
-    let root = directory.path().join(engine.as_str());
-    let operations = vec![json!({"seed": 42}); CAPTURE_OPERATION_COUNT];
-    let evidence = lab
-        .measure_trial(BrowserTrialRequest {
+        let root = directory.path().join(engine.as_str());
+        let operations = vec![json!({"seed": 42}); CAPTURE_OPERATION_COUNT];
+        let evidence = lab.measure_trial(BrowserTrialRequest {
             engine,
             artifact_root: &root,
             target_url: &server.url,
             operations: &operations,
             browser: &browser,
             batches: TrialBatchConfig::SINGLE,
-        })
-        .unwrap();
+        })?;
+        Ok((root, evidence))
+    })
+    .unwrap();
     assert_eq!(
         evidence.workload.result,
         vec![
@@ -382,7 +383,6 @@ fn assert_child_realm_evidence(engine: Engine) {
         cpu_profiles.contains("bperfIframeHotLoop"),
         flamegraphs.contains("/frame.html")
     );
-    lab.finish().unwrap();
 }
 
 #[test]

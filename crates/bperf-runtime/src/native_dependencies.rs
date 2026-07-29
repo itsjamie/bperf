@@ -1,4 +1,4 @@
-//! Linux packages required by the generated Playwright browser registry.
+//! Host package-manager capability and browser-native dependency installation.
 
 use std::collections::BTreeSet;
 
@@ -7,48 +7,73 @@ use std::process::{Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
-use anyhow::Result;
-#[cfg(target_os = "linux")]
-use anyhow::bail;
+use anyhow::{Result, bail};
 
 #[cfg(target_os = "linux")]
 use crate::registry::DependencyGroups;
 use crate::{installation::BrowserName, registry::Registry};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Capability {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    NotRequired,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Apt { registry_platform: String },
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Unsupported { distribution: String },
+}
+
 pub(crate) fn install(
-    host: &str,
+    capability: &Capability,
     browsers: &BTreeSet<BrowserName>,
     registry: &Registry,
 ) -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (host, browsers, registry);
-        println!("This platform does not require a separate system dependency installation.");
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let groups = registry.dependency_groups(host)?;
-        let mut packages = groups
-            .tools
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        for browser in browsers {
-            let group = dependency_group(groups, *browser);
-            packages.extend(group.iter().map(String::as_str));
+    match capability {
+        Capability::NotRequired => {
+            println!("This platform does not require a separate system dependency installation.");
+            Ok(())
         }
-        let packages = packages.into_iter().collect::<Vec<_>>();
-        println!(
-            "Installing {} operating-system packages for the selected browsers...",
-            packages.len()
-        );
-        run_apt(&["update"])?;
-        let mut arguments = vec!["install", "-y", "--no-install-recommends"];
-        arguments.extend(packages);
-        run_apt(&arguments)
+        Capability::Apt { registry_platform } => install_apt(registry_platform, browsers, registry),
+        Capability::Unsupported { distribution } => bail!(
+            "automatic browser dependency installation is unsupported on {distribution}; install the missing shared libraries with the host package manager"
+        ),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn install_apt(
+    registry_platform: &str,
+    browsers: &BTreeSet<BrowserName>,
+    registry: &Registry,
+) -> Result<()> {
+    let groups = registry.dependency_groups(registry_platform)?;
+    let mut packages = groups
+        .tools
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for browser in browsers {
+        let group = dependency_group(groups, *browser);
+        packages.extend(group.iter().map(String::as_str));
+    }
+    let packages = packages.into_iter().collect::<Vec<_>>();
+    println!(
+        "Installing {} operating-system packages for the selected browsers...",
+        packages.len()
+    );
+    run_apt(&["update"])?;
+    let mut arguments = vec!["install", "-y", "--no-install-recommends"];
+    arguments.extend(packages);
+    run_apt(&arguments)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_apt(
+    registry_platform: &str,
+    _browsers: &BTreeSet<BrowserName>,
+    _registry: &Registry,
+) -> Result<()> {
+    bail!("apt dependency installation is unavailable on this host (requested {registry_platform})")
 }
 
 #[cfg(target_os = "linux")]

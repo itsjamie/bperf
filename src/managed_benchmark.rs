@@ -2,8 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -560,18 +559,9 @@ fn describe(
     object_root: &Path,
     installation: &BrowserInstallation,
 ) -> Result<ManagedDescription> {
-    let mut browser_lab = BrowserLab::start(installation.clone())?;
-    let discovery =
-        discover_managed_benchmark(project, fixture_lock, object_root, &mut browser_lab);
-    let shutdown = browser_lab.finish();
-    match (discovery, shutdown) {
-        (Ok(description), Ok(())) => Ok(description),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error.context("managed discovery adapters failed to close")),
-        (Err(error), Err(shutdown)) => Err(error.context(format!(
-            "managed discovery adapters also failed to close: {shutdown:#}"
-        ))),
-    }
+    BrowserLab::run(installation.clone(), |browser_lab| {
+        discover_managed_benchmark(project, fixture_lock, object_root, browser_lab)
+    })
 }
 
 #[derive(Deserialize)]
@@ -926,27 +916,13 @@ fn write_generated(path: &Path, content: &[u8]) -> Result<()> {
     if fs::read(path).is_ok_and(|existing| existing == content) {
         return Ok(());
     }
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+    bperf_storage::replace_file(path, content)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
-    if path.exists() {
-        let existing =
-            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        if existing == content {
-            return Ok(());
-        }
-        bail!("refusing to overwrite immutable index {}", path.display());
-    }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush {}", path.display()))
+    bperf_storage::publish_immutable(path, content)
+        .with_context(|| format!("failed to publish immutable index {}", path.display()))
 }
 
 #[cfg(test)]

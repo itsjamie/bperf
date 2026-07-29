@@ -152,7 +152,7 @@ impl BrowserProcess {
     pub(crate) fn wait_for_exit(&mut self) -> Result<()> {
         let deadline = Instant::now() + GRACEFUL_EXIT_TIMEOUT;
         loop {
-            if self.child.try_wait()?.is_some() {
+            if self.child.root_has_exited()? {
                 self.stop_contained_processes()?;
                 return Ok(());
             }
@@ -171,9 +171,7 @@ impl BrowserProcess {
     }
 
     fn stop_contained_processes(&mut self) -> Result<()> {
-        self.child.terminate()?;
-        self.child.wait()?;
-        self.child.wait_until_empty()?;
+        self.child.stop_contained_processes()?;
         self.contained_processes_stopped = true;
         Ok(())
     }
@@ -243,6 +241,7 @@ mod platform {
     pub(super) struct ChildProcess {
         child: Child,
         process_group: i32,
+        process_group_terminated: bool,
     }
 
     impl ChildProcess {
@@ -250,17 +249,36 @@ mod platform {
             self.child.id()
         }
 
-        pub(super) fn try_wait(&mut self) -> Result<Option<()>> {
-            Ok(self.child.try_wait()?.map(|_| ()))
+        pub(super) fn root_has_exited(&self) -> Result<bool> {
+            let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.process_group as libc::id_t,
+                    information.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to observe browser exit");
+            }
+            let information = unsafe { information.assume_init() };
+            Ok(unsafe { information.si_pid() } != 0)
         }
 
-        pub(super) fn wait(&mut self) -> Result<()> {
+        pub(super) fn stop_contained_processes(&mut self) -> Result<()> {
+            if !self.process_group_terminated {
+                self.terminate_process_group()?;
+                self.process_group_terminated = true;
+            }
             self.child.wait()?;
-            Ok(())
+            self.wait_until_empty()
         }
 
-        pub(super) fn terminate(&mut self) -> Result<()> {
-            // The browser may already have exited between try_wait and kill.
+        fn terminate_process_group(&self) -> Result<()> {
+            // A gracefully exited root remains waitable until this signal has
+            // been sent, so its process-group id cannot identify another group.
             let result = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
             if result == -1 {
                 let error = std::io::Error::last_os_error();
@@ -271,7 +289,7 @@ mod platform {
             Ok(())
         }
 
-        pub(super) fn wait_until_empty(&self) -> Result<()> {
+        fn wait_until_empty(&self) -> Result<()> {
             let deadline = Instant::now() + FORCED_EXIT_TIMEOUT;
             loop {
                 let result = unsafe { libc::kill(-self.process_group, 0) };
@@ -354,6 +372,7 @@ mod platform {
             child: ChildProcess {
                 child,
                 process_group: pid,
+                process_group_terminated: false,
             },
             writer: unsafe { File::from_raw_fd(parent_write) },
             reader: unsafe { File::from_raw_fd(parent_read) },
@@ -466,10 +485,10 @@ mod platform {
             self.pid
         }
 
-        pub(super) fn try_wait(&mut self) -> Result<Option<()>> {
+        pub(super) fn root_has_exited(&self) -> Result<bool> {
             let result = unsafe { WaitForSingleObject(self.process_handle(), 0) };
             if result == WAIT_TIMEOUT {
-                Ok(None)
+                Ok(false)
             } else if result == WAIT_OBJECT_0 {
                 let mut exit_code = 0;
                 if unsafe { GetExitCodeProcess(self.process_handle(), &mut exit_code) } == 0 {
@@ -477,16 +496,17 @@ mod platform {
                         .context("failed to read browser exit status");
                 }
                 if exit_code == STILL_ACTIVE as u32 {
-                    Ok(None)
+                    Ok(false)
                 } else {
-                    Ok(Some(()))
+                    Ok(true)
                 }
             } else {
                 Err(std::io::Error::last_os_error()).context("failed waiting for browser")
             }
         }
 
-        pub(super) fn wait(&mut self) -> Result<()> {
+        pub(super) fn stop_contained_processes(&mut self) -> Result<()> {
+            self.terminate_job()?;
             let result =
                 unsafe { WaitForSingleObject(self.process_handle(), FORCED_EXIT_TIMEOUT_MS) };
             if result == WAIT_TIMEOUT {
@@ -495,10 +515,10 @@ mod platform {
             if result != WAIT_OBJECT_0 {
                 return Err(std::io::Error::last_os_error()).context("failed waiting for browser");
             }
-            Ok(())
+            self.wait_until_empty()
         }
 
-        pub(super) fn terminate(&mut self) -> Result<()> {
+        fn terminate_job(&self) -> Result<()> {
             if unsafe { TerminateJobObject(self.job_handle(), 1) } == 0 {
                 return Err(std::io::Error::last_os_error())
                     .context("failed to terminate the browser Job Object");
@@ -506,7 +526,7 @@ mod platform {
             Ok(())
         }
 
-        pub(super) fn wait_until_empty(&self) -> Result<()> {
+        fn wait_until_empty(&self) -> Result<()> {
             let deadline = Instant::now() + FORCED_EXIT_TIMEOUT;
             loop {
                 let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
@@ -874,9 +894,51 @@ mod tests {
         spawned.writer.flush().unwrap();
         let mut response = Vec::new();
         spawned.reader.read_to_end(&mut response).unwrap();
-        spawned.child.wait().unwrap();
+        spawned.child.stop_contained_processes().unwrap();
 
         assert_eq!(response, b"{\"id\":1}\0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_exit_observation_preserves_the_process_group_leader_until_termination() {
+        use std::{
+            path::Path,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let working_directory = tempfile::tempdir().unwrap();
+        let mut spawned = super::platform::spawn(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "exit 0".to_owned()],
+            working_directory.path(),
+            &[],
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !spawned.child.root_has_exited().unwrap() {
+            assert!(Instant::now() < deadline, "shell did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                spawned.child.pid() as libc::id_t,
+                information.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(
+            unsafe { information.assume_init().si_pid() },
+            spawned.child.pid() as libc::pid_t
+        );
+
+        spawned.child.stop_contained_processes().unwrap();
+        spawned.child.stop_contained_processes().unwrap();
     }
 
     #[test]

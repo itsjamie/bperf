@@ -1,8 +1,7 @@
 //! Append-only baseline references.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -125,15 +124,12 @@ fn current_if_present(registry_root: &Path, benchmark_id: &str) -> Result<Option
 
 fn current(registry_root: &Path, benchmark_id: &str) -> Result<BaselineRecord> {
     let path = registry_path(registry_root, benchmark_id);
-    let source = fs::read_to_string(&path)
-        .with_context(|| format!("no promoted baseline for benchmark {benchmark_id:?}"))?;
-    let line = source
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
+    if !path.exists() {
+        bail!("no promoted baseline for benchmark {benchmark_id:?}");
+    }
+    let record: BaselineRecord = bperf_storage::read_last_json_line(&path)
+        .with_context(|| format!("invalid baseline history {}", path.display()))?
         .with_context(|| format!("baseline history {} is empty", path.display()))?;
-    let record: BaselineRecord = serde_json::from_str(line)
-        .with_context(|| format!("invalid baseline history {}", path.display()))?;
     if record.schema_version != 2 || record.benchmark_id != benchmark_id {
         bail!(
             "baseline history {} has incompatible identity; promote a measurement made with the current runtime-anchor protocol",
@@ -145,15 +141,8 @@ fn current(registry_root: &Path, benchmark_id: &str) -> Result<BaselineRecord> {
 
 fn append(registry_root: &Path, record: &BaselineRecord) -> Result<()> {
     let path = registry_path(registry_root, &record.benchmark_id);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open baseline history {}", path.display()))?;
-    writeln!(file, "{}", serde_json::to_string(record)?)
-        .with_context(|| format!("failed to append baseline history {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush baseline history {}", path.display()))
+    bperf_storage::append_json_line(&path, record)
+        .with_context(|| format!("failed to append baseline history {}", path.display()))
 }
 
 fn registry_path(registry_root: &Path, benchmark_id: &str) -> PathBuf {
@@ -197,6 +186,8 @@ impl BaselineRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -228,6 +219,33 @@ mod tests {
         assert_eq!(
             current.previous_measurement_set_id.as_deref(),
             Some("first")
+        );
+    }
+
+    #[test]
+    fn interrupted_baseline_append_is_ignored_and_replaced_on_resume() {
+        let directory = tempdir().unwrap();
+        append(directory.path(), &record("first", None)).unwrap();
+        let path = registry_path(directory.path(), "benchmark");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"schema_version":"#)
+            .unwrap();
+
+        assert_eq!(
+            current(directory.path(), "benchmark")
+                .unwrap()
+                .measurement_set_id,
+            "first"
+        );
+        append(directory.path(), &record("second", Some("first"))).unwrap();
+        assert_eq!(
+            current(directory.path(), "benchmark")
+                .unwrap()
+                .measurement_set_id,
+            "second"
         );
     }
 }

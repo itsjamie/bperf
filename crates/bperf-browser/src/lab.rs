@@ -61,12 +61,23 @@ pub struct BrowserLab {
 }
 
 impl BrowserLab {
-    pub fn start(installation: BrowserInstallation) -> Result<Self> {
+    pub(crate) fn start(installation: BrowserInstallation) -> Result<Self> {
         Ok(Self {
             chromium: RetainedAdapter::new(installation.clone()),
             firefox: RetainedAdapter::new(installation.clone()),
             webkit: RetainedAdapter::new(installation),
         })
+    }
+
+    /// Runs one operation with a managed browser session and always attempts to
+    /// close every retained engine lane before returning.
+    pub fn run<Value>(
+        installation: BrowserInstallation,
+        operation: impl FnOnce(&mut Self) -> Result<Value>,
+    ) -> Result<Value> {
+        let mut lab = Self::start(installation)?;
+        let result = operation(&mut lab);
+        combine_operation_and_shutdown(result, lab.finish())
     }
 
     /// Proves the complete capture contract for one engine and stores immutable
@@ -123,7 +134,7 @@ impl BrowserLab {
         self.adapter(engine).inspect_benchmark(target_url, case_id)
     }
 
-    pub fn finish(mut self) -> Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         let chromium = self.chromium.finish();
         let firefox = self.firefox.finish();
         let webkit = self.webkit.finish();
@@ -151,6 +162,20 @@ impl BrowserLab {
             Engine::Firefox => &mut self.firefox,
             Engine::Webkit => &mut self.webkit,
         }
+    }
+}
+
+fn combine_operation_and_shutdown<Value>(
+    operation: Result<Value>,
+    shutdown: Result<()>,
+) -> Result<Value> {
+    match (operation, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.context("browser adapters failed to close")),
+        (Err(error), Err(shutdown)) => Err(error.context(format!(
+            "browser adapters also failed to close: {shutdown:#}"
+        ))),
     }
 }
 
@@ -920,6 +945,23 @@ mod tests {
             Engine::ALL.map(Engine::as_str),
             ["chromium", "firefox", "webkit"]
         );
+    }
+
+    #[test]
+    fn operation_and_shutdown_failures_are_both_preserved() {
+        let error = combine_operation_and_shutdown::<()>(
+            Err(anyhow::anyhow!("measurement failed")),
+            Err(anyhow::anyhow!("cleanup failed")),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("measurement failed"));
+        assert!(message.contains("cleanup failed"));
+
+        let shutdown_only =
+            combine_operation_and_shutdown(Ok("complete"), Err(anyhow::anyhow!("cleanup failed")))
+                .unwrap_err();
+        assert!(format!("{shutdown_only:#}").contains("browser adapters failed to close"));
     }
 
     #[test]
