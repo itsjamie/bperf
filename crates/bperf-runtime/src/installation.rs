@@ -26,15 +26,6 @@ impl BrowserName {
             Self::Webkit => "webkit",
         }
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) const fn dependency_group(self) -> &'static str {
-        match self {
-            Self::ChromiumHeadlessShell => "chromium",
-            Self::Firefox => "firefox",
-            Self::Webkit => "webkit",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
