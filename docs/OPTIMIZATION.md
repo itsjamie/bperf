@@ -108,11 +108,15 @@ Read `sampling.json` and the candidate's `summary.json` when:
 Read `artifact-retention.json` before opening profiles. It identifies the final
 trial nearest the median CPU metric and the final trial nearest the median heap
 metric for each case and engine. Those may be different trials because they
-represent different distributions.
+represent different distributions. For a trial with dedicated-worker or OOPIF
+capture scopes, every CPU/flamegraph scope from the CPU representative and
+every heap scope from the heap representative is retained.
 
 Open a retained CPU profile, Speedscope flamegraph, or heap snapshot when it can
-explain the result or distinguish the next hypotheses. A profile is useful
-diagnostic evidence; it does not replace the statistical comparison.
+explain the result or distinguish the next hypotheses. Scope names such as
+`page`, `worker-1`, and `iframe-1` identify native diagnostic groups; they are
+not additional benchmark cases. A profile is useful diagnostic evidence; it
+does not replace the statistical comparison.
 
 ## Runtime anchors
 
@@ -133,9 +137,11 @@ independently:
 A non-stable anchor makes performance evidence inconclusive for that engine.
 It does not excuse a correctness failure.
 
-Exact Node, Playwright, operating-system, CPU, protocol, and browser-build
-identity is a separate compatibility gate. Baseline age is reported and warns
+Exact host, per-engine browser, and per-engine adapter identity is a separate
+compatibility gate. Every engine identifies its Rust adapter protocol, pinned
+Playwright revision, and executable digest. Baseline age is reported and warns
 after seven days, but age alone does not override a stable fresh anchor.
+Measurements created by earlier browser capture contracts must be remeasured.
 
 [ADR 0001](adr/0001-runtime-validity.md) records why bperf uses anchors and
 independent confirmation instead of reconstructing old source inside the

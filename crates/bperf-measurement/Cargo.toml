@@ -1,0 +1,19 @@
+[package]
+name = "bperf-measurement"
+version = "0.1.0"
+edition = "2024"
+description = "Immutable browser measurement sets for bperf"
+license = "MIT"
+repository = "https://github.com/itsjamie/bperf"
+
+[dependencies]
+anyhow = "1.0"
+bperf-browser = { path = "../bperf-browser" }
+bperf-storage = { path = "../bperf-storage" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-saphyr = "0.0.29"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.27"

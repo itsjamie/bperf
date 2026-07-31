@@ -8,12 +8,7 @@ workloads:
   - id: parse-fragment
     trace_file: ../../examples/fixtures/checkout-flow/actions.jsonl
     verifier:
-      command:
-        - node
-        - ../../examples/fixtures/checkout-flow/verify.mjs
-      timeout_seconds: 30
-      identity_files:
-        - ../../examples/fixtures/checkout-flow/verify.mjs
+      builtin: exact
 
 browser:
   engines:

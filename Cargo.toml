@@ -6,16 +6,41 @@ description = "Cross-engine browser benchmark measurement and comparison CLI"
 license = "MIT"
 repository = "https://github.com/itsjamie/bperf"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target}.tar.gz"
+bin-dir = "{ name }-{ version }-{ target}/{ bin }{ binary-ext}"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
+
+[workspace]
+members = [
+    ".",
+    "crates/bperf-browser",
+    "crates/bperf-build",
+    "crates/bperf-decision",
+    "crates/bperf-measurement",
+    "crates/bperf-runtime",
+    "crates/bperf-storage",
+]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0"
+bperf-browser = { path = "crates/bperf-browser" }
+bperf-decision = { path = "crates/bperf-decision" }
+bperf-measurement = { path = "crates/bperf-measurement" }
+bperf-runtime = { path = "crates/bperf-runtime" }
+bperf-storage = { path = "crates/bperf-storage" }
 clap = { version = "4.5", features = ["derive"] }
+form_urlencoded = "1.2"
+rolldown = "1.2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-saphyr = "0.0.29"
 sha2 = "0.10"
-
-[dev-dependencies]
-tempfile = "3.20"
+tempfile = "3.27"
+tiny_http = "0.12"
+tokio = { version = "1.52", features = ["rt"] }
+ureq = "3.3"
 
 [profile.release]
 lto = "thin"

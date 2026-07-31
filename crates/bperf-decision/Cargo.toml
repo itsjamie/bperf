@@ -1,0 +1,26 @@
+[package]
+name = "bperf-decision"
+version = "0.1.0"
+edition = "2024"
+description = "Evidence comparison, baselines, and optimization history for bperf"
+license = "MIT"
+repository = "https://github.com/itsjamie/bperf"
+
+[dependencies]
+anyhow = "1.0"
+bperf-browser = { path = "../bperf-browser" }
+bperf-measurement = { path = "../bperf-measurement" }
+bperf-storage = { path = "../bperf-storage" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+tempfile = "3.27"

@@ -4,13 +4,20 @@ subject: browser-operation-adapter
 
 implementation:
   files:
-    - benchmarks/variants/baseline.mjs
-    - benchmarks/variants/server.mjs
+    - advanced-adapter/Cargo.toml
+    - advanced-adapter/Cargo.lock
+    - advanced-adapter/src/main.rs
 
 adapter:
   command:
-    - node
-    - benchmarks/variants/baseline.mjs
+    - cargo
+    - run
+    - --quiet
+    - --locked
+    - --manifest-path
+    - advanced-adapter/Cargo.toml
+    - --
+    - baseline
   ready:
     protocol: stdio-json
-    timeout_seconds: 15
+    timeout_seconds: 120

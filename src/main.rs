@@ -1,25 +1,18 @@
-mod artifact_retention;
-mod baseline;
+mod benchmark_host;
 mod benchmark_runtime;
-mod browser_lab;
-mod comparison;
 mod doctor;
-mod environment;
-mod lineage;
+mod fixtures;
 mod managed_benchmark;
-mod manifest;
-mod measurement;
+mod project_modules;
 mod runner;
-mod sampling;
-mod schedule;
-mod sidecar_runtime;
-
-const MEASUREMENT_SCHEMA_VERSION: u32 = 4;
 
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
-use browser_lab::Engine;
+use bperf_browser::lab::Engine;
+use bperf_decision::{baseline, comparison, lineage};
+use bperf_measurement::{sampling, store as measurement};
+use bperf_runtime::installation::{BrowserInstallation, BrowserName};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -35,8 +28,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__benchmark-host", hide = true)]
+    BenchmarkHost(BenchmarkHostArgs),
     /// Prove that required browser capture capabilities work on this host.
     Doctor(DoctorArgs),
+    /// Install the pinned browser builds used by bperf.
+    Browsers(BrowsersArgs),
     /// Validate a benchmark and, optionally, a compatible variant.
     Validate(ValidateArgs),
     /// Prepare an immutable measurement set for one variant.
@@ -59,6 +56,24 @@ enum Command {
     Baseline(BaselineArgs),
 }
 
+#[derive(Debug, Args)]
+struct BenchmarkHostArgs {
+    #[arg(long)]
+    root: PathBuf,
+
+    #[arg(long)]
+    benchmark: PathBuf,
+
+    #[arg(long)]
+    fixture_lock: PathBuf,
+
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    bundle_metadata: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum EngineSelection {
     Chromium,
@@ -77,6 +92,42 @@ impl EngineSelection {
             Self::All => Engine::ALL.to_vec(),
         }
     }
+
+    fn browsers(self) -> Vec<BrowserName> {
+        match self {
+            Self::Chromium => vec![BrowserName::ChromiumHeadlessShell],
+            Self::Firefox => vec![BrowserName::Firefox],
+            Self::Webkit => vec![BrowserName::Webkit],
+            Self::All => vec![
+                BrowserName::ChromiumHeadlessShell,
+                BrowserName::Firefox,
+                BrowserName::Webkit,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct BrowsersArgs {
+    #[command(subcommand)]
+    command: BrowsersCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BrowsersCommand {
+    /// Download the browser builds pinned by this bperf version.
+    Install(BrowserInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct BrowserInstallArgs {
+    /// Browser engine to install.
+    #[arg(long, value_enum, default_value_t)]
+    engine: EngineSelection,
+
+    /// Also install operating-system dependencies required by the browsers.
+    #[arg(long)]
+    with_deps: bool,
 }
 
 #[derive(Debug, Args)]
@@ -88,14 +139,6 @@ struct DoctorArgs {
     /// Root directory for immutable doctor-run artifacts.
     #[arg(long, default_value = ".bperf/doctor")]
     artifact_dir: PathBuf,
-
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled sidecar entrypoint.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 
     /// Emit the complete summary JSON to stdout.
     #[arg(long)]
@@ -152,14 +195,6 @@ struct MeasureArgs {
     /// Root directory for immutable measurement sets.
     #[arg(long, default_value = ".bperf/measurements")]
     artifact_dir: PathBuf,
-
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled sidecar entrypoint.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 
     /// Emit the measurement summary as JSON.
     #[arg(long)]
@@ -228,14 +263,6 @@ struct ExecutionArgs {
     /// Approximate measurement-time budget. The minimum evidence floor still applies.
     #[arg(long, default_value = "5m")]
     budget: sampling::RunBudget,
-
-    /// Node.js executable. Defaults to BPERF_NODE, then `node`.
-    #[arg(long)]
-    node: Option<PathBuf>,
-
-    /// Override the bundled sidecar entrypoint.
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 }
 
 impl ExecutionArgs {
@@ -248,8 +275,6 @@ impl ExecutionArgs {
             comparison_root: self.comparison_dir,
             lineage_root: self.lineage_dir,
             budget: self.budget,
-            node: self.node,
-            sidecar: self.sidecar,
         }
     }
 }
@@ -291,7 +316,24 @@ struct HistoryArgs {
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
-    format: lineage::HistoryFormat,
+    format: HistoryFormatArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HistoryFormatArg {
+    Text,
+    Json,
+    AgentContext,
+}
+
+impl From<HistoryFormatArg> for lineage::HistoryFormat {
+    fn from(format: HistoryFormatArg) -> Self {
+        match format {
+            HistoryFormatArg::Text => Self::Text,
+            HistoryFormatArg::Json => Self::Json,
+            HistoryFormatArg::AgentContext => Self::AgentContext,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -375,17 +417,33 @@ struct BaselineShowArgs {
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
+        Command::BenchmarkHost(args) => {
+            benchmark_host::run_adapter(benchmark_host::AdapterOptions {
+                root: args.root,
+                benchmark: args.benchmark,
+                fixture_lock: args.fixture_lock,
+                bundle: args.bundle,
+                bundle_metadata: args.bundle_metadata,
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Doctor(args) => {
             let options = doctor::DoctorOptions {
                 engines: args.engine.engines(),
                 artifact_root: args.artifact_dir,
-                node: args.node,
-                sidecar: args.sidecar,
+                runtime: BrowserInstallation::discover()?,
                 json: args.json,
             };
             doctor::run(options)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Browsers(args) => match args.command {
+            BrowsersCommand::Install(args) => {
+                let runtime = BrowserInstallation::discover()?;
+                runtime.install_browsers(&args.engine.browsers(), args.with_deps)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Command::Validate(args) => {
             measurement::validate(measurement::ValidateOptions {
                 benchmark: args.benchmark,
@@ -410,8 +468,7 @@ fn main() -> Result<ExitCode> {
                 variant: args.variant,
                 sampling: runner::SamplingMode::Fixed(args.final_samples),
                 artifact_root: args.artifact_dir,
-                node: args.node,
-                sidecar: args.sidecar,
+                runtime: BrowserInstallation::discover()?,
             })?;
             outcome.report("measure", args.json)?;
             Ok(ExitCode::SUCCESS)
@@ -449,7 +506,7 @@ fn main() -> Result<ExitCode> {
             lineage::history(lineage::HistoryOptions {
                 benchmark_id: args.benchmark_id,
                 root: args.lineage_dir,
-                format: args.format,
+                format: args.format.into(),
             })?;
             Ok(ExitCode::SUCCESS)
         }

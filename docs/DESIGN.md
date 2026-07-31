@@ -3,7 +3,10 @@
 Status: the TypeScript authoring path, three-engine combined trials, retained
 browser lanes, adaptive sampling, baseline comparison, runtime anchors,
 optimization lineage, independent confirmation, and representative artifact
-retention are implemented.
+retention are implemented. Dedicated-worker and iframe execution contribute to
+the same complete trial evidence on every engine. Tagged releases produce
+cargo-binstall-compatible, target-triple archives whose executables carry the
+pinned benchmark runtime.
 
 This document describes the current design. The
 [architecture decision records](adr/README.md) preserve the alternatives and
@@ -38,6 +41,7 @@ format.
 - Measure deterministic browser code in Chromium, Firefox, and WebKit.
 - Capture wall timing, native CPU, Speedscope flamegraph, and native JavaScript
   heap evidence from one workload execution per trial.
+- Include benchmark-owned dedicated workers and iframes in that evidence.
 - Fail explicitly when a requested engine or artifact cannot satisfy the
   contract.
 - Gate performance on correctness in every engine.
@@ -71,6 +75,9 @@ format.
 - A **trial** runs one variant for a benchmark case.
 - A **sample** is the wall, CPU, flamegraph, and heap evidence produced by one
   trial.
+- A **capture scope** is one adapter-assigned group of native CPU, flamegraph,
+  and heap artifacts. It preserves browser execution-realm evidence without
+  becoming a statistical dimension.
 - A **measurement set** contains immutable trial evidence for one variant.
 - **Baseline** and **candidate** are comparison roles assigned to measurement
   sets. They are not properties of a benchmark definition.
@@ -105,11 +112,22 @@ Every requested engine must satisfy the same result shape:
 | Native CPU profile | Required | Required | Required |
 | Speedscope flamegraph | Required | Required | Required |
 | Native JavaScript heap snapshot | Required | Required | Required |
+| Dedicated-worker execution | Required | Required | Required |
+| Iframe execution | Required | Required | Required |
 | Clean close | Required | Required | Required |
 | Artifact containment, size, and digest validation | Required | Required | Required |
 
-A missing capability fails preflight. The caller never receives a successful
-three-engine result with one browser or artifact omitted.
+A missing engine capability fails preflight. A child realm exposed in an
+incompatible form fails the trial before evidence is accepted. The caller never
+receives a successful three-engine result with one browser or artifact omitted.
+
+Each capture scope contains all three native artifact kinds. Chromium and
+WebKit can expose workers as separately profiled realms, while Firefox's native
+profiler and heap actor cover the browser context. The public evidence preserves
+those native boundaries, but CPU and heap scalars are aggregated into the one
+sample for the benchmark case. Shared workers and service workers are not part
+of the common contract; an adapter that exposes one as a separate target fails
+instead of omitting it.
 
 ### Correctness comes first
 
@@ -320,11 +338,11 @@ One captured trial follows this sequence:
 
 1. Create a fresh browser context and page.
 2. Run case setup outside the measured boundary.
-3. Start the engine-native CPU profiler.
+3. Start the engine-native CPU profiler in every existing capture scope.
 4. Run and time one calibrated workload batch.
-5. Stop the CPU profiler.
+5. Stop every CPU profiler.
 6. Let the case settle.
-7. Run the supported collection sequence and capture the live JavaScript heap.
+7. Capture the live JavaScript heap for every retained capture scope.
 8. Verify correctness and close the context.
 
 The resulting sample contains:
@@ -333,13 +351,13 @@ The resulting sample contains:
 - `variant.call_wall_ms`;
 - `browser.cpu_profile.active_ms`;
 - `browser.js_heap.live_bytes`;
-- a native CPU profile;
-- a Speedscope flamegraph derived from that profile;
-- a native heap snapshot.
+- one complete native CPU, Speedscope, and heap artifact group for every
+  capture scope.
 
 Wall and CPU scalars are normalized to one semantic invocation. The heap scalar
-is not divided by the batch size; it describes the settled page after the
-complete batch.
+is not divided by the batch size; it describes the settled page and child
+realms after the complete batch. Per-scope CPU durations and live heap sizes
+are summed inside an engine before the scalar crosses the adapter boundary.
 
 Wall timing is profiler-instrumented by design. Browser startup, setup,
 settling, and heap-capture time are outside `workload.wall_ms`. The same
@@ -359,13 +377,24 @@ are captured around one execution rather than scheduled as independent streams.
 
 ## Native browser adapters
 
-Automation is shared through Playwright. Profiling is engine-specific:
+All engines use browser archives published for one pinned Playwright version.
+An authenticated Rust maintenance job verifies the npm registry signature and
+signed SHA-512 integrity of `playwright-core`, extracts its static distribution
+data without executing package JavaScript, and emits the checked-in registry
+embedded in the executable. The compiled registry owns revisions, platform
+overrides, download URLs, archive layout, Linux dependencies, and installation.
+CI regenerates it from the signed package and rejects drift. Rust also owns each
+browser process and native capture adapter. Playwright WebKit is not the
+installed Safari application.
 
 | Concern | Chromium | Firefox | WebKit |
 |---|---|---|---|
+| Adapter owner | Rust | Rust | Rust |
+| Automation | CDP remote-debugging pipe | Juggler pipe | Inspector pipe to patched WebKit |
 | CPU | CDP `Profiler` | Gecko Profiler through RDP | Web Inspector `ScriptProfiler` |
 | JavaScript heap | CDP `HeapProfiler` | RDP `MemoryActor` | Web Inspector `Heap` |
 | Flamegraph | V8 samples to Speedscope | Gecko tables to Speedscope | Inspector samples to Speedscope |
+| Capture scopes | Page plus separately attached dedicated workers and OOPIFs | One browser context containing page, iframe, and DOM-worker evidence | Page, including iframe work, plus each nested dedicated worker |
 
 Raw captures stay in their native formats. Speedscope is a common viewer, not a
 claim that the profilers have identical semantics.
@@ -374,9 +403,35 @@ The Firefox adapter reads the `.fxsnapshot` core-dump framing and sums every
 node's shallow size in the live heap graph. Protocol memory-report buckets are
 not substituted for the snapshot metric.
 
-WebKit remains the adapter-maintenance hotspot. Playwright has no public WebKit
-equivalent of `newCDPSession`, so bperf owns a pinned, version-tested inspector
-bridge. A mismatch must fail preflight rather than skip the capture.
+The Rust Chromium adapter owns its CDP sessions, target attachment, request
+interception, V8 capture sequencing, and normalization. The Rust Firefox
+adapter owns its Juggler sessions, RDP actors, Gecko profile normalization, and
+`.fxsnapshot` lifecycle. The Rust WebKit adapter owns its pinned private
+inspector bridge. They share only process containment, pinned browser
+installation discovery, browser-workload policy, immutable artifact
+description, and
+Speedscope document construction. The capture-artifact module prepares three
+contained output paths for each capture scope, replaces stale files, and
+returns complete validated descriptor groups. Each adapter still decides which
+native payload, samples, and frames belong in an artifact; engine protocol
+concepts stay inside the adapter. A child realm created while profiling is
+paused until its profiler starts where the engine permits that sequencing. A
+realm lost before its complete artifact group is captured invalidates the
+attempt. A mismatch closes the retained lane and fails preflight or the current
+attempt; no adapter falls back to Node.
+Shutdown succeeds only after the owned Unix process group is absent or the
+Windows Job Object reports zero active processes. The live contract also proves
+that repeated captures keep one root PID for each healthy retained lane.
+
+One versioned JavaScript workload source owns setup, adaptive batch selection,
+result stability, timing, settling, the runtime anchor, and the doctor probe.
+Every Rust adapter embeds it, so those semantics are not reimplemented per
+engine.
+
+[ADR 0007](adr/0007-rust-browser-adapters.md) records the unified Rust
+ownership decision and retirement of the former TypeScript capture path.
+[ADR 0008](adr/0008-child-execution-realms.md) records why child realms use
+native artifact scopes rather than becoming benchmark cases.
 
 Checked-in golden captures exercise each native parser and Speedscope
 normalizer in the fast suite. The ignored real-browser contract tests prove the
@@ -485,8 +540,11 @@ and sampled CPU without changing version strings.
 
 Every measurement set carries:
 
-- exact Node, Playwright, operating-system, CPU, protocol, and browser-build
-  identity;
+- one Rust-captured host identity;
+- exact browser identity for each engine;
+- exact per-engine adapter identity: executable digest, Playwright version,
+  pinned revision, and adapter protocol version for Chromium, Firefox, and
+  WebKit;
 - 31 fresh observations of a versioned JavaScript CPU anchor in every engine.
 
 The comparator bootstraps the historical-to-fresh median anchor change for each
@@ -520,11 +578,13 @@ Every trial needs native CPU and heap payloads to derive its scalar metrics.
 Keeping every payload forever would make storage grow with the statistical
 sample count.
 
-After final evidence completes, bperf selects artifacts independently for each
-case and engine:
+After final evidence completes, bperf selects representative trials
+independently for each case and engine:
 
-- the CPU profile and flamegraph come from the final trial nearest median CPU;
-- the heap snapshot comes from the final trial nearest median live heap;
+- every CPU profile and flamegraph scope comes from the final trial nearest
+  median CPU;
+- every heap snapshot scope comes from the final trial nearest median live
+  heap;
 - ties use the stable trial identifier.
 
 `artifact-retention.json` records each selection and the aggregate retained and
@@ -533,7 +593,8 @@ path, size, format, and SHA-256 descriptor even when an unselected payload is
 removed.
 
 CPU and heap representatives may come from different trials because they
-represent different distributions.
+represent different distributions. Once a representative trial is chosen,
+retention keeps that artifact kind for all of its capture scopes.
 
 Failed and interrupted measurements keep preflight captures and frozen workload
 inputs needed for resumption. Completed measurements remove those scratch
@@ -590,49 +651,92 @@ inventing an optimization cycle. It remains available for advanced workflows.
 
 ```mermaid
 flowchart LR
-    CALLER["Agent, human, or CI"] --> CLI["CLI and managed workflow"]
-    BENCH["TypeScript benchmark"] --> HOST["Benchmark host"]
-    FIXTURES["Fixture objects and lock"] --> HOST
-    HOST --> RUNTIME["Benchmark runtime"]
-    CLI --> MEASURE["Measurement and sampling"]
-    RUNTIME --> MEASURE
-    MEASURE --> LAB["Browser laboratory"]
-    LAB --> CHROMIUM["Chromium adapter"]
-    LAB --> FIREFOX["Firefox adapter"]
-    LAB --> WEBKIT["WebKit adapter"]
-    MEASURE --> ENV["Runtime identity and anchors"]
+    CALLER["Agent, human, or CI"] --> CLI["bperf application"]
+    BENCH["TypeScript benchmark"] --> BUNDLER["Rust project bundler"]
+    FIXTURES["Fixture declarations"] --> RESOLVER["Rust fixture acquisition"]
+    CLI --> BUNDLER
+    CLI --> RESOLVER
+    BUNDLER --> HOST["Rust benchmark host"]
+    RESOLVER --> HOST
+    CLI --> HOST
+    HOST --> LAB
+    CLI --> DECISION["bperf-decision"]
+    CLI --> MEASURE["bperf-measurement"]
+    CLI --> LAB["bperf-browser"]
+    CLI --> INSTALL["bperf-runtime"]
+    CLI --> STORAGE["bperf-storage"]
+    DECISION --> MEASURE
+    DECISION --> LAB
+    DECISION --> STORAGE
+    MEASURE --> LAB
+    MEASURE --> STORAGE
+    LAB --> INSTALL
+    LAB --> CHROMIUM_ADAPTER["Rust Chromium adapter"]
+    CHROMIUM_ADAPTER --> CHROMIUM["Chromium"]
+    LAB --> FIREFOX_ADAPTER["Rust Firefox adapter"]
+    FIREFOX_ADAPTER --> FIREFOX["Firefox"]
+    LAB --> WEBKIT_ADAPTER["Rust WebKit adapter"]
+    WEBKIT_ADAPTER --> WEBKIT["WebKit"]
     MEASURE --> SET["Immutable measurement set"]
-    ENV --> SET
     SET --> RETENTION["Artifact retention"]
-    SET --> COMPARE["Independent comparison"]
+    DECISION --> COMPARE["Independent comparison"]
     BASELINE["Baseline registry"] --> COMPARE
-    SET --> LINEAGE["Optimization lineage"]
+    DECISION --> LINEAGE["Optimization lineage"]
     COMPARE --> LINEAGE
     LINEAGE --> BASELINE
 ```
 
-The important module boundaries are organized by the knowledge they hide:
+The Cargo graph is one-way. Each public Module has an explicit Interface and
+hides knowledge that would otherwise spread through the application:
 
-| Boundary | What it owns |
+| Crate / Module | Interface and hidden knowledge |
 |---|---|
-| `managed_benchmark` | The common `run` and `confirm` workflows, generated private inputs, comparison attachment, and cycle recording. |
-| `benchmark-host` | Loading a user benchmark in every engine, resolving and serving fixtures, and reporting the bundled project source graph. |
-| `project-modules` | TypeScript, package, CommonJS, alias, and browser-bundle resolution. |
+| `bperf` application | `doctor`, `run`, and `confirm` orchestration. It composes the library Interfaces but is not a dependency of them. |
+| `bperf-runtime::installation` | Pinned browser selection and installation. Playwright version, revisions, platform archives, executable paths, cache conventions, atomic extraction, and Linux packages stay private. |
+| `bperf-storage` | Atomic immutable publication, atomic replacement, and recoverable newline-committed journals. Domain schemas, identities, and path layouts stay with callers. |
+| `bperf-browser::lab` | Engine-neutral configurations and evidence, retained lane lifecycle, complete capture validation, and managed benchmark inspection. |
+| `bperf-browser::artifacts` | Complete per-scope artifact-set and file validation. Construction helpers and Speedscope representation stay crate-private. |
+| Private browser Modules | Chromium CDP, Firefox Juggler/RDP, WebKit inspector protocol, native formats, workload injection, and process containment. |
+| `bperf-measurement::manifest` | Benchmark and variant definitions. |
+| `bperf-measurement::schedule` | Deterministic fixed and adaptive trial schedules. |
+| `bperf-measurement::sampling` | Pilot stopping, batch selection, final-count sizing, and immutable sampling decisions. |
+| `bperf-measurement::store` | One-variant measurement-set preparation, resumption, evidence recording, frozen workloads, environment records, and finalization. Measurement paths and schemas stay private. |
+| `bperf-measurement::retention` | Representative artifact selection and resumable payload cleanup. |
+| `bperf-decision::environment` | Host and adapter identity plus versioned per-engine runtime anchors. |
+| `bperf-decision::comparison` | Compatibility checks, independent statistics, guardrails, and strict engine-level verdict folding. |
+| `bperf-decision::baseline` | Append-only current-baseline references. |
+| `bperf-decision::lineage` | Content-addressed source states, deltas, cycles, confirmations, and promotions. |
+| `managed_benchmark` | The common `run` and `confirm` workflows, two-pass cross-engine discovery, generated private inputs, comparison attachment, and cycle recording. |
+| `benchmark_host` | Concurrent loopback serving of one validated browser bundle and validated fixture bodies, including byte-range and paced-stream responses. |
+| `project_modules` | Rolldown-backed TypeScript, package, CommonJS, alias, and browser-bundle resolution plus materialized bundle identity. |
+| `fixtures` | Local project containment, HTTPS acquisition and redirects, content-addressed body caching, pinned-remote reuse, and immutable fixture-lock validation. |
 | `benchmark_runtime` | The prepared workload and verifier contract used by the measurement engine. |
-| `measurement` | One-variant measurement-set persistence, validation, and finalization. |
-| `sampling` | Pilot stopping, batch selection, final-count sizing, and immutable sampling decisions. |
 | `runner` | Resumable progression of pending attempts into terminal trial evidence. |
-| `browser_lab` | Retained lane lifecycle and validation of engine-neutral capture evidence. |
-| Private engine adapters | Native protocol sequencing, formats, cleanup, and Speedscope normalization for one engine. |
-| `environment` | Exact runtime identity, baseline age, and versioned per-engine anchors. |
-| `comparison` | Compatibility checks, independent statistics, guardrails, and strict engine-level verdict folding. |
-| `artifact_retention` | Representative selection and resumable payload cleanup. |
-| `baseline` | Append-only current-baseline references. |
-| `lineage` | Content-addressed source states, deltas, cycles, confirmations, and promotions. |
 
 Different layers expose different abstractions. The Rust core receives
 validated capture evidence, not browser protocol objects. The benchmark author
 supplies a domain operation, not generated YAML or a transport endpoint.
+
+Managed discovery serves the unresolved bundle and compares descriptions from
+Chromium, Firefox, and WebKit. After fixture resolution locks the inputs,
+it serves the resolved bundle, compares descriptions again, and exercises every
+case in a fresh context on every engine. Rolldown inlines the browser authoring
+module into one materialized ESM bundle. A Rust loopback host serves that bundle
+and the locked fixture bodies during both discovery and every trial. Rust also
+acquires local or remote fixture bodies and finalizes the lock between the two
+discovery passes.
+
+The browser authoring module and registry are compiled into the executable.
+`bperf browsers install` downloads the selected upstream archives over HTTPS,
+validates their paths and expected executable, preserves native permissions,
+and activates each cache directory atomically. Linux `--with-deps` installs the
+package set fixed by the same registry. Browser binaries remain separate
+because they are platform-specific and substantially larger than bperf.
+
+Capture protocol 13, benchmark-host protocol 2, environment schema 6,
+measurement schema 5, and doctor schema 2 identify the child-realm-capable
+ownership model. Each Rust adapter protocol is version 2. Environment and
+measurement records from earlier capture shapes require remeasurement.
 
 ## CLI
 
@@ -640,6 +744,7 @@ The common interface is:
 
 ```text
 bperf doctor [--engine chromium|firefox|webkit|all]
+bperf browsers install [--engine chromium|firefox|webkit|all] [--with-deps]
 bperf run <benchmark.ts> [--budget <duration>] [--message <text>] [--json]
 bperf confirm <cycle-id> <benchmark.ts> [--budget <duration>] [--json]
 bperf history <benchmark-id> [--format text|json|agent-context]
@@ -670,7 +775,7 @@ The advanced path uses:
 - one stdout readiness object;
 - `globalThis.__bperf.run(operation)` in the page;
 - JSONL operations;
-- an independent verifier process.
+- the built-in exact verifier or an independent verifier process.
 
 This protocol proved the workload and three-engine capture design before the
 TypeScript authoring layer existed. It remains useful when a project cannot fit

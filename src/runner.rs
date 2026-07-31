@@ -3,26 +3,26 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
-
-use crate::{
+use bperf_browser::lab::{BrowserLab, Engine};
+use bperf_decision::environment;
+use bperf_measurement::{
     MEASUREMENT_SCHEMA_VERSION,
-    artifact_retention::{self, RetentionSummary},
-    benchmark_runtime::BenchmarkRuntime,
-    browser_lab::{BrowserLab, BrowserLabConfig, Engine},
-    environment,
-    measurement::{self, MeasurementSet, TrialResult},
+    retention::{self as artifact_retention, RetentionSummary},
     sampling::{self, PilotStopReason, RunBudget, SamplingDecision, TRIAL_ELAPSED_METRIC},
     schedule::ScheduledTrial,
+    store::{self as measurement, MeasurementSet, TrialResult},
 };
+use bperf_runtime::installation::BrowserInstallation;
+use serde::Serialize;
+
+use crate::benchmark_runtime::BenchmarkRuntime;
 
 pub struct MeasureOptions {
     pub benchmark: PathBuf,
     pub variant: PathBuf,
     pub sampling: SamplingMode,
     pub artifact_root: PathBuf,
-    pub node: Option<PathBuf>,
-    pub sidecar: Option<PathBuf>,
+    pub runtime: BrowserInstallation,
 }
 
 pub(crate) enum SamplingMode {
@@ -57,16 +57,8 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
         return finish(&measurement);
     }
 
-    let mut lab_config = BrowserLabConfig::discover()?;
-    if let Some(node) = options.node {
-        lab_config = lab_config.with_node(node);
-    }
-    if let Some(sidecar) = options.sidecar {
-        lab_config = lab_config.with_sidecar(sidecar);
-    }
-    let mut browser_lab = BrowserLab::start(lab_config)?;
-    let execution = (|| {
-        let environment_fingerprint = environment::capture(&mut browser_lab, &measurement)?;
+    BrowserLab::run(options.runtime, |browser_lab| {
+        let environment_fingerprint = environment::capture(browser_lab, &measurement)?;
         if let Some(existing) = measurement.environment_fingerprint()
             && existing != environment_fingerprint
         {
@@ -87,7 +79,7 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
                 let started = Instant::now();
                 let result = benchmark.execute_trial(
                     &measurement,
-                    &mut browser_lab,
+                    browser_lab,
                     trial,
                     attempt,
                     &environment_fingerprint,
@@ -128,10 +120,7 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
             }
         }
         Ok(())
-    })();
-    let shutdown = browser_lab.finish();
-    execution?;
-    shutdown?;
+    })?;
 
     let completed = MeasurementSet::open(&measurement_root)?;
     finish(&completed)
@@ -142,8 +131,8 @@ fn lock_sampling_if_ready(measurement: &MeasurementSet) -> Result<bool> {
         return Ok(false);
     }
     let decision = sampling::decide(
-        &measurement.schedule,
-        &measurement.benchmark.analysis_policy(),
+        measurement.schedule(),
+        &measurement.benchmark().analysis_policy(),
         &measurement.calibration_results(),
     )?;
     measurement.record_sampling_decision(&decision)?;

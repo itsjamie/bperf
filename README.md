@@ -36,10 +36,16 @@ Chromium, Firefox, and WebKit are one contract:
 - A missing capture capability fails before measurement. bperf does not
   silently drop an engine or artifact.
 - Correctness is checked independently in every engine.
+- Dedicated-worker and iframe execution is included in the same trial. Native
+  CPU, flamegraph, and heap evidence remains grouped by each engine's capture
+  scopes instead of being flattened or silently omitted.
 - Results stay indexed by benchmark case, engine, and metric. Raw measurements
   are not averaged across browsers.
 - Historical comparisons check a fresh runtime anchor in every engine before
   trusting the old baseline.
+
+`webkit` means Playwright's pinned, patched WebKit build. It does not automate
+the Safari application installed by macOS.
 
 This is not a general page-load tester. It is for deterministic browser
 workloads whose result can prove that the same work still happened.
@@ -49,38 +55,67 @@ TypeScript authoring API may still change.
 
 ## Requirements
 
-- Rust with edition 2024 support
-- Node.js 24.12 or newer
-- The Chromium, Firefox, and WebKit builds pinned by the sidecar's Playwright
-  version
+- Rust with edition 2024 support when installing from source
+- The Chromium, Firefox, and WebKit builds pinned by bperf's Playwright version
+
+Node.js is not required to build, install, test, or run bperf.
+
+## Install
+
+Every `v*` tag publishes native archives for x86-64 Linux and Windows, plus
+Apple Silicon and Intel macOS. Each archive contains one bperf executable with
+the Rust project bundler, fixture acquisition, benchmark host, browser
+authoring module, and pinned browser registry. Extract the archive, put its
+directory on `PATH`, then install the browser builds:
+
+```text
+bperf browsers install --engine all
+bperf doctor --engine all
+```
+
+On Linux, pass `--with-deps` to let bperf install the required
+operating-system packages as well:
+
+```text
+bperf browsers install --engine all --with-deps
+```
+
+Cargo can build and install the same self-contained executable directly from a
+tag:
+
+```text
+cargo install --git https://github.com/itsjamie/bperf --tag v0.1.0 --locked bperf
+bperf browsers install --engine all
+bperf doctor --engine all
+```
 
 From a source checkout:
 
 ```text
-npm --prefix sidecar ci
-npm --prefix sidecar exec -- playwright install chromium firefox webkit
 cargo build --locked
+cargo run -- browsers install --engine all
 cargo run -- doctor --engine all
 ```
 
-On Linux, Playwright may also require operating-system packages. Its
-`install --with-deps` command can install both the browser builds and those
-packages.
-
 `doctor --engine all` is the capability gate. Run it on a new machine or after
-changing Node, Playwright, or the installed browsers.
+changing Playwright or the installed browsers. Every doctor launches its browser
+directly from Rust.
 
 To create and install an optimized build for the current platform:
 
 ```text
-node scripts/package-release.ts --install
+cargo run --locked -p bperf-build -- package --install
 bperf --version
 ```
 
-The packaging script builds the locked Cargo release and installs the
-versioned TypeScript sidecar under Cargo's user `bin` directory. The sidecar
-runs directly in Node; there is no transpiled JavaScript tree. The bundle also
-contains the documentation, examples, license, and `bperf-agent-loop` skill.
+The Rust packaging tool builds a target-triple archive and installs its
+executable under Cargo's user `bin` directory. Rust bundles benchmark projects
+with Rolldown, acquires and pins local or remote fixtures, serves the generated
+bundle and locked fixture bodies, downloads and extracts the pinned browser
+archives, and directly launches and captures Chromium, Firefox, and WebKit.
+The browser authoring module is inlined into the generated bundle; there is no
+transpiled JavaScript tree. The archive also contains the documentation,
+examples, license, and `bperf-agent-loop` skill.
 
 ## Write a benchmark
 
@@ -127,7 +162,8 @@ export default defineBrowserBenchmark({
 
 The benchmark imports project code normally. `fixture()` turns a local file or
 remote source into a pinned, browser-reachable loopback URL. The subject still
-decides whether to use Fetch, XHR, streams, workers, or another browser API.
+decides whether to use Fetch, XHR, streams, dedicated workers, iframes, or
+another browser API.
 
 Put acquisition inside `measure()` when fetching or streaming is part of the
 behavior being measured. Move it to `setup()` when only the processing work
@@ -236,8 +272,8 @@ The design and the reasons behind these boundaries are in
 ## Advanced integration
 
 The original YAML benchmark, variant descriptor, JSONL operation stream, local
-adapter, and verifier process remain available for subjects that cannot use the
-TypeScript authoring path:
+adapter, and built-in or custom verifier remain available for subjects that
+cannot use the TypeScript authoring path:
 
 ```text
 cargo run -- validate examples/browser-benchmark.yaml --variant examples/browser-variant-baseline.yaml

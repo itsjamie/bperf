@@ -1,0 +1,15 @@
+[package]
+name = "bperf-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Installed runtime discovery for bperf"
+license = "MIT"
+repository = "https://github.com/itsjamie/bperf"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+ureq = "3.3"
+zip = { version = "8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

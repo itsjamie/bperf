@@ -13,17 +13,18 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use bperf_browser::lab::{
+    ArtifactEvidence, BrowserLab, BrowserTrialConfig, BrowserTrialRequest, Engine,
+};
+use bperf_measurement::{
+    MEASUREMENT_SCHEMA_VERSION,
+    manifest::{VariantInvocation, VerifierInvocation},
+    schedule::{ScheduledTrial, TrialPhase},
+    store::{MeasurementSet, TrialResult},
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    MEASUREMENT_SCHEMA_VERSION,
-    browser_lab::{ArtifactEvidence, BrowserLab, BrowserTrialConfig, BrowserTrialRequest, Engine},
-    manifest::{VariantInvocation, VerifierInvocation},
-    measurement::{self, MeasurementSet, TrialResult},
-    schedule::ScheduledTrial,
-};
-
-const READINESS_PROTOCOL_VERSION: u32 = 1;
+const READINESS_PROTOCOL_VERSION: u32 = 2;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Frozen workload inputs and invocation rules for repeated isolated trials.
@@ -41,8 +42,8 @@ impl BenchmarkRuntime {
     pub(crate) fn prepare(measurement: &MeasurementSet) -> Result<Self> {
         Ok(Self {
             workloads: load_workloads(measurement)?,
-            browser_config: measurement.benchmark.browser_trial_config(),
-            adapter: VariantAdapter::start(&measurement.variant.invocation())?,
+            browser_config: measurement.benchmark().browser_trial_config(),
+            adapter: VariantAdapter::start(&measurement.variant().invocation())?,
         })
     }
 
@@ -101,13 +102,10 @@ impl BenchmarkRuntime {
 fn load_workloads(
     measurement: &MeasurementSet,
 ) -> Result<BTreeMap<String, Vec<serde_json::Value>>> {
-    let frozen_root = measurement.frozen_workload_root();
-    fs::create_dir_all(&frozen_root)
-        .with_context(|| format!("failed to create {}", frozen_root.display()))?;
     let mut workloads = BTreeMap::new();
-    for id in measurement.benchmark.workload_ids() {
+    for id in measurement.benchmark().workload_ids() {
         let workload = measurement
-            .benchmark
+            .benchmark()
             .workload(id)
             .with_context(|| format!("workload {id:?} disappeared"))?;
         let source = fs::read_to_string(workload.trace_file).with_context(|| {
@@ -133,7 +131,7 @@ fn load_workloads(
             bail!("workload {id:?} contains no operations");
         }
         let frozen = format!("{}\n", serde_json::to_string_pretty(&operations)?);
-        measurement::write_immutable(&frozen_root.join(format!("{id}.json")), frozen.as_bytes())?;
+        measurement.freeze_workload(id, frozen.as_bytes())?;
         workloads.insert(id.to_owned(), operations);
     }
     Ok(workloads)
@@ -147,7 +145,7 @@ struct VerifierPayload<'a> {
     variant_id: &'a str,
     workload_id: &'a str,
     engine: Engine,
-    phase: crate::schedule::TrialPhase,
+    phase: TrialPhase,
     sample_index: u32,
     operations: &'a [serde_json::Value],
     workload_result: &'a [serde_json::Value],
@@ -170,7 +168,7 @@ fn verify(
     workload_result: &[serde_json::Value],
 ) -> Result<VerifierVerdict> {
     let workload = measurement
-        .benchmark
+        .benchmark()
         .workload(&trial.workload_id)
         .with_context(|| format!("unknown workload {}", trial.workload_id))?;
     let payload = VerifierPayload {
@@ -382,6 +380,8 @@ fn make_artifact_paths_measurement_relative(
 struct AdapterReady {
     protocol_version: u32,
     url: String,
+    #[serde(default, rename = "source_files")]
+    _source_files: Vec<std::path::PathBuf>,
 }
 
 struct VariantAdapter {
@@ -502,6 +502,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn benchmark_host_readiness_accepts_the_reported_source_graph() {
+        let ready: AdapterReady = serde_json::from_value(json!({
+            "protocol_version": 2,
+            "url": "http://127.0.0.1:4317/",
+            "source_files": ["/benchmark.ts"]
+        }))
+        .unwrap();
+
+        assert_eq!(ready.protocol_version, READINESS_PROTOCOL_VERSION);
+        assert_eq!(ready.url, "http://127.0.0.1:4317/");
+        assert_eq!(ready._source_files.len(), 1);
+    }
 
     #[test]
     fn exact_verification_accepts_matching_semantic_results() {
