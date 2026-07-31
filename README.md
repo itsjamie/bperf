@@ -58,8 +58,6 @@ TypeScript authoring API may still change.
 - Rust with edition 2024 support when installing from source
 - The Chromium, Firefox, and WebKit builds pinned by bperf's Playwright version
 
-Node.js is not required to build, install, test, or run bperf.
-
 ## Install
 
 Every `v*` tag publishes native archives for x86-64 Linux and Windows, plus
