@@ -69,9 +69,14 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
 
         let benchmark = BenchmarkRuntime::prepare(&measurement)?;
         loop {
-            for trial in measurement.pending_trials() {
+            let pending = measurement.pending_trials();
+            let completed_before = measurement.completed_active_trial_count();
+            let total = measurement.active_trial_count();
+            for (offset, trial) in pending.into_iter().enumerate() {
                 eprintln!(
-                    "[measure] {} attempt {}",
+                    "[measure {}/{}] {} (attempt {})",
+                    completed_before + offset + 1,
+                    total,
                     trial.trial_id,
                     measurement.next_attempt(&trial.trial_id)
                 );
@@ -91,7 +96,6 @@ pub(crate) fn run(options: MeasureOptions) -> Result<MeasurementOutcome> {
                             (started.elapsed().as_secs_f64() * 1_000.0).max(0.001),
                         );
                         measurement.append_result(&result)?;
-                        eprintln!("[measure] {} recorded", trial.trial_id);
                     }
                     Err(error) => {
                         measurement.append_result(&invalid_result(
@@ -236,23 +240,8 @@ impl MeasurementOutcome {
                 "  artifacts: {} representative retained, {} discarded",
                 retention.retained_artifacts, retention.discarded_artifacts
             );
-            println!(
-                "  profiles: {}",
-                self.measurement_root
-                    .join("artifact-retention.json")
-                    .display()
-            );
         }
-        if self.sampling.is_some() {
-            println!(
-                "  sampling: {}",
-                self.measurement_root.join("sampling.json").display()
-            );
-        }
-        println!(
-            "  measurement: {}",
-            self.measurement_root.join("summary.json").display()
-        );
+        println!("  measurement set: {}", self.measurement_set_id);
     }
 
     pub(crate) fn report_engine_results(&self) -> Result<()> {

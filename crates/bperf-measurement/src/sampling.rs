@@ -1,6 +1,6 @@
 //! Budgeted final-sample selection from calibration evidence.
 
-use std::{cmp::Ordering, collections::HashMap, str::FromStr};
+use std::{cmp::Ordering, collections::HashMap, fmt, str::FromStr};
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::Engine;
@@ -37,7 +37,7 @@ pub struct RunBudget {
 }
 
 impl RunBudget {
-    pub(crate) const fn milliseconds(self) -> u64 {
+    pub const fn milliseconds(self) -> u64 {
         self.milliseconds
     }
 }
@@ -72,6 +72,21 @@ impl FromStr for RunBudget {
             .checked_mul(multiplier)
             .ok_or_else(|| "budget is too large".to_owned())?;
         Ok(Self { milliseconds })
+    }
+}
+
+impl fmt::Display for RunBudget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (amount, unit) = if self.milliseconds.is_multiple_of(3_600_000) {
+            (self.milliseconds / 3_600_000, "h")
+        } else if self.milliseconds.is_multiple_of(60_000) {
+            (self.milliseconds / 60_000, "m")
+        } else if self.milliseconds.is_multiple_of(1_000) {
+            (self.milliseconds / 1_000, "s")
+        } else {
+            (self.milliseconds, "ms")
+        };
+        write!(formatter, "{amount}{unit}")
     }
 }
 
@@ -749,6 +764,15 @@ mod tests {
         assert_eq!("2h".parse::<RunBudget>().unwrap().milliseconds(), 7_200_000);
         assert!("5".parse::<RunBudget>().is_err());
         assert!("0s".parse::<RunBudget>().is_err());
+    }
+
+    #[test]
+    fn displays_budgets_in_a_round_trippable_human_unit() {
+        for value in ["250ms", "45s", "5m", "2h"] {
+            let budget = value.parse::<RunBudget>().unwrap();
+            assert_eq!(budget.to_string(), value);
+            assert_eq!(budget.to_string().parse::<RunBudget>().unwrap(), budget);
+        }
     }
 
     #[test]

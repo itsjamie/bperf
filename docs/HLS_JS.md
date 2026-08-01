@@ -155,7 +155,7 @@ browser receives the pinned bytes from bperf's loopback server.
 Run the capability gate once, then the benchmark:
 
 ```text
-bperf doctor --engine all
+bperf doctor
 bperf run benchmarks/mp4-tools.bench.ts --budget 1s
 ```
 
@@ -171,16 +171,15 @@ bperf run: measured
   adaptive calibration: 16 pilot trials; 3/3 strata met the stability rule
   adaptive sampling: 60 final trials
   artifacts: 9 representative retained, 219 discarded
-  profiles: .bperf/measurements/<measurement-id>/artifact-retention.json
-  sampling: .bperf/measurements/<measurement-id>/sampling.json
-  measurement: .bperf/measurements/<measurement-id>/summary.json
+  measurement set: <measurement-id>
   chromium: measured correctness=pass final=20/20 invalid_attempts=0
   firefox: measured correctness=pass final=20/20 invalid_attempts=0
   webkit: measured correctness=pass final=20/20 invalid_attempts=0
   comparison: no promoted baseline
   cycle: cycle-<id>
-  source change: bperf show cycle-<id> --diff
-  measurement index: .bperf/measurements/index/<receipt>.json
+  inspect: bperf show cycle-<id> --diff
+  promote: bperf accept cycle-<id>
+  measurement record: <receipt-id>
 ```
 
 Pilot counts are selected independently and can vary by machine. This run
