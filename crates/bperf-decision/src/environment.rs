@@ -56,6 +56,21 @@ pub(crate) struct EnvironmentRecord {
     anchors: BTreeMap<String, RuntimeAnchorEvidence>,
 }
 
+/// Stable host and browser identity suitable for human-facing evidence views.
+///
+/// Protocol versions, executable paths, and anchor payloads remain hidden in
+/// the environment record; callers receive only the identity needed to
+/// distinguish comparable measurement sets.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EnvironmentSummary {
+    pub recorded_at_unix_ms: u64,
+    pub fingerprint: String,
+    pub platform: String,
+    pub arch: String,
+    pub os_release: String,
+    pub browser_versions: BTreeMap<Engine, String>,
+}
+
 impl EnvironmentRecord {
     pub(crate) fn recorded_at_unix_ms(&self) -> u64 {
         self.recorded_at_unix_ms
@@ -67,6 +82,31 @@ impl EnvironmentRecord {
             .map(|anchor| anchor.wall_ms.as_slice())
             .with_context(|| format!("environment record has no {engine} runtime anchor"))
     }
+}
+
+pub fn summary(measurement: &MeasurementSet) -> Result<EnvironmentSummary> {
+    let record = read(measurement)?;
+    let browser_versions = Engine::ALL
+        .into_iter()
+        .map(|engine| {
+            let version = record
+                .identity
+                .browsers
+                .get(engine.as_str())
+                .with_context(|| format!("environment record has no {engine} browser identity"))?
+                .version
+                .clone();
+            Ok((engine, version))
+        })
+        .collect::<Result<_>>()?;
+    Ok(EnvironmentSummary {
+        recorded_at_unix_ms: record.recorded_at_unix_ms,
+        fingerprint: record.fingerprint,
+        platform: record.identity.host.platform,
+        arch: record.identity.host.arch,
+        os_release: record.identity.host.os_release,
+        browser_versions,
+    })
 }
 
 pub(crate) struct EnvironmentPair {

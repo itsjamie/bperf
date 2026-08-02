@@ -4,6 +4,7 @@ use std::{
     process::Command,
 };
 
+use bperf_storage::database::Database;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -38,6 +39,8 @@ fn plan(benchmark: &Path, variant: &Path, artifact_root: &Path) -> (Value, PathB
 }
 
 fn complete_measurement(root: &Path, value: f64, environment: &str) {
+    let measurement_set_id = root.file_name().unwrap().to_str().unwrap();
+    let database = Database::for_collection(root.parent().unwrap(), "measurements").unwrap();
     let os_release = format!("test-{environment}");
     let identity_source = format!(
         concat!(
@@ -112,23 +115,24 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "checksum": 42
         }
     });
-    fs::write(
-        root.join("environment.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
+    database
+        .publish_document(
+            "measurement",
+            &format!("{measurement_set_id}/environment"),
+            &serde_json::json!({
             "schema_version": 6,
             "recorded_at_unix_ms": 1,
             "fingerprint": environment_fingerprint,
             "identity": identity,
             "anchors": anchors
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+            }),
+        )
+        .unwrap();
 
-    let schedule: Value =
-        serde_json::from_slice(&fs::read(root.join("schedule.json")).unwrap()).unwrap();
-    let measurement_set_id = schedule["measurement_set_id"].as_str().unwrap();
-    let mut lines = Vec::new();
+    let schedule: Value = database
+        .read_document("measurement", &format!("{measurement_set_id}/schedule"))
+        .unwrap()
+        .unwrap();
     for trial in schedule["trials"].as_array().unwrap() {
         let trial_id = trial["trial_id"].as_str().unwrap();
         let artifact_dir = root.join("synthetic-artifacts").join(trial_id);
@@ -160,8 +164,11 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                 "format": "synthetic test evidence"
             }));
         }
-        lines.push(
-            serde_json::to_string(&serde_json::json!({
+        database
+            .append_event(
+                "measurement_trials",
+                measurement_set_id,
+                &serde_json::json!({
                 "schema_version": 5,
                 "measurement_set_id": measurement_set_id,
                 "trial_id": trial["trial_id"],
@@ -183,11 +190,10 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                     "bperf.trial.elapsed_ms": value
                 },
                 "artifacts": artifacts
-            }))
-            .unwrap(),
-        );
+                }),
+            )
+            .unwrap();
     }
-    fs::write(root.join("trials.jsonl"), format!("{}\n", lines.join("\n"))).unwrap();
 }
 
 fn write_lineage_fixture(
@@ -197,11 +203,8 @@ fn write_lineage_fixture(
     comparison: &Value,
 ) -> String {
     let objects = root.join("objects");
-    let states = root.join("states");
-    let changes = root.join("changes");
-    for directory in [&objects, &states, &changes] {
-        fs::create_dir_all(directory).unwrap();
-    }
+    fs::create_dir_all(&objects).unwrap();
+    let database = Database::for_collection(root, "lineages").unwrap();
 
     let before = b"export const value = 1;\n";
     let after = b"export const value = 2;\n";
@@ -218,55 +221,58 @@ fn write_lineage_fixture(
         (&first_state, &before_hash, before.len()),
         (&second_state, &after_hash, after.len()),
     ] {
-        fs::write(
-            states.join(format!("{state_id}.json")),
-            serde_json::to_vec_pretty(&serde_json::json!({
+        database
+            .publish_document(
+                "source_state",
+                state_id,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "state_id": state_id,
+                    "files": [{
+                        "path": "src/implementation.js",
+                        "sha256": digest,
+                        "size_bytes": size
+                    }]
+                }),
+            )
+            .unwrap();
+    }
+    database
+        .publish_document(
+            "source_change",
+            &first_change,
+            &serde_json::json!({
                 "schema_version": 1,
-                "state_id": state_id,
+                "change_id": first_change,
+                "source_before": null,
+                "source_after": first_state,
                 "files": [{
                     "path": "src/implementation.js",
-                    "sha256": digest,
-                    "size_bytes": size
+                    "kind": "added",
+                    "before_sha256": null,
+                    "after_sha256": before_hash
                 }]
-            }))
-            .unwrap(),
+            }),
         )
         .unwrap();
-    }
-    fs::write(
-        changes.join(format!("{first_change}.json")),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 1,
-            "change_id": first_change,
-            "source_before": null,
-            "source_after": first_state,
-            "files": [{
-                "path": "src/implementation.js",
-                "kind": "added",
-                "before_sha256": null,
-                "after_sha256": before_hash
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        changes.join(format!("{second_change}.json")),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 1,
-            "change_id": second_change,
-            "source_before": first_state,
-            "source_after": second_state,
-            "files": [{
-                "path": "src/implementation.js",
-                "kind": "modified",
-                "before_sha256": before_hash,
-                "after_sha256": after_hash
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    database
+        .publish_document(
+            "source_change",
+            &second_change,
+            &serde_json::json!({
+                "schema_version": 1,
+                "change_id": second_change,
+                "source_before": first_state,
+                "source_after": second_state,
+                "files": [{
+                    "path": "src/implementation.js",
+                    "kind": "modified",
+                    "before_sha256": before_hash,
+                    "after_sha256": after_hash
+                }]
+            }),
+        )
+        .unwrap();
 
     let engine_summaries: Vec<_> = comparison["engines"]
         .as_array()
@@ -304,12 +310,6 @@ fn write_lineage_fixture(
         .collect();
     let first_cycle = format!("cycle-{}", "1".repeat(64));
     let second_cycle = format!("cycle-{}", "2".repeat(64));
-    let comparison_path = root
-        .parent()
-        .unwrap()
-        .join("comparisons")
-        .join(comparison["comparison_id"].as_str().unwrap())
-        .join("comparison.json");
     let first = serde_json::json!({
         "event": "cycle",
         "record": {
@@ -353,7 +353,6 @@ fn write_lineage_fixture(
             "outcome": comparison["verdict"],
             "comparison": {
                 "comparison_id": comparison["comparison_id"],
-                "report_path": comparison_path.to_string_lossy(),
                 "baseline_measurement_set": comparison["baseline"]["measurement_set_id"],
                 "candidate_measurement_set": comparison["candidate"]["measurement_set_id"],
                 "environment_fingerprint": comparison["environment_fingerprint"],
@@ -364,15 +363,58 @@ fn write_lineage_fixture(
             }
         }
     });
-    fs::write(
-        root.join("browser-operation-benchmark.jsonl"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&first).unwrap(),
-            serde_json::to_string(&second).unwrap()
+    database
+        .append_event("lineage", "browser-operation-benchmark", &first)
+        .unwrap();
+    database
+        .append_event("lineage", "browser-operation-benchmark", &second)
+        .unwrap();
+
+    let environment = |recorded_at_unix_ms| {
+        serde_json::json!({
+            "recorded_at_unix_ms": recorded_at_unix_ms,
+            "fingerprint": comparison["environment_fingerprint"],
+            "platform": "windows",
+            "arch": "x86_64",
+            "os_release": "test",
+            "browser_versions": {
+                "chromium": "1",
+                "firefox": "1",
+                "webkit": "1"
+            }
+        })
+    };
+    for (cycle_id, variant_id, recorded_at_unix_ms, additions, deletions) in [
+        (&first_cycle, &comparison["baseline"]["variant_id"], 1, 1, 0),
+        (
+            &second_cycle,
+            &comparison["candidate"]["variant_id"],
+            2,
+            1,
+            1,
         ),
-    )
-    .unwrap();
+    ] {
+        database
+            .publish_document(
+                "history_evidence",
+                cycle_id,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "cycle_id": cycle_id,
+                    "variant_id": variant_id,
+                    "case_ids": ["checkout-flow"],
+                    "environment": environment(recorded_at_unix_ms),
+                    "change": {
+                        "files_changed": 1,
+                        "additions": additions,
+                        "deletions": deletions,
+                        "binary_files": 0
+                    },
+                    "artifacts": []
+                }),
+            )
+            .unwrap();
+    }
     second_cycle
 }
 
@@ -414,10 +456,11 @@ fn independent_measurements_can_be_promoted_and_compared() {
         candidate_plan["measurement_set_id"]
     );
     for root in [&baseline_root, &candidate_root] {
-        assert!(root.join("benchmark.resolved.json").is_file());
-        assert!(root.join("variant.resolved.json").is_file());
-        assert!(root.join("schedule.json").is_file());
+        assert!(!root.join("benchmark.resolved.json").exists());
+        assert!(!root.join("variant.resolved.json").exists());
+        assert!(!root.join("schedule.json").exists());
     }
+    assert!(directory.path().join("bperf.sqlite3").is_file());
 
     let registry = directory.path().join("baselines");
     let incomplete_promotion = bperf()
@@ -459,11 +502,12 @@ fn independent_measurements_can_be_promoted_and_compared() {
         .output()
         .unwrap();
     assert!(repeated_promotion.status.success());
+    let database = Database::open(directory.path()).unwrap();
     assert_eq!(
-        fs::read_to_string(registry.join("browser-operation-benchmark.jsonl"))
+        database
+            .read_events::<Value>("baseline", "browser-operation-benchmark")
             .unwrap()
-            .lines()
-            .count(),
+            .len(),
         1
     );
 
@@ -498,10 +542,14 @@ fn independent_measurements_can_be_promoted_and_compared() {
         candidate_plan["measurement_set_id"]
     );
     assert!(
-        comparisons
-            .join(comparison["comparison_id"].as_str().unwrap())
-            .join("comparison.json")
-            .is_file()
+        database
+            .read_document_bytes("comparison", comparison["comparison_id"].as_str().unwrap(),)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        !comparisons.exists(),
+        "default compare must not materialize JSON"
     );
     let compact_comparison = bperf()
         .arg("compare")
@@ -520,7 +568,7 @@ fn independent_measurements_can_be_promoted_and_compared() {
         "firefox: positive correctness=pass anchor=stable",
         "webkit: positive correctness=pass anchor=stable",
         "workload.wall_ms: improved effect=+10.00% (100ms -> 90ms) ci=[+10.00%, +10.00%]",
-        "comparison.json",
+        comparison["comparison_id"].as_str().unwrap(),
     ] {
         assert!(
             compact_comparison.contains(expected),
@@ -531,6 +579,47 @@ fn independent_measurements_can_be_promoted_and_compared() {
     let lineages = directory.path().join("lineages");
     fs::create_dir_all(&lineages).unwrap();
     let cycle_id = write_lineage_fixture(&lineages, &baseline_root, &candidate_root, &comparison);
+    let simple_history = bperf()
+        .arg("history")
+        .arg("--lineage-dir")
+        .arg(&lineages)
+        .output()
+        .unwrap();
+    assert!(
+        simple_history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&simple_history.stderr)
+    );
+    let simple_history = String::from_utf8(simple_history.stdout).unwrap();
+    for expected in [
+        "bperf history: browser-operation-benchmark (2 runs)",
+        "case: checkout-flow",
+        "cycle",
+        "message",
+        "cycle-11111111111111",
+        "establish baseline",
+        "cycle-22222222222222",
+        "reuse parsed boxes",
+    ] {
+        assert!(
+            simple_history.contains(expected),
+            "simple history omitted {expected:?}:\n{simple_history}"
+        );
+    }
+    for internal_detail in [
+        "measurement set:",
+        "source:",
+        "chromium",
+        "100ms",
+        "positive",
+        &cycle_id,
+    ] {
+        assert!(
+            !simple_history.contains(internal_detail),
+            "simple history exposed {internal_detail:?}:\n{simple_history}"
+        );
+    }
+
     let history = bperf()
         .args([
             "history",
@@ -598,26 +687,108 @@ fn independent_measurements_can_be_promoted_and_compared() {
         );
     }
     assert_eq!(
-        fs::read_to_string(lineages.join("browser-operation-benchmark.jsonl"))
+        database
+            .read_events::<Value>("lineage", "browser-operation-benchmark")
             .unwrap()
-            .lines()
-            .count(),
+            .len(),
         3,
         "repeated acceptance must not duplicate a promotion event"
     );
+    assert!(!lineages.join("browser-operation-benchmark.jsonl").exists());
     assert_eq!(
-        fs::read_to_string(registry.join("browser-operation-benchmark.jsonl"))
+        database
+            .read_events::<Value>("baseline", "browser-operation-benchmark")
             .unwrap()
-            .lines()
-            .count(),
+            .len(),
         2,
         "repeated acceptance must not duplicate a baseline reference"
     );
+    let accepted_history = bperf()
+        .arg("history")
+        .arg("--lineage-dir")
+        .arg(&lineages)
+        .output()
+        .unwrap();
+    assert!(accepted_history.status.success());
+    let accepted_history = String::from_utf8(accepted_history.stdout).unwrap();
+    assert!(accepted_history.contains("reuse parsed boxes [baseline]"));
+    assert!(
+        !accepted_history.contains("promotion "),
+        "plain history should mark the current baseline without listing storage events:\n{accepted_history}"
+    );
+    let interactive_snapshot = bperf_decision::lineage::history_view(&lineages, None).unwrap();
+    assert_eq!(
+        interactive_snapshot.benchmark_id,
+        "browser-operation-benchmark"
+    );
+    assert_eq!(interactive_snapshot.cycles.len(), 2);
+    assert_eq!(
+        interactive_snapshot.current_baseline_label.as_deref(),
+        Some("b-02")
+    );
+    let accepted_cycle = interactive_snapshot
+        .cycles
+        .iter()
+        .find(|cycle| cycle.accepted)
+        .unwrap();
+    assert!(accepted_cycle.current_baseline);
+    assert_eq!(accepted_cycle.accepted_label.as_deref(), Some("b-02"));
+    let candidate_cycle = interactive_snapshot
+        .cycles
+        .iter()
+        .find(|cycle| cycle.outcome == "positive")
+        .unwrap();
+    assert_eq!(candidate_cycle.change.files_changed, 1);
+    assert_eq!(candidate_cycle.change.additions, 1);
+    assert_eq!(candidate_cycle.change.deletions, 1);
+    assert_eq!(candidate_cycle.baseline_label.as_deref(), Some("b-01"));
+    assert!(candidate_cycle.artifacts.iter().all(|artifact| !matches!(
+        artifact.kind,
+        bperf_decision::lineage::HistoryArtifactKind::Comparison
+            | bperf_decision::lineage::HistoryArtifactKind::Sampling
+    )));
 
-    complete_measurement(&candidate_root, 90.0, "different-environment");
+    let overview = bperf_decision::lineage::history_overview(&lineages, None).unwrap();
+    assert_eq!(overview.cycles.len(), interactive_snapshot.cycles.len());
+    let candidate_summary = overview
+        .cycles
+        .iter()
+        .find(|cycle| cycle.outcome == "positive")
+        .unwrap();
+    let selected_cycle = bperf_decision::lineage::history_cycle(
+        &lineages,
+        &overview.benchmark_id,
+        &candidate_summary.cycle_id,
+    )
+    .unwrap();
+    assert_eq!(selected_cycle.cycle_id, candidate_cycle.cycle_id);
+    assert_eq!(selected_cycle.change.files_changed, 1);
+    assert_eq!(
+        selected_cycle.artifacts.len(),
+        candidate_cycle.artifacts.len()
+    );
+
+    let redirected_bare_history = bperf()
+        .arg("--data-dir")
+        .arg(directory.path())
+        .arg("history")
+        .output()
+        .unwrap();
+    assert!(redirected_bare_history.status.success());
+    assert!(
+        String::from_utf8(redirected_bare_history.stdout)
+            .unwrap()
+            .contains("bperf history: browser-operation-benchmark"),
+        "bare history must retain text output when stdout is not a terminal"
+    );
+
+    let different_measurements = directory.path().join("different").join("measurements");
+    let (_, different_candidate_root) =
+        plan(&benchmark, &candidate_variant, &different_measurements);
+    complete_measurement(&different_candidate_root, 90.0, "different-environment");
     let incompatible = bperf()
         .arg("compare")
-        .arg(&candidate_root)
+        .arg(&different_candidate_root)
         .arg("--baseline")
         .arg(&baseline_root)
         .arg("--artifact-dir")

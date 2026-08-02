@@ -59,8 +59,13 @@ impl BenchmarkManifest {
             .with_context(|| format!("failed to resolve {}", path.display()))?;
         let source = fs::read(&resolved_path)
             .with_context(|| format!("failed to read {}", resolved_path.display()))?;
-        let mut value: serde_json::Value = serde_json::from_slice(&source)
-            .with_context(|| format!("invalid resolved benchmark {}", resolved_path.display()))?;
+        Self::load_resolved_bytes(&source)
+            .with_context(|| format!("invalid resolved benchmark {}", resolved_path.display()))
+    }
+
+    pub(crate) fn load_resolved_bytes(source: &[u8]) -> Result<Self> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(source).context("invalid resolved benchmark JSON")?;
         let source_metadata = value
             .as_object_mut()
             .and_then(|object| object.remove("_source"))
@@ -411,8 +416,13 @@ impl VariantDescriptor {
             .with_context(|| format!("failed to resolve {}", path.display()))?;
         let source = fs::read(&resolved_path)
             .with_context(|| format!("failed to read {}", resolved_path.display()))?;
-        let mut value: serde_json::Value = serde_json::from_slice(&source)
-            .with_context(|| format!("invalid resolved variant {}", resolved_path.display()))?;
+        Self::load_resolved_bytes(&source)
+            .with_context(|| format!("invalid resolved variant {}", resolved_path.display()))
+    }
+
+    pub(crate) fn load_resolved_bytes(source: &[u8]) -> Result<Self> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(source).context("invalid resolved variant JSON")?;
         let source_metadata = value
             .as_object_mut()
             .and_then(|object| object.remove("_source"))

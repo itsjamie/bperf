@@ -287,7 +287,7 @@ flowchart TD
     RUN["bperf run"] --> DISCOVER["Discover cases, source graph, and fixtures"]
     DISCOVER --> PREFLIGHT["Prove engine capabilities and runtime identity"]
     PREFLIGHT --> PILOT["Run independent pilot prefixes"]
-    PILOT --> LOCK["Write sampling.json and lock active prefixes"]
+    PILOT --> LOCK["Persist sampling decision and lock active prefixes"]
     LOCK --> FINAL["Run complete final trials"]
     FINAL --> RETAIN["Select representative native artifacts"]
     RETAIN --> SET["Finalize immutable measurement set"]
@@ -297,11 +297,11 @@ flowchart TD
     COMPARE --> CYCLE
 ```
 
-The schedule is deterministic and resumable. `schedule.json` contains the
+The schedule is deterministic and resumable. Its database record contains the
 maximum envelope of trials the policy may select. Pilot evidence determines a
-prefix for each case and engine. Before final evidence begins,
-`sampling.json` locks those pilot prefixes, the batch sizes, and the selected
-final prefixes.
+prefix for each case and engine. Before final evidence begins, the sampling
+record locks those pilot prefixes, the batch sizes, and the selected final
+prefixes.
 
 An interrupted run before that boundary recomputes the next deterministic
 pilot from append-only evidence. A resumed run after that boundary validates
@@ -561,8 +561,8 @@ with one baseline, promotion requires an independent measurement of the
 unchanged candidate:
 
 ```text
-bperf confirm <cycle-id> <benchmark.ts>
-bperf accept <cycle-id>
+bperf confirm <benchmark.ts> [<cycle-selector>]
+bperf accept [<cycle-selector>]
 ```
 
 Confirmation uses a distinct resumable identity and is recorded as a lineage
@@ -587,7 +587,7 @@ independently for each case and engine:
   heap;
 - ties use the stable trial identifier.
 
-`artifact-retention.json` records each selection and the aggregate retained and
+The retention record stores each selection and the aggregate retained and
 discarded counts before cleanup begins. Every trial record keeps the original
 path, size, format, and SHA-256 descriptor even when an unselected payload is
 removed.
@@ -598,7 +598,8 @@ retention keeps that artifact kind for all of its capture scopes.
 
 Failed and interrupted measurements keep preflight captures and frozen workload
 inputs needed for resumption. Completed measurements remove those scratch
-directories only after the summary and retention manifest are durable.
+directories only after the measurement summary and retention record are
+durable.
 
 [ADR 0002](adr/0002-artifact-retention.md) records why cleanup waits until the
 completed distribution can choose a representative.
@@ -633,12 +634,23 @@ Returning to an older source state after another cycle produces a new reversion
 cycle.
 
 ```text
-bperf history <benchmark-id>
-bperf history <benchmark-id> --format agent-context
-bperf show <cycle-id> --diff
-bperf confirm <cycle-id> <benchmark.ts>
-bperf accept <cycle-id>
+bperf history [<benchmark-id>]
+bperf history [<benchmark-id>] --format agent-context
+bperf show [<cycle-selector>] --diff
+bperf confirm <benchmark.ts> [<cycle-selector>]
+bperf accept [<cycle-selector>]
 ```
+
+With no history arguments and an attached input/output terminal, `history`
+loads a compact database overview of the latest benchmark, then reads the
+selected cycle's persisted evidence projection. Details are cached as the
+selection moves. Navigation does not reopen measurements, hash retained
+profiles, or reconstruct source changes.
+The application owns terminal layout, keyboard state, filters, and artifact
+launching; the lineage module supplies terminal-neutral benchmark, cycle,
+baseline, environment, comparison, change, promotion, and retained-artifact
+summaries. An explicit benchmark or `--format`, and every redirected invocation,
+keeps the existing non-interactive output contract.
 
 `accept` promotes the cycle's candidate and appends a promotion event. Accepting
 an older cycle later records another promotion and restores that measured state
@@ -693,7 +705,7 @@ hides knowledge that would otherwise spread through the application:
 |---|---|
 | `bperf` application | `doctor`, `run`, and `confirm` orchestration. It composes the library Interfaces but is not a dependency of them. |
 | `bperf-runtime::installation` | Pinned browser selection and installation. Playwright version, revisions, platform archives, executable paths, cache conventions, atomic extraction, and Linux packages stay private. |
-| `bperf-storage` | Atomic immutable publication, atomic replacement, and recoverable newline-committed journals. Domain schemas, identities, and path layouts stay with callers. |
+| `bperf-storage` | Canonical SQLite connections, schema versioning, immutable documents, ordered events, cross-domain transactions, and atomic publication for external payloads. Domain schemas and identities stay with callers. |
 | `bperf-browser::lab` | Engine-neutral configurations and evidence, retained lane lifecycle, complete capture validation, and managed benchmark inspection. |
 | `bperf-browser::artifacts` | Complete per-scope artifact-set and file validation. Construction helpers and Speedscope representation stay crate-private. |
 | Private browser Modules | Chromium CDP, Firefox Juggler/RDP, WebKit inspector protocol, native formats, workload injection, and process containment. |
@@ -745,12 +757,19 @@ The common interface is:
 ```text
 bperf doctor [--engine chromium|firefox|webkit|all]
 bperf browsers install [--engine chromium|firefox|webkit|all] [--with-deps]
-bperf run <benchmark.ts> [--budget <duration>] [--message <text>] [--json]
-bperf confirm <cycle-id> <benchmark.ts> [--budget <duration>] [--json]
-bperf history <benchmark-id> [--format text|json|agent-context]
-bperf show <cycle-id> [--diff] [--json]
-bperf accept <cycle-id>
+bperf run [<benchmark.ts|directory>] [--budget <duration>] [--message <text>] [--json]
+bperf confirm <benchmark.ts> [<cycle-selector>] [--budget <duration>] [--json]
+bperf history [<benchmark-id>] [--format text|json|agent-context]
+bperf show [<cycle-selector>] [--diff] [--json]
+bperf accept [<cycle-selector>]
 ```
+
+Cycle selectors default to the latest local cycle and accept a unique ID
+prefix. Generated state is rooted at `.bperf` by default; one global
+`--data-dir <directory>` option relocates it without exposing the internal
+storage layout. With a terminal, omitting the `run` target opens the recursive
+`benchmarks` picker; a directory opens the same picker at that subtree. An
+exact benchmark module always uses the direct command path.
 
 The advanced evidence interface remains:
 
@@ -789,6 +808,7 @@ measurement, comparison, or lineage.
 
 ```text
 .bperf/
+|-- bperf.sqlite3
 |-- objects/
 |   `-- <fixture-sha256>
 |-- managed/
@@ -798,40 +818,24 @@ measurement, comparison, or lineage.
 |       |-- variant.json
 |       `-- workloads/
 |-- measurements/
-|   |-- index/
-|   |   `-- <unix-ms>-exit-<code>-<cycle-or-confirmation-id>.json
 |   `-- <measurement-set-id>/
-|       |-- benchmark.resolved.json
-|       |-- variant.resolved.json
-|       |-- schedule.json
-|       |-- sampling.json
-|       |-- environment.json
-|       |-- trials.jsonl
-|       |-- artifact-retention.json
-|       |-- summary.json
+|       |-- workloads/
 |       `-- artifacts/
-|-- comparisons/
-|   `-- <comparison-id>/comparison.json
-|-- baselines/
-|   `-- <benchmark-id>.jsonl
 `-- lineages/
-    |-- objects/
-    |   `-- <source-sha256>
-    |-- states/
-    |   `-- state-<sha256>.json
-    |-- changes/
-    |   `-- change-<sha256>.json
-    `-- <benchmark-id>.jsonl
+    `-- objects/
+        `-- <source-sha256>
 ```
 
-Files under `managed/` are a private compatibility layer, not an authoring
-interface. Fixture and source objects use different stores because their
-identities and retention policies are different.
+`bperf.sqlite3` is canonical for resolved definitions, schedules, sampling,
+environments, trials and metrics, retention, comparisons, baseline and lineage
+events, source metadata, history projections, and chronological run receipts.
+Files under `managed/` are generated browser-adapter inputs, not an authoring
+interface or a second history store. Fixture and source payloads use different
+directories because their identities and retention policies are different.
 
-The chronological measurement index records completed runs and confirmations
-without changing measurement identity. Its filename includes creation time,
-exit code, and lineage ID so lexical order is also command order. The small
-receipt links to the immutable summary and optional comparison report.
+Structured state has no file-format fallback or dual write. A database with an
+unsupported schema fails explicitly. JSON remains available from command
+`--json` output.
 
 ## Open questions
 

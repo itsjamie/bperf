@@ -10,19 +10,25 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bperf_browser::lab::Engine;
+use bperf_browser::lab::{ArtifactKind, Engine};
 use bperf_measurement::{manifest::VariantDescriptor, store::MeasurementSet};
+use bperf_storage::database::{Database, DatabaseReader, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     baseline::{self, BaselineRecord},
     comparison::ComparisonSummary,
+    environment::{self, EnvironmentSummary},
 };
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: usize = 4096;
 const PROMOTION_CONFIRMATION_SEARCHES: usize = 5;
+const LINEAGE_EVENTS: &str = "lineage";
+const SOURCE_STATES: &str = "source_state";
+const SOURCE_CHANGES: &str = "source_change";
+const HISTORY_EVIDENCE: &str = "history_evidence";
 
 pub struct RecordRunOptions {
     pub root: PathBuf,
@@ -47,17 +53,30 @@ pub fn record_run(options: RecordRunOptions) -> Result<CycleRecord> {
         &options.source_files,
         &measurement,
     )?;
-    store.append_cycle(NewCycle {
-        benchmark_id: measurement.benchmark_id().to_owned(),
-        subject_id: measurement.subject_id().to_owned(),
-        benchmark_sha256: measurement.benchmark_sha256().to_owned(),
-        candidate_measurement_set: measurement.measurement_set_id().to_owned(),
-        candidate_measurement_path: measurement.root().to_string_lossy().into_owned(),
-        environment_fingerprint: environment_fingerprint.to_owned(),
-        source_after: state,
-        message: normalize_message(options.message)?,
-        comparison: options.comparison,
-    })
+    let evidence = NewCycleEvidence {
+        variant_id: measurement.variant_id().to_owned(),
+        case_ids: measurement
+            .benchmark()
+            .workload_ids()
+            .map(str::to_owned)
+            .collect(),
+        environment: environment::summary(&measurement)?,
+        artifacts: retained_history_artifacts(&measurement),
+    };
+    store.append_cycle_with_evidence(
+        NewCycle {
+            benchmark_id: measurement.benchmark_id().to_owned(),
+            subject_id: measurement.subject_id().to_owned(),
+            benchmark_sha256: measurement.benchmark_sha256().to_owned(),
+            candidate_measurement_set: measurement.measurement_set_id().to_owned(),
+            candidate_measurement_path: measurement.root().to_string_lossy().into_owned(),
+            environment_fingerprint: environment_fingerprint.to_owned(),
+            source_after: state,
+            message: normalize_message(options.message)?,
+            comparison: options.comparison,
+        },
+        Some(evidence),
+    )
 }
 
 pub struct ConfirmationTarget {
@@ -86,7 +105,6 @@ impl ConfirmationTarget {
 }
 
 pub fn confirmation_target(root: &Path, cycle_id: &str) -> Result<ConfirmationTarget> {
-    require_cycle_id(cycle_id)?;
     let store = LineageStore::load(root)?;
     let (cycle, _, _) = store.find_cycle(cycle_id)?;
     let baseline_measurement_set = cycle
@@ -205,32 +223,251 @@ pub enum HistoryFormat {
 }
 
 pub struct HistoryOptions {
-    pub benchmark_id: String,
+    pub benchmark_id: Option<String>,
     pub root: PathBuf,
     pub format: HistoryFormat,
 }
 
+/// Lightweight benchmark choices for an interactive history client.
+#[derive(Clone, Debug)]
+pub struct HistoryIndex {
+    pub benchmarks: Vec<HistoryIndexEntry>,
+    pub latest_benchmark_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryIndexEntry {
+    pub benchmark_id: String,
+    pub cycle_count: usize,
+    pub accepted_count: usize,
+    pub latest_recorded_at_unix_ms: u64,
+    pub latest_outcome: String,
+    pub latest_message: Option<String>,
+    pub current_baseline_label: Option<String>,
+    pub latest_comparison: Option<ComparisonSummary>,
+    pub wall_history_ms: BTreeMap<Engine, Vec<f64>>,
+}
+
+/// Compact lineage state suitable for the first interactive render.
+///
+/// Measurement sets and content-addressed payloads are not opened. Use
+/// [`history_cycle`] to read the persisted evidence for one selected cycle.
+#[derive(Clone, Debug)]
+pub struct HistoryOverview {
+    pub benchmark_id: String,
+    pub subject_id: String,
+    pub cycles: Vec<HistoryCycleSummary>,
+    pub baselines: Vec<HistoryBaseline>,
+    pub current_baseline_label: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryCycleSummary {
+    pub cycle_id: String,
+    pub selector: String,
+    pub recorded_at_unix_ms: u64,
+    pub message: String,
+    pub outcome: String,
+    pub baseline_label: Option<String>,
+    pub baseline_cycle_id: Option<String>,
+    pub accepted_label: Option<String>,
+    pub accepted: bool,
+    pub current_baseline: bool,
+    pub candidate_measurement_set: String,
+    pub comparison: Option<ComparisonSummary>,
+    pub promotion: HistoryPromotionSummary,
+}
+
+/// Complete human-facing evidence for one benchmark's optimization lineage.
+///
+/// Storage events, native browser protocols, and measurement schemas stay
+/// behind this snapshot. Artifact descriptors refer only to retained evidence;
+/// payload bytes are read only when an artifact is explicitly opened.
+#[derive(Clone, Debug)]
+pub struct HistoryView {
+    pub benchmark_id: String,
+    pub subject_id: String,
+    pub cycles: Vec<HistoryCycle>,
+    pub baselines: Vec<HistoryBaseline>,
+    pub current_baseline_label: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryBaseline {
+    pub label: String,
+    pub cycle_id: String,
+    pub measurement_set_id: String,
+    pub promoted_at_unix_ms: u64,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryCycle {
+    pub cycle_id: String,
+    pub selector: String,
+    pub recorded_at_unix_ms: u64,
+    pub message: String,
+    pub outcome: String,
+    pub baseline_label: Option<String>,
+    pub baseline_cycle_id: Option<String>,
+    pub accepted_label: Option<String>,
+    pub accepted: bool,
+    pub current_baseline: bool,
+    pub candidate_measurement_set: String,
+    pub variant_id: String,
+    pub case_ids: Vec<String>,
+    pub environment: EnvironmentSummary,
+    pub comparison: Option<ComparisonSummary>,
+    pub change: HistoryChangeSummary,
+    pub promotion: HistoryPromotionSummary,
+    pub artifacts: Vec<HistoryArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HistoryChangeSummary {
+    pub files_changed: usize,
+    pub additions: usize,
+    pub deletions: usize,
+    pub binary_files: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryPromotionSummary {
+    pub ready: bool,
+    pub confirmation_required: bool,
+    pub searched_candidates: usize,
+    pub search_threshold: usize,
+    pub confirmations: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryArtifactKind {
+    CpuProfile,
+    Flamegraph,
+    HeapSnapshot,
+    Comparison,
+    Sampling,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HistoryArtifact {
+    pub kind: HistoryArtifactKind,
+    pub engine: Option<Engine>,
+    pub capture_scope: Option<String>,
+    pub path: PathBuf,
+}
+
+/// Reusable history query session for interactive clients.
+///
+/// Each query uses a short database read and never opens native evidence
+/// payloads.
+pub struct HistoryReader {
+    store: LineageStore,
+    reader: DatabaseReader,
+}
+
+impl HistoryReader {
+    pub fn open(root: &Path) -> Result<Self> {
+        let store = LineageStore::load(root)?;
+        let reader = store.database.reader()?;
+        Ok(Self { store, reader })
+    }
+
+    pub fn index(&self) -> Result<HistoryIndex> {
+        self.store.history_index(&self.reader)
+    }
+
+    pub fn overview(&self, benchmark_id: Option<&str>) -> Result<HistoryOverview> {
+        let benchmark_id = self.benchmark_id(benchmark_id)?;
+        let events = self.store.read_events_with(&self.reader, &benchmark_id)?;
+        self.store.build_history_overview(&benchmark_id, &events)
+    }
+
+    pub fn cycle(&self, summary: &HistoryCycleSummary) -> Result<HistoryCycle> {
+        require_cycle_id(&summary.cycle_id)?;
+        self.store.load_history_cycle(&self.reader, summary.clone())
+    }
+
+    pub fn view(&self, benchmark_id: Option<&str>) -> Result<HistoryView> {
+        let benchmark_id = self.benchmark_id(benchmark_id)?;
+        let events = self.store.read_events_with(&self.reader, &benchmark_id)?;
+        self.store
+            .build_history_view(&self.reader, &benchmark_id, &events)
+    }
+
+    fn benchmark_id(&self, benchmark_id: Option<&str>) -> Result<String> {
+        match benchmark_id {
+            Some(benchmark_id) if benchmark_id != "latest" => {
+                require_identifier("benchmark", benchmark_id)?;
+                Ok(benchmark_id.to_owned())
+            }
+            Some(_) | None => Ok(self.index()?.latest_benchmark_id),
+        }
+    }
+}
+
+pub fn history_index(root: &Path) -> Result<HistoryIndex> {
+    HistoryReader::open(root)?.index()
+}
+
+/// Returns the compact history index without treating an unused store as an
+/// error. Invalid persisted history is still reported to the caller.
+pub fn history_index_if_present(root: &Path) -> Result<Option<HistoryIndex>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let reader = HistoryReader::open(root)?;
+    reader.store.history_index_if_present(&reader.reader)
+}
+
+pub fn history_overview(root: &Path, benchmark_id: Option<&str>) -> Result<HistoryOverview> {
+    HistoryReader::open(root)?.overview(benchmark_id)
+}
+
+/// Loads one cycle's compact persisted evidence without opening native payloads.
+/// The cycle ID must be the full immutable ID, not a human selector prefix.
+pub fn history_cycle(root: &Path, benchmark_id: &str, cycle_id: &str) -> Result<HistoryCycle> {
+    require_identifier("benchmark", benchmark_id)?;
+    require_cycle_id(cycle_id)?;
+    let reader = HistoryReader::open(root)?;
+    let overview = reader.overview(Some(benchmark_id))?;
+    let summary = overview
+        .cycles
+        .into_iter()
+        .find(|cycle| cycle.cycle_id == cycle_id)
+        .with_context(|| format!("benchmark {benchmark_id:?} has no cycle {cycle_id}"))?;
+    reader.cycle(&summary)
+}
+
+pub fn history_view(root: &Path, benchmark_id: Option<&str>) -> Result<HistoryView> {
+    HistoryReader::open(root)?.view(benchmark_id)
+}
+
 pub fn history(options: HistoryOptions) -> Result<()> {
-    require_identifier("benchmark", &options.benchmark_id)?;
     let store = LineageStore::load(&options.root)?;
-    let events = store.read_events(&options.benchmark_id)?;
+    let benchmark_id = match options.benchmark_id {
+        Some(benchmark_id) if benchmark_id != "latest" => {
+            require_identifier("benchmark", &benchmark_id)?;
+            benchmark_id
+        }
+        Some(_) | None => store.latest_benchmark_id()?,
+    };
+    let events = store.read_events(&benchmark_id)?;
     match options.format {
         HistoryFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&HistoryReport {
                     schema_version: SCHEMA_VERSION,
-                    benchmark_id: &options.benchmark_id,
+                    benchmark_id: &benchmark_id,
                     events: &events,
                 })?
             );
         }
-        HistoryFormat::Text => print!("{}", store.render_history(&options.benchmark_id, &events)?),
+        HistoryFormat::Text => print!("{}", store.render_history(&benchmark_id, &events)?),
         HistoryFormat::AgentContext => {
-            print!(
-                "{}",
-                store.render_agent_context(&options.benchmark_id, &events)?
-            );
+            print!("{}", store.render_agent_context(&benchmark_id, &events)?);
         }
     }
     Ok(())
@@ -244,7 +481,6 @@ pub struct ShowOptions {
 }
 
 pub fn show(options: ShowOptions) -> Result<()> {
-    require_cycle_id(&options.cycle_id)?;
     let store = LineageStore::load(&options.root)?;
     let (cycle, promotions, confirmations) = store.find_cycle(&options.cycle_id)?;
     let events = store.read_events(&cycle.benchmark_id)?;
@@ -295,6 +531,18 @@ pub fn show(options: ShowOptions) -> Result<()> {
                 confirmation.outcome
             )?;
         }
+        if promotions.is_empty()
+            && matches!(cycle.outcome(), "measured" | "positive" | "equivalent")
+        {
+            if promotion_readiness.ready {
+                println!("  next: bperf accept {}", cycle.selector());
+            } else {
+                println!(
+                    "  next: bperf confirm <benchmark.bench.ts> {}",
+                    cycle.selector()
+                );
+            }
+        }
         if let Some(diff) = diff {
             print!("{diff}");
         }
@@ -309,16 +557,25 @@ pub struct AcceptOptions {
 }
 
 pub fn accept(options: AcceptOptions) -> Result<AcceptOutcome> {
-    require_cycle_id(&options.cycle_id)?;
     let store = LineageStore::load(&options.root)?;
     let (cycle, _, _) = store.find_cycle(&options.cycle_id)?;
     let events = store.read_events(&cycle.benchmark_id)?;
     require_promotion_confirmation(&cycle, &events)?;
-    let baseline = baseline::promote_measurement(
-        Path::new(&cycle.candidate_measurement_path),
-        &options.registry_root,
-    )?;
-    let promotion = store.append_promotion(&cycle, &baseline)?;
+    let pending = baseline::prepare_measurement(Path::new(&cycle.candidate_measurement_path))?;
+    if pending.benchmark_id() != cycle.benchmark_id {
+        bail!("accepted measurement does not match the cycle benchmark");
+    }
+    let database = baseline::promotion_database(&options.registry_root)?;
+    if !database.same_store(&store.database) {
+        bail!(
+            "baseline and lineage state must share one bperf data directory; use --data-dir instead of separate storage overrides"
+        );
+    }
+    let (baseline, promotion) = database.write(|transaction| {
+        let baseline = baseline::promote_prepared(transaction, &pending)?;
+        let promotion = store.append_promotion(transaction, &cycle, &baseline)?;
+        Ok((baseline, promotion))
+    })?;
     Ok(AcceptOutcome {
         cycle,
         promotion,
@@ -346,7 +603,7 @@ impl AcceptOutcome {
                 })?
             );
         } else {
-            println!("bperf accept: {}", self.cycle.cycle_id);
+            println!("bperf accept: {}", self.cycle.selector());
             println!(
                 "  baseline measurement set: {}",
                 self.baseline.measurement_set_id()
@@ -381,6 +638,10 @@ pub struct CycleRecord {
 impl CycleRecord {
     pub fn cycle_id(&self) -> &str {
         &self.cycle_id
+    }
+
+    pub fn selector(&self) -> &str {
+        short_id(&self.cycle_id)
     }
 
     pub fn recorded_at_unix_ms(&self) -> u64 {
@@ -432,6 +693,10 @@ impl ConfirmationRecord {
 
     pub fn outcome(&self) -> &str {
         &self.outcome
+    }
+
+    pub fn cycle_selector(&self) -> &str {
+        short_id(&self.cycle_id)
     }
 }
 
@@ -498,25 +763,50 @@ struct NewCycle {
     comparison: Option<ComparisonSummary>,
 }
 
+struct NewCycleEvidence {
+    variant_id: String,
+    case_ids: Vec<String>,
+    environment: EnvironmentSummary,
+    artifacts: Vec<HistoryArtifact>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCycleEvidence {
+    schema_version: u32,
+    cycle_id: String,
+    variant_id: String,
+    case_ids: Vec<String>,
+    environment: EnvironmentSummary,
+    change: HistoryChangeSummary,
+    artifacts: Vec<HistoryArtifact>,
+}
+
 struct LineageStore {
     root: PathBuf,
+    database: Database,
 }
 
 impl LineageStore {
     fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)
             .with_context(|| format!("failed to create lineage store {}", root.display()))?;
-        for name in ["objects", "states", "changes"] {
-            fs::create_dir_all(root.join(name))
-                .with_context(|| format!("failed to create lineage {name} directory"))?;
-        }
+        fs::create_dir_all(root.join("objects"))
+            .context("failed to create lineage object directory")?;
         Self::load(root)
     }
 
     fn load(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!(
+                "no bperf optimization history in {}; run `bperf run <benchmark.bench.ts>` first",
+                root.display()
+            );
+        }
         let root = fs::canonicalize(root)
             .with_context(|| format!("failed to resolve lineage store {}", root.display()))?;
-        Ok(Self { root })
+        let database = Database::for_collection(&root, "lineages")?;
+        Ok(Self { root, database })
     }
 
     fn capture_state(
@@ -535,7 +825,8 @@ impl LineageStore {
         if state.state_id != confirmation.state_id {
             bail!("source files changed while their optimization checkpoint was captured");
         }
-        self.write_json(&self.state_path(&state.state_id), &state, "source state")?;
+        self.database
+            .publish_document(SOURCE_STATES, &state.state_id, &state)?;
         Ok(state)
     }
 
@@ -586,7 +877,16 @@ impl LineageStore {
         })
     }
 
+    #[cfg(test)]
     fn append_cycle(&self, cycle: NewCycle) -> Result<CycleRecord> {
+        self.append_cycle_with_evidence(cycle, None)
+    }
+
+    fn append_cycle_with_evidence(
+        &self,
+        cycle: NewCycle,
+        evidence: Option<NewCycleEvidence>,
+    ) -> Result<CycleRecord> {
         require_identifier("benchmark", &cycle.benchmark_id)?;
         let events = self.read_events_if_present(&cycle.benchmark_id)?;
         let previous = events.iter().rev().find_map(|event| match event {
@@ -606,6 +906,9 @@ impl LineageStore {
                 .map(|item| item.comparison_id.as_str())
                 == comparison_id
         {
+            if let Some(evidence) = evidence {
+                self.publish_cycle_evidence(previous, evidence)?;
+            }
             return Ok(previous.clone());
         }
 
@@ -647,15 +950,55 @@ impl LineageStore {
             outcome,
             comparison: cycle.comparison,
         };
-        self.append_event(
-            &record.benchmark_id,
-            &LineageEvent::Cycle(Box::new(record.clone())),
-        )?;
+        let event = LineageEvent::Cycle(Box::new(record.clone()));
+        if let Some(evidence) = evidence {
+            let stored = self.build_cycle_evidence(&record, evidence)?;
+            let event_payload = serde_json::to_vec(&event)?;
+            let evidence_payload = serde_json::to_vec(&stored)?;
+            self.database.write(|transaction| {
+                transaction.publish_document(
+                    HISTORY_EVIDENCE,
+                    &record.cycle_id,
+                    &evidence_payload,
+                )?;
+                transaction.append_event(LINEAGE_EVENTS, &record.benchmark_id, &event_payload)?;
+                Ok(())
+            })?;
+        } else {
+            self.append_event(&record.benchmark_id, &event)?;
+        }
         Ok(record)
+    }
+
+    fn build_cycle_evidence(
+        &self,
+        record: &CycleRecord,
+        evidence: NewCycleEvidence,
+    ) -> Result<StoredCycleEvidence> {
+        Ok(StoredCycleEvidence {
+            schema_version: SCHEMA_VERSION,
+            cycle_id: record.cycle_id.clone(),
+            variant_id: evidence.variant_id,
+            case_ids: evidence.case_ids,
+            environment: evidence.environment,
+            change: self.summarize_change(&record.change_id)?,
+            artifacts: evidence.artifacts,
+        })
+    }
+
+    fn publish_cycle_evidence(
+        &self,
+        record: &CycleRecord,
+        evidence: NewCycleEvidence,
+    ) -> Result<()> {
+        let stored = self.build_cycle_evidence(record, evidence)?;
+        self.database
+            .publish_document(HISTORY_EVIDENCE, &record.cycle_id, &stored)
     }
 
     fn append_promotion(
         &self,
+        transaction: &mut WriteTransaction<'_>,
         cycle: &CycleRecord,
         baseline: &BaselineRecord,
     ) -> Result<PromotionRecord> {
@@ -667,7 +1010,8 @@ impl LineageStore {
             baseline.measurement_set_id(),
             baseline.previous_measurement_set_id(),
         );
-        let events = self.read_events(&cycle.benchmark_id)?;
+        let events: Vec<LineageEvent> =
+            transaction.read_events(LINEAGE_EVENTS, &cycle.benchmark_id)?;
         if let Some(existing) = events.iter().find_map(|event| match event {
             LineageEvent::Promotion(record) if record.promotion_id == promotion_id => {
                 Some(record.clone())
@@ -687,9 +1031,10 @@ impl LineageStore {
                 .previous_measurement_set_id()
                 .map(str::to_owned),
         };
-        self.append_event(
+        transaction.append_event(
+            LINEAGE_EVENTS,
             &cycle.benchmark_id,
-            &LineageEvent::Promotion(record.clone()),
+            &serde_json::to_vec(&LineageEvent::Promotion(record.clone()))?,
         )?;
         Ok(record)
     }
@@ -788,129 +1133,451 @@ impl LineageStore {
             source_after: after.state_id.clone(),
             files,
         };
-        self.write_json(
-            &self.change_path(&change.change_id),
-            &change,
-            "source change",
-        )?;
+        self.database
+            .publish_document(SOURCE_CHANGES, &change.change_id, &change)?;
         Ok(change)
     }
 
     fn read_events(&self, benchmark_id: &str) -> Result<Vec<LineageEvent>> {
-        let path = self.history_path(benchmark_id);
-        if !path.exists() {
+        let reader = self.database.reader()?;
+        self.read_events_with(&reader, benchmark_id)
+    }
+
+    fn read_events_with(
+        &self,
+        reader: &DatabaseReader,
+        benchmark_id: &str,
+    ) -> Result<Vec<LineageEvent>> {
+        let events = reader.read_events(LINEAGE_EVENTS, benchmark_id)?;
+        if events.is_empty() {
             bail!("no optimization history for benchmark {benchmark_id:?}");
         }
-        let events = bperf_storage::read_json_lines(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        validate_events(&path, events, benchmark_id)
+        validate_events(self.database.path(), events, benchmark_id)
     }
 
     fn read_events_if_present(&self, benchmark_id: &str) -> Result<Vec<LineageEvent>> {
-        let path = self.history_path(benchmark_id);
-        if !path.exists() {
-            return Ok(Vec::new());
+        let events = self.database.read_events(LINEAGE_EVENTS, benchmark_id)?;
+        if events.is_empty() {
+            return Ok(events);
         }
-        let events = bperf_storage::read_json_lines(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        validate_events(&path, events, benchmark_id)
+        validate_events(self.database.path(), events, benchmark_id)
     }
 
     fn append_event(&self, benchmark_id: &str, event: &LineageEvent) -> Result<()> {
-        let path = self.history_path(benchmark_id);
-        bperf_storage::append_json_line(&path, event)
-            .with_context(|| format!("failed to append optimization history {}", path.display()))
+        self.database
+            .append_event(LINEAGE_EVENTS, benchmark_id, event)
+            .map(|_| ())
     }
 
     fn find_cycle(
         &self,
-        cycle_id: &str,
+        selector: &str,
     ) -> Result<(CycleRecord, Vec<PromotionRecord>, Vec<ConfirmationRecord>)> {
-        let mut found: Option<(CycleRecord, Vec<PromotionRecord>, Vec<ConfirmationRecord>)> = None;
-        for entry in fs::read_dir(&self.root)
-            .with_context(|| format!("failed to read lineage store {}", self.root.display()))?
-        {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-                continue;
+        let prefix = cycle_selector_prefix(selector)?;
+        let mut matches = Vec::new();
+        for benchmark_id in self.database.streams(LINEAGE_EVENTS)? {
+            let events = self.read_events(&benchmark_id)?;
+            for cycle in events.iter().filter_map(|event| match event {
+                LineageEvent::Cycle(record) => Some(record.as_ref()),
+                LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
+            }) {
+                if prefix
+                    .as_ref()
+                    .is_none_or(|prefix| cycle.cycle_id.starts_with(prefix))
+                {
+                    matches.push(cycle.clone());
+                }
             }
-            let benchmark_id = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .context("lineage history has a non-UTF-8 name")?;
-            let events = self.read_events(benchmark_id)?;
-            let cycle = events.iter().find_map(|event| match event {
-                LineageEvent::Cycle(record) if record.cycle_id == cycle_id => {
+        }
+
+        let cycle = if prefix.is_none() {
+            matches
+                .into_iter()
+                .max_by(|left, right| {
+                    left.recorded_at_unix_ms
+                        .cmp(&right.recorded_at_unix_ms)
+                        .then_with(|| left.cycle_id.cmp(&right.cycle_id))
+                })
+                .context(
+                    "no measured optimization cycles; run `bperf run <benchmark.bench.ts>` first",
+                )?
+        } else {
+            match matches.len() {
+                0 => bail!(
+                    "no optimization cycle matches {selector:?}; run `bperf history` to list cycles"
+                ),
+                1 => matches.pop().expect("one cycle selector match"),
+                _ => {
+                    let choices = matches
+                        .iter()
+                        .map(CycleRecord::selector)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!(
+                        "cycle selector {selector:?} is ambiguous; use more of the ID ({choices})"
+                    )
+                }
+            }
+        };
+        let events = self.read_events(&cycle.benchmark_id)?;
+        let promotions = events
+            .iter()
+            .filter_map(|event| match event {
+                LineageEvent::Promotion(record) if record.cycle_id == cycle.cycle_id => {
+                    Some(record.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let confirmations = events
+            .into_iter()
+            .filter_map(|event| match event {
+                LineageEvent::Confirmation(record) if record.cycle_id == cycle.cycle_id => {
                     Some(record.as_ref().clone())
                 }
                 _ => None,
+            })
+            .collect();
+        Ok((cycle, promotions, confirmations))
+    }
+
+    fn latest_benchmark_id(&self) -> Result<String> {
+        Ok(self.find_cycle("latest")?.0.benchmark_id)
+    }
+
+    fn history_index(&self, reader: &DatabaseReader) -> Result<HistoryIndex> {
+        self.history_index_if_present(reader)?
+            .context("no measured optimization cycles; run `bperf run <benchmark.bench.ts>` first")
+    }
+
+    fn history_index_if_present(&self, reader: &DatabaseReader) -> Result<Option<HistoryIndex>> {
+        let mut benchmarks = Vec::new();
+        for benchmark_id in reader.streams(LINEAGE_EVENTS)? {
+            let events = self.read_events_with(reader, &benchmark_id)?;
+            let mut cycles = events
+                .iter()
+                .filter_map(|event| match event {
+                    LineageEvent::Cycle(cycle) => Some(cycle.as_ref()),
+                    LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let Some(latest) = cycles.iter().copied().max_by(|left, right| {
+                left.recorded_at_unix_ms
+                    .cmp(&right.recorded_at_unix_ms)
+                    .then_with(|| left.cycle_id.cmp(&right.cycle_id))
+            }) else {
+                continue;
+            };
+            let timeline = baseline_timeline(&cycles, &events)?;
+            cycles.sort_by(|left, right| {
+                left.recorded_at_unix_ms
+                    .cmp(&right.recorded_at_unix_ms)
+                    .then_with(|| left.cycle_id.cmp(&right.cycle_id))
             });
-            if let Some(cycle) = cycle {
-                if found.is_some() {
-                    bail!("cycle ID {cycle_id:?} appears in more than one history");
-                }
-                let promotions = events
+            let mut wall_history_ms = BTreeMap::new();
+            for engine in Engine::ALL {
+                let history = cycles
                     .iter()
-                    .filter_map(|event| match event {
-                        LineageEvent::Promotion(record) if record.cycle_id == cycle_id => {
-                            Some(record.clone())
-                        }
-                        _ => None,
+                    .filter_map(|cycle| {
+                        cycle
+                            .comparison
+                            .as_ref()
+                            .and_then(|comparison| {
+                                comparison
+                                    .engines
+                                    .iter()
+                                    .find(|summary| summary.engine == engine)
+                            })
+                            .and_then(|summary| summary.metrics.get("workload.wall_ms"))
+                            .and_then(|metric| metric.candidate_value)
                     })
                     .collect();
-                let confirmations = events
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        LineageEvent::Confirmation(record) if record.cycle_id == cycle_id => {
-                            Some(record.as_ref().clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                found = Some((cycle, promotions, confirmations));
+                wall_history_ms.insert(engine, history);
+            }
+            benchmarks.push(HistoryIndexEntry {
+                benchmark_id,
+                cycle_count: cycles.len(),
+                accepted_count: timeline.baselines.len(),
+                latest_recorded_at_unix_ms: latest.recorded_at_unix_ms,
+                latest_outcome: latest.outcome.clone(),
+                latest_message: latest.message.as_deref().map(one_line),
+                current_baseline_label: timeline.current_baseline_label.clone(),
+                latest_comparison: latest.comparison.clone(),
+                wall_history_ms,
+            });
+        }
+        benchmarks.sort_by(|left, right| {
+            right
+                .latest_recorded_at_unix_ms
+                .cmp(&left.latest_recorded_at_unix_ms)
+                .then_with(|| left.benchmark_id.cmp(&right.benchmark_id))
+        });
+        let Some(latest_benchmark_id) = benchmarks.first().map(|entry| entry.benchmark_id.clone())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(HistoryIndex {
+            benchmarks,
+            latest_benchmark_id,
+        }))
+    }
+
+    fn build_history_overview(
+        &self,
+        benchmark_id: &str,
+        events: &[LineageEvent],
+    ) -> Result<HistoryOverview> {
+        let cycle_records = events
+            .iter()
+            .filter_map(|event| match event {
+                LineageEvent::Cycle(cycle) => Some(cycle.as_ref()),
+                LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let subject_id = cycle_records
+            .first()
+            .map(|cycle| cycle.subject_id.clone())
+            .context("optimization history has no measured cycles")?;
+
+        let cycle_by_measurement = cycle_records
+            .iter()
+            .map(|cycle| (cycle.candidate_measurement_set.as_str(), *cycle))
+            .collect::<BTreeMap<_, _>>();
+        let timeline = baseline_timeline(&cycle_records, events)?;
+
+        let mut cycles = Vec::with_capacity(cycle_records.len());
+        for cycle in cycle_records {
+            let readiness = promotion_readiness(cycle, events);
+            let baseline_cycle_id = cycle
+                .baseline_measurement_set
+                .as_deref()
+                .and_then(|measurement| cycle_by_measurement.get(measurement))
+                .map(|cycle| cycle.cycle_id.clone());
+            let confirmations = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        LineageEvent::Confirmation(confirmation)
+                            if confirmation.cycle_id == cycle.cycle_id
+                    )
+                })
+                .count();
+            cycles.push(HistoryCycleSummary {
+                cycle_id: cycle.cycle_id.clone(),
+                selector: cycle.selector().to_owned(),
+                recorded_at_unix_ms: cycle.recorded_at_unix_ms,
+                message: cycle
+                    .message
+                    .as_deref()
+                    .map(one_line)
+                    .unwrap_or_else(|| "(no message)".to_owned()),
+                outcome: cycle.outcome.clone(),
+                baseline_label: cycle
+                    .baseline_measurement_set
+                    .as_deref()
+                    .and_then(|measurement| timeline.label_by_measurement.get(measurement))
+                    .cloned(),
+                baseline_cycle_id,
+                accepted_label: timeline
+                    .label_by_cycle
+                    .get(cycle.cycle_id.as_str())
+                    .cloned(),
+                accepted: timeline
+                    .label_by_cycle
+                    .contains_key(cycle.cycle_id.as_str()),
+                current_baseline: timeline.current_baseline_cycle.as_deref()
+                    == Some(cycle.cycle_id.as_str()),
+                candidate_measurement_set: cycle.candidate_measurement_set.clone(),
+                comparison: cycle.comparison.clone(),
+                promotion: HistoryPromotionSummary {
+                    ready: readiness.ready,
+                    confirmation_required: readiness.confirmation_required,
+                    searched_candidates: readiness.searched_candidates,
+                    search_threshold: readiness.search_threshold,
+                    confirmations,
+                },
+            });
+        }
+        cycles.sort_by(|left, right| {
+            right
+                .recorded_at_unix_ms
+                .cmp(&left.recorded_at_unix_ms)
+                .then_with(|| right.cycle_id.cmp(&left.cycle_id))
+        });
+        let current_baseline_label = timeline.current_baseline_label;
+        let mut baselines = timeline.baselines;
+        baselines.reverse();
+        Ok(HistoryOverview {
+            benchmark_id: benchmark_id.to_owned(),
+            subject_id,
+            cycles,
+            baselines,
+            current_baseline_label,
+        })
+    }
+
+    fn build_history_view(
+        &self,
+        reader: &DatabaseReader,
+        benchmark_id: &str,
+        events: &[LineageEvent],
+    ) -> Result<HistoryView> {
+        let HistoryOverview {
+            benchmark_id,
+            subject_id,
+            cycles: summaries,
+            baselines,
+            current_baseline_label,
+        } = self.build_history_overview(benchmark_id, events)?;
+        let cycles = summaries
+            .into_iter()
+            .map(|summary| self.load_history_cycle(reader, summary))
+            .collect::<Result<_>>()?;
+        Ok(HistoryView {
+            benchmark_id,
+            subject_id,
+            cycles,
+            baselines,
+            current_baseline_label,
+        })
+    }
+
+    fn load_history_cycle(
+        &self,
+        reader: &DatabaseReader,
+        summary: HistoryCycleSummary,
+    ) -> Result<HistoryCycle> {
+        let stored: StoredCycleEvidence = reader
+            .read_document(HISTORY_EVIDENCE, &summary.cycle_id)?
+            .with_context(|| {
+                format!(
+                    "cycle {} has no persisted history evidence",
+                    summary.selector
+                )
+            })?;
+        if stored.schema_version != SCHEMA_VERSION || stored.cycle_id != summary.cycle_id {
+            bail!(
+                "history evidence for {} has incompatible identity",
+                summary.selector
+            );
+        }
+        let StoredCycleEvidence {
+            schema_version: _,
+            cycle_id: _,
+            variant_id,
+            case_ids,
+            environment,
+            change,
+            artifacts,
+        } = stored;
+        let HistoryCycleSummary {
+            cycle_id,
+            selector,
+            recorded_at_unix_ms,
+            message,
+            outcome,
+            baseline_label,
+            baseline_cycle_id,
+            accepted_label,
+            accepted,
+            current_baseline,
+            candidate_measurement_set,
+            comparison,
+            promotion,
+        } = summary;
+        Ok(HistoryCycle {
+            cycle_id,
+            selector,
+            recorded_at_unix_ms,
+            message,
+            outcome,
+            baseline_label,
+            baseline_cycle_id,
+            accepted_label,
+            accepted,
+            current_baseline,
+            candidate_measurement_set,
+            variant_id,
+            case_ids,
+            environment,
+            comparison,
+            change,
+            promotion,
+            artifacts,
+        })
+    }
+
+    fn summarize_change(&self, change_id: &str) -> Result<HistoryChangeSummary> {
+        let change = self.load_change(change_id)?;
+        let mut additions = 0;
+        let mut deletions = 0;
+        let mut binary_files = 0;
+        for file in &change.files {
+            let before = file
+                .before_sha256
+                .as_deref()
+                .map(|digest| self.read_object(digest, &file.path))
+                .transpose()?
+                .unwrap_or_default();
+            let after = file
+                .after_sha256
+                .as_deref()
+                .map(|digest| self.read_object(digest, &file.path))
+                .transpose()?
+                .unwrap_or_default();
+            match (std::str::from_utf8(&before), std::str::from_utf8(&after)) {
+                (Ok(before), Ok(after)) => {
+                    let old = before.lines().collect::<Vec<_>>();
+                    let new = after.lines().collect::<Vec<_>>();
+                    let (prefix, old_change_end, new_change_end) = changed_span(&old, &new);
+                    deletions += old_change_end.saturating_sub(prefix);
+                    additions += new_change_end.saturating_sub(prefix);
+                }
+                _ => binary_files += 1,
             }
         }
-        found.with_context(|| format!("no optimization cycle {cycle_id:?}"))
+        Ok(HistoryChangeSummary {
+            files_changed: change.files.len(),
+            additions,
+            deletions,
+            binary_files,
+        })
     }
 
     fn render_history(&self, benchmark_id: &str, events: &[LineageEvent]) -> Result<String> {
-        let mut output = format!("bperf history: {benchmark_id}\n");
-        for event in events {
-            match event {
-                LineageEvent::Cycle(cycle) => {
-                    output.push_str(&render_cycle(cycle));
-                    let readiness = promotion_readiness(cycle, events);
-                    if readiness.confirmation_required {
-                        writeln!(
-                            output,
-                            "  promotion confirmation: {} ({}/{} searched candidates)",
-                            if readiness.ready {
-                                "satisfied"
-                            } else {
-                                "required"
-                            },
-                            readiness.searched_candidates,
-                            readiness.search_threshold
-                        )?;
-                    }
-                }
-                LineageEvent::Confirmation(confirmation) => {
-                    writeln!(
-                        output,
-                        "confirmation {}: {} -> {}",
-                        short_id(&confirmation.confirmation_id),
-                        short_id(&confirmation.cycle_id),
-                        confirmation.outcome
-                    )?;
-                }
-                LineageEvent::Promotion(promotion) => {
-                    writeln!(
-                        output,
-                        "promotion {}: {} -> baseline",
-                        short_id(&promotion.promotion_id),
-                        short_id(&promotion.cycle_id)
-                    )?;
-                }
+        let measurements = history_measurements(events)?;
+        let current_baseline = events.iter().rev().find_map(|event| match event {
+            LineageEvent::Promotion(promotion) => Some(promotion.cycle_id.as_str()),
+            LineageEvent::Cycle(_) | LineageEvent::Confirmation(_) => None,
+        });
+        let mut output = format!(
+            "bperf history: {benchmark_id} ({} runs)\n",
+            measurements.len()
+        );
+        for case_id in history_case_ids(&measurements) {
+            writeln!(output, "\ncase: {case_id}")?;
+            writeln!(output, "  {:<20}  message", "cycle")?;
+            for item in measurements
+                .iter()
+                .filter(|item| item.measurement.benchmark().workload(&case_id).is_some())
+            {
+                let message = item
+                    .cycle
+                    .message
+                    .as_deref()
+                    .map(one_line)
+                    .unwrap_or_else(|| "(no message)".to_owned());
+                let baseline = if current_baseline == Some(item.cycle.cycle_id()) {
+                    " [baseline]"
+                } else {
+                    ""
+                };
+                writeln!(
+                    output,
+                    "  {:<20}  {message}{baseline}",
+                    item.cycle.selector()
+                )?;
             }
         }
         Ok(output)
@@ -1039,8 +1706,10 @@ impl LineageStore {
 
     fn load_state(&self, state_id: &str) -> Result<SourceState> {
         require_hash_id("source state", state_id, "state-")?;
-        let state: SourceState =
-            self.read_json(&self.state_path(state_id), state_id, "source state")?;
+        let state: SourceState = self
+            .database
+            .read_document(SOURCE_STATES, state_id)?
+            .with_context(|| format!("failed to read source state {state_id}"))?;
         if state.schema_version != SCHEMA_VERSION || state.state_id != state_id {
             bail!("source state {state_id} has incompatible identity");
         }
@@ -1053,8 +1722,10 @@ impl LineageStore {
 
     fn load_change(&self, change_id: &str) -> Result<SourceChange> {
         require_hash_id("source change", change_id, "change-")?;
-        let change: SourceChange =
-            self.read_json(&self.change_path(change_id), change_id, "source change")?;
+        let change: SourceChange = self
+            .database
+            .read_document(SOURCE_CHANGES, change_id)?
+            .with_context(|| format!("failed to read source change {change_id}"))?;
         if change.schema_version != SCHEMA_VERSION || change.change_id != change_id {
             bail!("source change {change_id} has incompatible identity");
         }
@@ -1084,46 +1755,195 @@ impl LineageStore {
         Ok(content)
     }
 
-    fn read_json<Value: for<'de> Deserialize<'de>>(
-        &self,
-        path: &Path,
-        id: &str,
-        label: &str,
-    ) -> Result<Value> {
-        serde_json::from_slice(
-            &fs::read(path).with_context(|| format!("failed to read {label} {id}"))?,
-        )
-        .with_context(|| format!("invalid {label} {}", path.display()))
-    }
-
-    fn write_json<Value: Serialize>(&self, path: &Path, value: &Value, label: &str) -> Result<()> {
-        self.write_immutable(
-            path,
-            format!("{}\n", serde_json::to_string_pretty(value)?).as_bytes(),
-        )
-        .with_context(|| format!("failed to store {label} {}", path.display()))
-    }
-
     fn write_immutable(&self, path: &Path, content: &[u8]) -> Result<()> {
         bperf_storage::publish_immutable(path, content)
             .with_context(|| format!("failed to store lineage object {}", path.display()))
     }
 
-    fn history_path(&self, benchmark_id: &str) -> PathBuf {
-        self.root.join(format!("{benchmark_id}.jsonl"))
-    }
-
     fn object_path(&self, sha256: &str) -> PathBuf {
         self.root.join("objects").join(sha256)
     }
+}
 
-    fn state_path(&self, state_id: &str) -> PathBuf {
-        self.root.join("states").join(format!("{state_id}.json"))
-    }
+struct HistoryMeasurement<'a> {
+    cycle: &'a CycleRecord,
+    measurement: MeasurementSet,
+}
 
-    fn change_path(&self, change_id: &str) -> PathBuf {
-        self.root.join("changes").join(format!("{change_id}.json"))
+struct BaselineTimeline {
+    baselines: Vec<HistoryBaseline>,
+    label_by_cycle: BTreeMap<String, String>,
+    label_by_measurement: BTreeMap<String, String>,
+    current_baseline_cycle: Option<String>,
+    current_baseline_label: Option<String>,
+}
+
+fn baseline_timeline(cycles: &[&CycleRecord], events: &[LineageEvent]) -> Result<BaselineTimeline> {
+    let cycle_by_measurement = cycles
+        .iter()
+        .map(|cycle| (cycle.candidate_measurement_set.as_str(), *cycle))
+        .collect::<BTreeMap<_, _>>();
+    let cycle_by_id = cycles
+        .iter()
+        .map(|cycle| (cycle.cycle_id.as_str(), *cycle))
+        .collect::<BTreeMap<_, _>>();
+    let mut baseline_roles = BTreeMap::new();
+    let mut current_baseline_cycle = None;
+    for event in events {
+        match event {
+            LineageEvent::Cycle(cycle) => {
+                let Some(parent) = cycle
+                    .baseline_measurement_set
+                    .as_deref()
+                    .and_then(|measurement| cycle_by_measurement.get(measurement))
+                else {
+                    continue;
+                };
+                baseline_roles.entry(parent.cycle_id.as_str()).or_insert((
+                    cycle.recorded_at_unix_ms,
+                    parent.candidate_measurement_set.as_str(),
+                ));
+                current_baseline_cycle = Some(parent.cycle_id.as_str());
+            }
+            LineageEvent::Promotion(promotion) => {
+                let promoted_cycle = cycle_by_id
+                    .get(promotion.cycle_id.as_str())
+                    .context("promotion refers to an unknown measured cycle")?;
+                baseline_roles
+                    .entry(promoted_cycle.cycle_id.as_str())
+                    .and_modify(|(recorded_at, _)| {
+                        *recorded_at = (*recorded_at).min(promotion.recorded_at_unix_ms);
+                    })
+                    .or_insert((
+                        promotion.recorded_at_unix_ms,
+                        promoted_cycle.candidate_measurement_set.as_str(),
+                    ));
+                current_baseline_cycle = Some(promoted_cycle.cycle_id.as_str());
+            }
+            LineageEvent::Confirmation(_) => {}
+        }
     }
+    let mut ordered_roles = baseline_roles
+        .into_iter()
+        .map(|(cycle_id, (recorded_at, measurement_set_id))| {
+            (cycle_id, measurement_set_id, recorded_at)
+        })
+        .collect::<Vec<_>>();
+    ordered_roles.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(right.0)));
+
+    let mut label_by_cycle = BTreeMap::new();
+    let mut baselines = Vec::new();
+    for (cycle_id, measurement_set_id, recorded_at_unix_ms) in ordered_roles {
+        let label = format!("b-{:02}", baselines.len() + 1);
+        label_by_cycle.insert(cycle_id.to_owned(), label.clone());
+        baselines.push(HistoryBaseline {
+            label,
+            cycle_id: cycle_id.to_owned(),
+            measurement_set_id: measurement_set_id.to_owned(),
+            promoted_at_unix_ms: recorded_at_unix_ms,
+            current: false,
+        });
+    }
+    for baseline in &mut baselines {
+        baseline.current = current_baseline_cycle == Some(baseline.cycle_id.as_str());
+    }
+    let label_by_measurement = baselines
+        .iter()
+        .map(|baseline| (baseline.measurement_set_id.clone(), baseline.label.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let current_baseline_cycle = current_baseline_cycle.map(str::to_owned);
+    let current_baseline_label = current_baseline_cycle
+        .as_deref()
+        .and_then(|cycle_id| label_by_cycle.get(cycle_id))
+        .cloned();
+    Ok(BaselineTimeline {
+        baselines,
+        label_by_cycle,
+        label_by_measurement,
+        current_baseline_cycle,
+        current_baseline_label,
+    })
+}
+
+fn retained_history_artifacts(measurement: &MeasurementSet) -> Vec<HistoryArtifact> {
+    let mut paths = HashSet::new();
+    let mut artifacts = Vec::new();
+    for (engine, artifact) in measurement.retained_artifacts() {
+        let path = measurement.root().join(&artifact.path);
+        if !paths.insert(path.clone()) {
+            continue;
+        }
+        let kind = match artifact.kind {
+            ArtifactKind::CpuProfile => HistoryArtifactKind::CpuProfile,
+            ArtifactKind::JsHeap => HistoryArtifactKind::HeapSnapshot,
+            ArtifactKind::Flamegraph => HistoryArtifactKind::Flamegraph,
+        };
+        artifacts.push(HistoryArtifact {
+            kind,
+            engine: Some(engine),
+            capture_scope: Some(artifact.capture_scope.clone()),
+            path,
+        });
+    }
+    artifacts.sort_by(|left, right| {
+        (
+            left.engine.map(engine_rank).unwrap_or(Engine::ALL.len()),
+            left.kind,
+            left.capture_scope.as_deref(),
+            &left.path,
+        )
+            .cmp(&(
+                right.engine.map(engine_rank).unwrap_or(Engine::ALL.len()),
+                right.kind,
+                right.capture_scope.as_deref(),
+                &right.path,
+            ))
+    });
+    artifacts
+}
+
+fn engine_rank(engine: Engine) -> usize {
+    Engine::ALL
+        .iter()
+        .position(|candidate| *candidate == engine)
+        .expect("required engine has a stable display position")
+}
+
+fn history_measurements(events: &[LineageEvent]) -> Result<Vec<HistoryMeasurement<'_>>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            LineageEvent::Cycle(cycle) => Some(cycle.as_ref()),
+            LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
+        })
+        .map(|cycle| {
+            let measurement = MeasurementSet::open(Path::new(&cycle.candidate_measurement_path))
+                .with_context(|| {
+                    format!(
+                        "failed to read measurement for history cycle {}",
+                        cycle.selector()
+                    )
+                })?;
+            Ok(HistoryMeasurement { cycle, measurement })
+        })
+        .collect()
+}
+
+fn history_case_ids(measurements: &[HistoryMeasurement<'_>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut cases = Vec::new();
+    for item in measurements {
+        for case_id in item.measurement.benchmark().workload_ids() {
+            if seen.insert(case_id.to_owned()) {
+                cases.push(case_id.to_owned());
+            }
+        }
+    }
+    cases
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn validate_events(
@@ -1274,11 +2094,11 @@ fn require_promotion_confirmation(cycle: &CycleRecord, events: &[LineageEvent]) 
         .as_deref()
         .context("confirmation requirement has no baseline")?;
     bail!(
-        "cycle {} needs a fresh confirmation after {} candidates were searched against baseline {}; run `bperf confirm {} <benchmark.ts>`",
-        cycle.cycle_id,
+        "cycle {} needs a fresh confirmation after {} candidates were searched against baseline {}; run `bperf confirm <benchmark.bench.ts> {}`",
+        cycle.selector(),
         readiness.searched_candidates,
         baseline_measurement_set,
-        cycle.cycle_id
+        cycle.selector()
     );
 }
 
@@ -1450,6 +2270,19 @@ fn require_cycle_id(value: &str) -> Result<()> {
     require_hash_id("optimization cycle", value, "cycle-")
 }
 
+fn cycle_selector_prefix(value: &str) -> Result<Option<String>> {
+    if value == "latest" {
+        return Ok(None);
+    }
+    let digest = value.strip_prefix("cycle-").unwrap_or(value);
+    if !(8..=64).contains(&digest.len()) || !digest.chars().all(|item| item.is_ascii_hexdigit()) {
+        bail!(
+            "invalid cycle selector {value:?}; use `latest` or at least 8 hexadecimal ID characters"
+        );
+    }
+    Ok(Some(format!("cycle-{}", digest.to_ascii_lowercase())))
+}
+
 fn require_hash_id(label: &str, value: &str, prefix: &str) -> Result<()> {
     if !value.strip_prefix(prefix).is_some_and(|digest| {
         digest.len() == 64 && digest.chars().all(|item| item.is_ascii_hexdigit())
@@ -1474,10 +2307,7 @@ fn require_portable_file_path(value: &str) -> Result<()> {
 }
 
 fn render_cycle(cycle: &CycleRecord) -> String {
-    let mut output = format!("{}: {}\n", cycle.cycle_id, cycle.outcome);
-    if let Some(message) = &cycle.message {
-        let _ = writeln!(output, "  hypothesis: {message}");
-    }
+    let mut output = render_cycle_heading(cycle);
     let _ = writeln!(
         output,
         "  source: {} -> {}",
@@ -1490,6 +2320,14 @@ fn render_cycle(cycle: &CycleRecord) -> String {
         cycle.candidate_measurement_set
     );
     output.push_str(&render_engine_results(cycle));
+    output
+}
+
+fn render_cycle_heading(cycle: &CycleRecord) -> String {
+    let mut output = format!("{}: {}\n", cycle.selector(), cycle.outcome);
+    if let Some(message) = &cycle.message {
+        let _ = writeln!(output, "  hypothesis: {message}");
+    }
     output
 }
 
@@ -1516,17 +2354,7 @@ fn file_diff(
     };
     let old: Vec<_> = before.lines().collect();
     let new: Vec<_> = after.lines().collect();
-    let mut prefix = 0;
-    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < old.len().saturating_sub(prefix)
-        && suffix < new.len().saturating_sub(prefix)
-        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
+    let (prefix, old_change_end, new_change_end) = changed_span(&old, &new);
     if prefix == old.len() && prefix == new.len() {
         return format!(
             "--- a/{path}\n+++ b/{path}\n@@ content bytes changed without line changes @@\n"
@@ -1534,8 +2362,6 @@ fn file_diff(
     }
 
     let context = 3;
-    let old_change_end = old.len() - suffix;
-    let new_change_end = new.len() - suffix;
     let start = prefix.saturating_sub(context);
     let old_end = (old_change_end + context).min(old.len());
     let new_end = (new_change_end + context).min(new.len());
@@ -1559,6 +2385,21 @@ fn file_diff(
         let _ = writeln!(output, " {line}");
     }
     output
+}
+
+fn changed_span(old: &[&str], new: &[&str]) -> (usize, usize, usize) {
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old.len().saturating_sub(prefix)
+        && suffix < new.len().saturating_sub(prefix)
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    (prefix, old.len() - suffix, new.len() - suffix)
 }
 
 fn short_id(value: &str) -> &str {
@@ -1607,7 +2448,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::comparison::EngineSummary;
+    use crate::comparison::{EngineSummary, MetricSummary};
 
     fn cycle(state: SourceState, measurement: &str) -> NewCycle {
         NewCycle {
@@ -1626,7 +2467,7 @@ mod tests {
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {
         ComparisonSummary {
             comparison_id: format!("compare-{candidate}"),
-            report_path: format!("C:/comparisons/{candidate}.json"),
+            report_path: None,
             baseline_measurement_set: "baseline".to_owned(),
             candidate_measurement_set: candidate.to_owned(),
             environment_fingerprint: Some("environment".to_owned()),
@@ -1634,12 +2475,23 @@ mod tests {
             verdict: verdict.to_owned(),
             engines: Engine::ALL
                 .into_iter()
-                .map(|engine| EngineSummary {
+                .enumerate()
+                .map(|(index, engine)| EngineSummary {
                     engine,
                     verdict: verdict.to_owned(),
                     correctness: "pass".to_owned(),
                     anchor: None,
-                    metrics: BTreeMap::new(),
+                    metrics: BTreeMap::from([(
+                        "workload.wall_ms".to_owned(),
+                        MetricSummary {
+                            improvement_pct: Some(5.0),
+                            ci_pct: Some([3.0, 7.0]),
+                            classification: "improved".to_owned(),
+                            guardrail_regressed: false,
+                            baseline_value: Some(100.0 + index as f64),
+                            candidate_value: Some(95.0 + index as f64),
+                        },
+                    )]),
                 })
                 .collect(),
             warnings: Vec::new(),
@@ -1651,6 +2503,269 @@ mod tests {
             comparison: Some(comparison(measurement, "positive")),
             ..cycle(state, measurement)
         }
+    }
+
+    #[test]
+    fn history_index_exposes_picker_summaries_without_opening_measurements() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+
+        let baseline_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let baseline = store
+            .append_cycle(cycle(baseline_state, "measure-1"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let candidate_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let candidate = store
+            .append_cycle(compared_cycle(candidate_state, "measure-2"))
+            .unwrap();
+        let promotion_id = promotion_id(
+            &baseline.cycle_id,
+            &baseline.candidate_measurement_set,
+            None,
+        );
+        store
+            .append_event(
+                "parser",
+                &LineageEvent::Promotion(PromotionRecord {
+                    schema_version: SCHEMA_VERSION,
+                    promotion_id,
+                    recorded_at_unix_ms: candidate.recorded_at_unix_ms + 1,
+                    benchmark_id: "parser".to_owned(),
+                    cycle_id: baseline.cycle_id,
+                    baseline_measurement_set: baseline.candidate_measurement_set,
+                    previous_baseline_measurement_set: None,
+                }),
+            )
+            .unwrap();
+
+        let index = store
+            .history_index(&store.database.reader().unwrap())
+            .unwrap();
+        let entry = &index.benchmarks[0];
+        assert_eq!(entry.benchmark_id, "parser");
+        assert_eq!(entry.cycle_count, 2);
+        assert_eq!(entry.accepted_count, 1);
+        assert_eq!(entry.latest_outcome, "positive");
+        assert_eq!(entry.latest_message.as_deref(), Some("measure measure-2"));
+        assert_eq!(entry.current_baseline_label.as_deref(), Some("b-01"));
+        assert_eq!(
+            entry
+                .latest_comparison
+                .as_ref()
+                .map(|comparison| comparison.candidate_measurement_set.as_str()),
+            Some("measure-2")
+        );
+        assert_eq!(
+            entry.wall_history_ms.get(&Engine::Chromium),
+            Some(&vec![95.0])
+        );
+    }
+
+    #[test]
+    fn history_overview_does_not_open_measurements_or_source_objects() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let lineage_root = temporary.path().join("lineages");
+        let store = LineageStore::open(&lineage_root).unwrap();
+
+        let baseline_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        store
+            .append_cycle(cycle(baseline_state, "measure-1"))
+            .unwrap();
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let candidate_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let candidate = store
+            .append_cycle(compared_cycle(candidate_state, "measure-2"))
+            .unwrap();
+
+        for directory in ["objects", "states", "changes"] {
+            let path = lineage_root.join(directory);
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+
+        let overview = history_overview(&lineage_root, Some("parser")).unwrap();
+        assert_eq!(overview.benchmark_id, "parser");
+        assert_eq!(overview.subject_id, "parser");
+        assert_eq!(overview.cycles.len(), 2);
+        assert_eq!(overview.cycles[0].cycle_id, candidate.cycle_id);
+        assert_eq!(overview.cycles[0].outcome, "positive");
+        assert_eq!(
+            overview.cycles[0]
+                .comparison
+                .as_ref()
+                .map(|comparison| comparison.candidate_measurement_set.as_str()),
+            Some("measure-2")
+        );
+    }
+
+    #[test]
+    fn history_cycle_reads_persisted_evidence_without_opening_payload_files() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let lineage_root = temporary.path().join("lineages");
+        let store = LineageStore::open(&lineage_root).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let missing_artifact = temporary.path().join("deleted-cpu-profile.json");
+        let cycle = store
+            .append_cycle_with_evidence(
+                cycle(state, "measure-1"),
+                Some(NewCycleEvidence {
+                    variant_id: "worktree".to_owned(),
+                    case_ids: vec!["parse".to_owned()],
+                    environment: EnvironmentSummary {
+                        recorded_at_unix_ms: 1,
+                        fingerprint: "environment".to_owned(),
+                        platform: "windows".to_owned(),
+                        arch: "x86_64".to_owned(),
+                        os_release: "test".to_owned(),
+                        browser_versions: Engine::ALL
+                            .into_iter()
+                            .map(|engine| (engine, "test".to_owned()))
+                            .collect(),
+                    },
+                    artifacts: vec![HistoryArtifact {
+                        kind: HistoryArtifactKind::CpuProfile,
+                        engine: Some(Engine::Chromium),
+                        capture_scope: Some("parse/final/0".to_owned()),
+                        path: missing_artifact.clone(),
+                    }],
+                }),
+            )
+            .unwrap();
+        fs::remove_dir_all(lineage_root.join("objects")).unwrap();
+
+        let detail = history_cycle(&lineage_root, "parser", cycle.cycle_id()).unwrap();
+        assert_eq!(detail.variant_id, "worktree");
+        assert_eq!(detail.case_ids, ["parse"]);
+        assert_eq!(detail.artifacts[0].path, missing_artifact);
+    }
+
+    #[test]
+    #[ignore = "manual history performance probe"]
+    fn history_sqlite_performance_probe() {
+        let temporary = tempdir().unwrap();
+        let lineage_root = temporary.path().join("lineages");
+        let store = LineageStore::open(&lineage_root).unwrap();
+        let environment = EnvironmentSummary {
+            recorded_at_unix_ms: 1,
+            fingerprint: "environment".to_owned(),
+            platform: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            os_release: "test".to_owned(),
+            browser_versions: Engine::ALL
+                .into_iter()
+                .map(|engine| (engine, "test".to_owned()))
+                .collect(),
+        };
+        let mut previous_cycle = None;
+        let mut previous_state = None;
+        let mut selected_cycle = String::new();
+        store
+            .database
+            .write(|transaction| {
+                for index in 1_u64..=400 {
+                    let cycle_id = format!("cycle-{index:064x}");
+                    let source_after = format!("state-{index:064x}");
+                    let change_id = format!("change-{index:064x}");
+                    let record = CycleRecord {
+                        schema_version: SCHEMA_VERSION,
+                        cycle_id: cycle_id.clone(),
+                        previous_cycle_id: previous_cycle.clone(),
+                        recorded_at_unix_ms: index,
+                        benchmark_id: "parser".to_owned(),
+                        subject_id: "parser".to_owned(),
+                        benchmark_sha256: "a".repeat(64),
+                        message: Some(format!("candidate {index}")),
+                        source_before: previous_state.clone(),
+                        source_after: source_after.clone(),
+                        change_id,
+                        baseline_measurement_set: None,
+                        candidate_measurement_set: format!("measure-{index}"),
+                        candidate_measurement_path: format!("C:/missing/measure-{index}"),
+                        environment_fingerprint: "environment".to_owned(),
+                        outcome: "measured".to_owned(),
+                        comparison: None,
+                    };
+                    let evidence = StoredCycleEvidence {
+                        schema_version: SCHEMA_VERSION,
+                        cycle_id: cycle_id.clone(),
+                        variant_id: "worktree".to_owned(),
+                        case_ids: vec!["parse".to_owned()],
+                        environment: environment.clone(),
+                        change: HistoryChangeSummary {
+                            files_changed: 1,
+                            additions: 1,
+                            deletions: 1,
+                            binary_files: 0,
+                        },
+                        artifacts: Vec::new(),
+                    };
+                    transaction.publish_document(
+                        HISTORY_EVIDENCE,
+                        &cycle_id,
+                        &serde_json::to_vec(&evidence)?,
+                    )?;
+                    transaction.append_event(
+                        LINEAGE_EVENTS,
+                        "parser",
+                        &serde_json::to_vec(&LineageEvent::Cycle(Box::new(record)))?,
+                    )?;
+                    previous_cycle = Some(cycle_id.clone());
+                    previous_state = Some(source_after);
+                    selected_cycle = cycle_id;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let reader = HistoryReader::open(&lineage_root).unwrap();
+        let open_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let index = reader.index().unwrap();
+        let index_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let overview = reader.overview(Some("parser")).unwrap();
+        let overview_elapsed = started.elapsed();
+        let selected_summary = overview
+            .cycles
+            .iter()
+            .find(|cycle| cycle.cycle_id == selected_cycle)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let cycle = reader.cycle(selected_summary).unwrap();
+        let cycle_elapsed = started.elapsed();
+
+        assert_eq!(index.benchmarks[0].cycle_count, 400);
+        assert_eq!(overview.cycles.len(), 400);
+        assert_eq!(cycle.cycle_id, selected_cycle);
+        eprintln!(
+            "400 cycles: open={open_elapsed:?} index={index_elapsed:?} overview={overview_elapsed:?} selected={cycle_elapsed:?}"
+        );
     }
 
     #[test]
@@ -1704,6 +2819,50 @@ mod tests {
     }
 
     #[test]
+    fn human_cycle_selectors_resolve_prefixes_and_the_latest_cycle() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let first_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let first = store.append_cycle(cycle(first_state, "measure-1")).unwrap();
+
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let second_state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let second = store
+            .append_cycle(cycle(second_state, "measure-2"))
+            .unwrap();
+
+        let by_prefix = store.find_cycle(second.selector()).unwrap().0;
+        assert_eq!(by_prefix.cycle_id(), second.cycle_id());
+        let bare_prefix = second.selector().strip_prefix("cycle-").unwrap();
+        let by_bare_prefix = store.find_cycle(bare_prefix).unwrap().0;
+        assert_eq!(by_bare_prefix.cycle_id(), second.cycle_id());
+
+        let expected_latest = [&first, &second]
+            .into_iter()
+            .max_by(|left, right| {
+                left.recorded_at_unix_ms
+                    .cmp(&right.recorded_at_unix_ms)
+                    .then_with(|| left.cycle_id.cmp(&right.cycle_id))
+            })
+            .unwrap();
+        let latest = store.find_cycle("latest").unwrap().0;
+        assert_eq!(latest.cycle_id(), expected_latest.cycle_id());
+        assert_eq!(store.latest_benchmark_id().unwrap(), "parser");
+
+        let error = store.find_cycle("cycle-nope").unwrap_err();
+        assert!(error.to_string().contains("at least 8 hexadecimal"));
+    }
+
+    #[test]
     fn binary_deltas_keep_content_references() {
         let diff = file_diff(
             "fixture.bin",
@@ -1745,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_lineage_event_is_ignored_and_replaced_on_resume() {
+    fn lineage_history_uses_atomic_database_events() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         fs::create_dir_all(&workspace).unwrap();
@@ -1756,15 +2915,8 @@ mod tests {
             .capture_state(&workspace, std::slice::from_ref(&source))
             .unwrap();
         store.append_cycle(cycle(first_state, "measure-1")).unwrap();
-        let history = store.history_path("parser");
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&history)
-            .unwrap()
-            .write_all(br#"{"event":"#)
-            .unwrap();
-
         assert_eq!(store.read_events("parser").unwrap().len(), 1);
+        assert!(!temporary.path().join("lineages/parser.jsonl").exists());
         fs::write(&source, "export const value = 2;\n").unwrap();
         let second_state = store
             .capture_state(&workspace, std::slice::from_ref(&source))

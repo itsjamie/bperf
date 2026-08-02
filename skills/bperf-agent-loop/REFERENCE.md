@@ -42,7 +42,7 @@ bperf doctor --engine all
 bperf run <benchmark.ts> --budget 5m --message <text>
 bperf history <benchmark-id> --format agent-context
 bperf show <cycle-id> --diff
-bperf confirm <cycle-id> <benchmark.ts> --budget 5m
+bperf confirm <benchmark.ts> <cycle-id> --budget 5m
 bperf accept <cycle-id>
 bperf baseline show <benchmark-id> --json
 ```
@@ -72,12 +72,13 @@ Present effect percentages with their baseline and candidate values, such as
 values, so they remain consistent with the reported effect across one or
 several benchmark cases.
 
-The default `run` and `confirm` output is a decision summary with paths to the
-complete evidence. Open `comparison.json` for warnings, disputed engines,
-threshold-sensitive intervals, or guardrail failures; open `sampling.json` for
-incomplete, noisy, or budget-limited evidence; open the retained profiles only
-when they can explain the result or choose the next hypothesis. Query the
-specific fields needed instead of printing a complete JSON document.
+The default `run` and `confirm` output is a decision summary. Use
+`bperf show <cycle-id> --json` for warnings, disputed engines,
+threshold-sensitive intervals, guardrail failures, or sampling context; open
+retained profiles only when they can explain the result or choose the next
+hypothesis. Query the specific fields needed instead of printing a complete
+JSON document. `.bperf/bperf.sqlite3` is internal canonical state, not a direct
+inspection interface.
 
 ## Accepted-change commit template
 

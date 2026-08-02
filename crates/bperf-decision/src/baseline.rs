@@ -8,9 +8,12 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bperf_measurement::store::MeasurementSet;
+use bperf_storage::database::{Database, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use crate::environment;
+
+pub(crate) const BASELINE_EVENTS: &str = "baseline";
 
 pub struct PromoteOptions {
     pub measurement_root: PathBuf,
@@ -27,6 +30,12 @@ pub(crate) fn promote_measurement(
     measurement_root: &Path,
     registry_root: &Path,
 ) -> Result<BaselineRecord> {
+    let pending = prepare_measurement(measurement_root)?;
+    let database = promotion_database(registry_root)?;
+    database.write(|transaction| promote_prepared(transaction, &pending))
+}
+
+pub(crate) fn prepare_measurement(measurement_root: &Path) -> Result<PendingBaseline> {
     let measurement = MeasurementSet::open(measurement_root)?;
     if !measurement.final_is_complete() {
         bail!(
@@ -38,28 +47,7 @@ pub(crate) fn promote_measurement(
         .environment_fingerprint()
         .context("complete measurement set has no environment fingerprint")?;
     let measured_at_unix_ms = environment::read(&measurement)?.recorded_at_unix_ms();
-    fs::create_dir_all(registry_root).with_context(|| {
-        format!(
-            "failed to create baseline registry {}",
-            registry_root.display()
-        )
-    })?;
-    let registry_root = fs::canonicalize(registry_root).with_context(|| {
-        format!(
-            "failed to resolve baseline registry {}",
-            registry_root.display()
-        )
-    })?;
-    let previous = current_if_present(&registry_root, measurement.benchmark_id())?;
-    if previous.as_ref().is_some_and(|record| {
-        record.measurement_set_id == measurement.measurement_set_id()
-            && record.measurement_set_path == measurement.root().to_string_lossy()
-    }) {
-        return Ok(previous.unwrap());
-    }
-
-    let record = BaselineRecord {
-        schema_version: 2,
+    Ok(PendingBaseline {
         benchmark_id: measurement.benchmark_id().to_owned(),
         subject_id: measurement.subject_id().to_owned(),
         benchmark_sha256: measurement.benchmark_sha256().to_owned(),
@@ -69,11 +57,63 @@ pub(crate) fn promote_measurement(
         variant_sha256: measurement.variant_sha256().to_owned(),
         environment_fingerprint: environment_fingerprint.to_owned(),
         measured_at_unix_ms,
+    })
+}
+
+pub(crate) fn promote_prepared(
+    transaction: &mut WriteTransaction<'_>,
+    pending: &PendingBaseline,
+) -> Result<BaselineRecord> {
+    let previous: Option<BaselineRecord> =
+        transaction.read_last_event(BASELINE_EVENTS, &pending.benchmark_id)?;
+    let previous = previous
+        .map(|record| validate_current(record, &pending.benchmark_id))
+        .transpose()?;
+    if previous.as_ref().is_some_and(|record| {
+        record.measurement_set_id == pending.measurement_set_id
+            && record.measurement_set_path == pending.measurement_set_path
+    }) {
+        return Ok(previous.unwrap());
+    }
+
+    let record = BaselineRecord {
+        schema_version: 2,
+        benchmark_id: pending.benchmark_id.clone(),
+        subject_id: pending.subject_id.clone(),
+        benchmark_sha256: pending.benchmark_sha256.clone(),
+        measurement_set_id: pending.measurement_set_id.clone(),
+        measurement_set_path: pending.measurement_set_path.clone(),
+        variant_id: pending.variant_id.clone(),
+        variant_sha256: pending.variant_sha256.clone(),
+        environment_fingerprint: pending.environment_fingerprint.clone(),
+        measured_at_unix_ms: pending.measured_at_unix_ms,
         promoted_at_unix_ms: unix_time_ms()?,
         previous_measurement_set_id: previous.map(|record| record.measurement_set_id),
     };
-    append(&registry_root, &record)?;
+    transaction.append_event(
+        BASELINE_EVENTS,
+        &record.benchmark_id,
+        &serde_json::to_vec(&record)?,
+    )?;
     Ok(record)
+}
+
+pub(crate) struct PendingBaseline {
+    benchmark_id: String,
+    subject_id: String,
+    benchmark_sha256: String,
+    measurement_set_id: String,
+    measurement_set_path: String,
+    variant_id: String,
+    variant_sha256: String,
+    environment_fingerprint: String,
+    measured_at_unix_ms: u64,
+}
+
+impl PendingBaseline {
+    pub(crate) fn benchmark_id(&self) -> &str {
+        &self.benchmark_id
+    }
 }
 
 pub struct ShowOptions {
@@ -116,37 +156,56 @@ pub fn current_path_if_present(
 }
 
 fn current_if_present(registry_root: &Path, benchmark_id: &str) -> Result<Option<BaselineRecord>> {
-    if !registry_path(registry_root, benchmark_id).exists() {
-        return Ok(None);
-    }
-    current(registry_root, benchmark_id).map(Some)
+    let database = baseline_database(registry_root)?;
+    read_current(&database, benchmark_id)
 }
 
 fn current(registry_root: &Path, benchmark_id: &str) -> Result<BaselineRecord> {
-    let path = registry_path(registry_root, benchmark_id);
-    if !path.exists() {
-        bail!("no promoted baseline for benchmark {benchmark_id:?}");
-    }
-    let record: BaselineRecord = bperf_storage::read_last_json_line(&path)
-        .with_context(|| format!("invalid baseline history {}", path.display()))?
-        .with_context(|| format!("baseline history {} is empty", path.display()))?;
+    let database = baseline_database(registry_root)?;
+    let record = read_current(&database, benchmark_id)?
+        .with_context(|| format!("no promoted baseline for benchmark {benchmark_id:?}"))?;
+    validate_current(record, benchmark_id)
+}
+
+fn read_current(database: &Database, benchmark_id: &str) -> Result<Option<BaselineRecord>> {
+    database.read_last_event(BASELINE_EVENTS, benchmark_id)
+}
+
+fn validate_current(record: BaselineRecord, benchmark_id: &str) -> Result<BaselineRecord> {
     if record.schema_version != 2 || record.benchmark_id != benchmark_id {
         bail!(
-            "baseline history {} has incompatible identity; promote a measurement made with the current runtime-anchor protocol",
-            path.display()
+            "baseline history for {benchmark_id:?} has incompatible identity; promote a measurement made with the current runtime-anchor protocol"
         );
     }
     Ok(record)
 }
 
+#[cfg(test)]
 fn append(registry_root: &Path, record: &BaselineRecord) -> Result<()> {
-    let path = registry_path(registry_root, &record.benchmark_id);
-    bperf_storage::append_json_line(&path, record)
-        .with_context(|| format!("failed to append baseline history {}", path.display()))
+    let database = baseline_database(registry_root)?;
+    database
+        .append_event(BASELINE_EVENTS, &record.benchmark_id, record)
+        .map(|_| ())
 }
 
-fn registry_path(registry_root: &Path, benchmark_id: &str) -> PathBuf {
-    registry_root.join(format!("{benchmark_id}.jsonl"))
+pub(crate) fn promotion_database(registry_root: &Path) -> Result<Database> {
+    fs::create_dir_all(registry_root).with_context(|| {
+        format!(
+            "failed to create baseline registry {}",
+            registry_root.display()
+        )
+    })?;
+    let registry_root = fs::canonicalize(registry_root).with_context(|| {
+        format!(
+            "failed to resolve baseline registry {}",
+            registry_root.display()
+        )
+    })?;
+    baseline_database(&registry_root)
+}
+
+fn baseline_database(registry_root: &Path) -> Result<Database> {
+    Database::for_collection(registry_root, "baselines")
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -186,8 +245,6 @@ impl BaselineRecord {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use tempfile::tempdir;
 
     use super::*;
@@ -223,23 +280,16 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_baseline_append_is_ignored_and_replaced_on_resume() {
+    fn baseline_history_uses_atomic_database_events() {
         let directory = tempdir().unwrap();
         append(directory.path(), &record("first", None)).unwrap();
-        let path = registry_path(directory.path(), "benchmark");
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(br#"{"schema_version":"#)
-            .unwrap();
-
         assert_eq!(
             current(directory.path(), "benchmark")
                 .unwrap()
                 .measurement_set_id,
             "first"
         );
+        assert!(!directory.path().join("benchmark.jsonl").exists());
         append(directory.path(), &record("second", Some("first"))).unwrap();
         assert_eq!(
             current(directory.path(), "benchmark")

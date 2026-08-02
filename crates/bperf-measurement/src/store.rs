@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::{ArtifactEvidence, Engine, TrialBatchConfig};
+use bperf_storage::database::Database;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -20,6 +21,8 @@ use crate::{
 
 const PREFLIGHT_CAPTURE_DIRECTORY: &str = "preflight";
 const FROZEN_WORKLOAD_DIRECTORY: &str = "workloads";
+const MEASUREMENT_DOCUMENTS: &str = "measurement";
+const MEASUREMENT_TRIALS: &str = "measurement_trials";
 
 pub struct ValidateOptions {
     pub benchmark: PathBuf,
@@ -218,18 +221,21 @@ fn prepare_with_sampling(
             measurement_root.display()
         )
     })?;
-
-    write_immutable(
-        &measurement_root.join("benchmark.resolved.json"),
-        format!("{}\n", benchmark.resolved_json()?).as_bytes(),
+    let database = Database::for_collection(artifact_root, "measurements")?;
+    database.publish_document_bytes(
+        MEASUREMENT_DOCUMENTS,
+        &measurement_document_key(&measurement_set_id, "benchmark"),
+        benchmark.resolved_json()?.as_bytes(),
     )?;
-    write_immutable(
-        &measurement_root.join("variant.resolved.json"),
-        format!("{}\n", variant.resolved_json()?).as_bytes(),
+    database.publish_document_bytes(
+        MEASUREMENT_DOCUMENTS,
+        &measurement_document_key(&measurement_set_id, "variant"),
+        variant.resolved_json()?.as_bytes(),
     )?;
-    write_immutable(
-        &measurement_root.join("schedule.json"),
-        format!("{}\n", serde_json::to_string_pretty(&schedule)?).as_bytes(),
+    database.publish_document(
+        MEASUREMENT_DOCUMENTS,
+        &measurement_document_key(&measurement_set_id, "schedule"),
+        &schedule,
     )?;
     Ok(measurement_root)
 }
@@ -243,6 +249,23 @@ fn cohort_key(value: &str) -> String {
     format!("{:x}", digest.finalize())[..12].to_owned()
 }
 
+fn measurement_document_key(measurement_set_id: &str, document: &str) -> String {
+    format!("{measurement_set_id}/{document}")
+}
+
+fn required_measurement_document(
+    database: &Database,
+    measurement_set_id: &str,
+    document: &str,
+) -> Result<Vec<u8>> {
+    database
+        .read_document_bytes(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(measurement_set_id, document),
+        )?
+        .with_context(|| format!("measurement set {measurement_set_id:?} has no {document} record"))
+}
+
 pub(crate) fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
     bperf_storage::publish_immutable(path, content).with_context(|| {
         format!(
@@ -254,6 +277,7 @@ pub(crate) fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
 
 pub struct MeasurementSet {
     pub(crate) root: PathBuf,
+    pub(crate) database: Database,
     pub(crate) benchmark: BenchmarkManifest,
     pub(crate) variant: VariantDescriptor,
     pub(crate) schedule: MeasurementSchedule,
@@ -270,38 +294,53 @@ impl MeasurementSet {
     pub fn open_with_results(root: &Path, results: Option<&Path>) -> Result<Self> {
         let root = fs::canonicalize(root)
             .with_context(|| format!("failed to resolve measurement set {}", root.display()))?;
-        let benchmark = BenchmarkManifest::load_resolved(&root.join("benchmark.resolved.json"))?;
-        let variant = VariantDescriptor::load_resolved(&root.join("variant.resolved.json"))?;
+        let measurement_set_id = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("measurement directory has a non-UTF-8 name")?;
+        let collection_root = root
+            .parent()
+            .context("measurement set has no collection root")?;
+        let database = Database::for_collection(collection_root, "measurements")?;
+        let benchmark_bytes =
+            required_measurement_document(&database, measurement_set_id, "benchmark")?;
+        let variant_bytes =
+            required_measurement_document(&database, measurement_set_id, "variant")?;
+        let benchmark = BenchmarkManifest::load_resolved_bytes(&benchmark_bytes)?;
+        let variant = VariantDescriptor::load_resolved_bytes(&variant_bytes)?;
         benchmark.validate_variant(&variant)?;
-        let schedule: MeasurementSchedule = serde_json::from_slice(
-            &fs::read(root.join("schedule.json")).context("failed to read schedule.json")?,
-        )
-        .context("invalid schedule.json")?;
+        let schedule: MeasurementSchedule = database
+            .read_document(
+                MEASUREMENT_DOCUMENTS,
+                &measurement_document_key(measurement_set_id, "schedule"),
+            )?
+            .context("measurement set has no schedule")?;
         validate_schedule(&benchmark, &variant, &schedule)?;
-        let sampling_path = root.join("sampling.json");
-        let sampling = if sampling_path.exists() {
-            let decision: SamplingDecision = serde_json::from_slice(
-                &fs::read(&sampling_path)
-                    .with_context(|| format!("failed to read {}", sampling_path.display()))?,
-            )
-            .with_context(|| format!("invalid {}", sampling_path.display()))?;
+        let sampling: Option<SamplingDecision> = database.read_document(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(measurement_set_id, "sampling"),
+        )?;
+        let sampling = if let Some(decision) = sampling {
             decision.validate(&schedule)?;
             Some(decision)
         } else {
             None
         };
         if matches!(schedule.sampling, SamplingSchedule::Fixed) && sampling.is_some() {
-            bail!("fixed measurement set cannot contain sampling.json");
+            bail!("fixed measurement set cannot contain an adaptive sampling decision");
         }
-        let results_path = results
-            .map(Path::to_owned)
-            .unwrap_or_else(|| root.join("trials.jsonl"));
-        let retention = artifact_retention::load(&root)?;
+        let trial_results = if let Some(path) = results {
+            bperf_storage::read_json_lines(path)
+                .with_context(|| format!("failed to read trial results {}", path.display()))?
+        } else {
+            database.read_events(MEASUREMENT_TRIALS, measurement_set_id)?
+        };
+        let retention = artifact_retention::load(&database, measurement_set_id)?;
         let results = ingest(
             &schedule,
             &benchmark.analysis_policy(),
             &root,
-            &results_path,
+            trial_results,
             retention.is_some(),
         )?;
         if let Some(decision) = &sampling {
@@ -317,6 +356,7 @@ impl MeasurementSet {
         }
         Ok(Self {
             root,
+            database,
             benchmark,
             variant,
             schedule,
@@ -358,21 +398,17 @@ impl MeasurementSet {
     }
 
     pub fn environment_record<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        let path = self.root.join("environment.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-        serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
+        self.database.read_document(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(self.measurement_set_id(), "environment"),
         )
-        .with_context(|| format!("invalid {}", path.display()))
-        .map(Some)
     }
 
     pub fn write_environment_record<T: Serialize>(&self, record: &T) -> Result<()> {
-        write_immutable(
-            &self.root.join("environment.json"),
-            format!("{}\n", serde_json::to_string_pretty(record)?).as_bytes(),
+        self.database.publish_document(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(self.measurement_set_id(), "environment"),
+            record,
         )
     }
 
@@ -385,10 +421,11 @@ impl MeasurementSet {
             bail!("cannot commit completion before artifact retention is finalized");
         }
 
-        let encoded = serde_json::to_string_pretty(summary)?;
-        let summary_path = self.root.join("summary.json");
-        bperf_storage::replace_file(&summary_path, format!("{encoded}\n").as_bytes())
-            .with_context(|| format!("failed to store {}", summary_path.display()))?;
+        self.database.replace_document(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(self.measurement_set_id(), "summary"),
+            summary,
+        )?;
 
         if !complete {
             return Ok(());
@@ -543,9 +580,10 @@ impl MeasurementSet {
             decision,
             &self.results.completed,
         )?;
-        write_immutable(
-            &self.root.join("sampling.json"),
-            format!("{}\n", serde_json::to_string_pretty(decision)?).as_bytes(),
+        self.database.publish_document(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(self.measurement_set_id(), "sampling"),
+            decision,
         )
     }
 
@@ -677,9 +715,9 @@ impl MeasurementSet {
             );
         }
 
-        let path = self.root.join("trials.jsonl");
-        bperf_storage::append_json_line(&path, result)
-            .with_context(|| format!("failed to append {}", path.display()))
+        self.database
+            .append_event(MEASUREMENT_TRIALS, self.measurement_set_id(), result)
+            .map(|_| ())
     }
 
     pub fn final_results(&self, engine: Engine) -> Vec<&TrialResult> {
@@ -692,6 +730,30 @@ impl MeasurementSet {
                     && self.trial_is_active(trial)
             })
             .filter_map(|trial| self.results.completed.get(&trial.trial_id))
+            .collect()
+    }
+
+    /// Returns only native payloads retained by a finalized representative
+    /// selection. Descriptors for discarded trial payloads never cross this
+    /// boundary even though they remain in immutable trial evidence.
+    pub fn retained_artifacts(&self) -> Vec<(Engine, &ArtifactEvidence)> {
+        if self.retention.is_none() {
+            return Vec::new();
+        }
+        Engine::ALL
+            .into_iter()
+            .flat_map(|engine| {
+                self.final_results(engine)
+                    .into_iter()
+                    .flat_map(move |result| {
+                        result.artifacts.iter().filter_map(move |artifact| {
+                            self.root
+                                .join(&artifact.path)
+                                .is_file()
+                                .then_some((engine, artifact))
+                        })
+                    })
+            })
             .collect()
     }
 
@@ -877,7 +939,7 @@ fn ingest(
     schedule: &MeasurementSchedule,
     policy: &AnalysisPolicy,
     measurement_root: &Path,
-    path: &Path,
+    results: Vec<TrialResult>,
     retention_finalized: bool,
 ) -> Result<IngestedResults> {
     let expected: HashMap<_, _> = schedule
@@ -885,8 +947,6 @@ fn ingest(
         .iter()
         .map(|trial| (trial.trial_id.as_str(), trial))
         .collect();
-    let results: Vec<TrialResult> = bperf_storage::read_json_lines(path)
-        .with_context(|| format!("failed to read trial results {}", path.display()))?;
     let mut attempts: HashMap<String, Vec<TrialResult>> = HashMap::new();
     let mut seen = HashSet::new();
     let mut environment_fingerprints = HashSet::new();
@@ -1105,8 +1165,6 @@ struct PlanSummary<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -1128,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn measurement_reopen_ignores_an_interrupted_trailing_result() {
+    fn measurement_reopen_reads_transactionally_committed_trial_events() {
         let directory = tempdir().unwrap();
         let root = prepare(
             &example("browser-benchmark.yaml"),
@@ -1139,15 +1197,10 @@ mod tests {
         .unwrap();
         let measurement = MeasurementSet::open(&root).unwrap();
         append_pending(&measurement);
-        fs::OpenOptions::new()
-            .append(true)
-            .open(root.join("trials.jsonl"))
-            .unwrap()
-            .write_all(br#"{"schema_version":"#)
-            .unwrap();
 
         let reopened = MeasurementSet::open(&root).unwrap();
         assert!(reopened.final_is_complete());
+        assert!(!root.join("trials.jsonl").exists());
     }
 
     #[test]
@@ -1189,7 +1242,16 @@ mod tests {
                 .to_string()
                 .contains("does not match its locked prefix")
         );
-        assert!(!root.join("sampling.json").exists());
+        assert!(
+            calibrated
+                .database
+                .read_document_bytes(
+                    MEASUREMENT_DOCUMENTS,
+                    &measurement_document_key(calibrated.measurement_set_id(), "sampling"),
+                )
+                .unwrap()
+                .is_none()
+        );
 
         calibrated.record_sampling_decision(&decision).unwrap();
 
@@ -1209,10 +1271,11 @@ mod tests {
         assert!(completed.pending_trials().is_empty());
         assert_eq!(completed.completed_active_trial_count(), 84);
         assert_eq!(
-            fs::read_to_string(root.join("trials.jsonl"))
+            completed
+                .database
+                .read_events::<TrialResult>(MEASUREMENT_TRIALS, completed.measurement_set_id())
                 .unwrap()
-                .lines()
-                .count(),
+                .len(),
             84
         );
     }
@@ -1313,13 +1376,27 @@ mod tests {
 
         assert!(!root.join("preflight").exists());
         assert!(!root.join("workloads").exists());
-        assert!(root.join("trials.jsonl").is_file());
-        assert!(root.join("artifact-retention.json").is_file());
+        assert!(!root.join("trials.jsonl").exists());
+        assert!(!root.join("artifact-retention.json").exists());
+        assert!(
+            retained
+                .database
+                .read_document_bytes(
+                    MEASUREMENT_DOCUMENTS,
+                    &measurement_document_key(retained.measurement_set_id(), "retention"),
+                )
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(
-                &fs::read(root.join("summary.json")).unwrap()
-            )
-            .unwrap(),
+            retained
+                .database
+                .read_document::<serde_json::Value>(
+                    MEASUREMENT_DOCUMENTS,
+                    &measurement_document_key(retained.measurement_set_id(), "summary"),
+                )
+                .unwrap()
+                .unwrap(),
             summary
         );
         MeasurementSet::open(&root).unwrap();

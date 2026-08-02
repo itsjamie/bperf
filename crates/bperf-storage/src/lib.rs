@@ -1,10 +1,10 @@
-//! Crash-safe publication and append-only record storage.
+//! Crash-safe database and external-payload storage.
 
 #![forbid(unsafe_code)]
 
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::Path,
 };
 
@@ -12,7 +12,9 @@ use std::{
 use std::fs::File;
 
 use anyhow::{Context, Result, bail};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
+
+pub mod database;
 
 /// Publishes immutable content without ever exposing a partially written final
 /// path. A concurrent publisher of identical content is accepted.
@@ -76,47 +78,8 @@ pub fn replace_file(path: &Path, content: &[u8]) -> Result<()> {
     sync_directory(parent)
 }
 
-/// Appends one committed JSON record. An interrupted trailing record is removed
-/// under the journal lock before the new record is written.
-pub fn append_json_line<Value: Serialize>(path: &Path, value: &Value) -> Result<()> {
-    let parent = parent_directory(path)?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create journal directory {}", parent.display()))?;
-    let journal_existed = path.exists();
-    let mut encoded = serde_json::to_vec(value).context("failed to encode journal record")?;
-    encoded.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open journal {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to lock journal {}", path.display()))?;
-    let mut content = Vec::new();
-    file.read_to_end(&mut content)
-        .with_context(|| format!("failed to inspect journal {}", path.display()))?;
-    let committed_len = committed_prefix_len(&content);
-    if committed_len != content.len() {
-        file.set_len(committed_len as u64)
-            .with_context(|| format!("failed to recover journal {}", path.display()))?;
-    }
-    file.seek(SeekFrom::End(0))
-        .with_context(|| format!("failed to seek journal {}", path.display()))?;
-    file.write_all(&encoded)
-        .with_context(|| format!("failed to append journal {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush journal {}", path.display()))?;
-    if journal_existed {
-        Ok(())
-    } else {
-        sync_directory(parent)
-    }
-}
-
 /// Reads only newline-committed JSON records. A partial trailing record is
-/// ignored so the owning operation can resume and replace it on append.
+/// ignored so an interrupted producer cannot expose a half-written value.
 pub fn read_json_lines<Value: DeserializeOwned>(path: &Path) -> Result<Vec<Value>> {
     let Some(content) = read_committed_journal(path)? else {
         return Ok(Vec::new());
@@ -131,23 +94,6 @@ pub fn read_json_lines<Value: DeserializeOwned>(path: &Path) -> Result<Vec<Value
             })
         })
         .collect()
-}
-
-/// Reads the most recent newline-committed JSON record without requiring older
-/// records to use the current domain schema.
-pub fn read_last_json_line<Value: DeserializeOwned>(path: &Path) -> Result<Option<Value>> {
-    let Some(content) = read_committed_journal(path)? else {
-        return Ok(None);
-    };
-    let Some(line) = content
-        .rsplit(|byte| *byte == b'\n')
-        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
-    else {
-        return Ok(None);
-    };
-    serde_json::from_slice(line)
-        .with_context(|| format!("invalid final JSON record in {}", path.display()))
-        .map(Some)
 }
 
 fn read_committed_journal(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -207,12 +153,12 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use std::fs;
 
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use tempfile::tempdir;
 
     use super::*;
 
-    #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
     struct Record {
         value: u32,
     }
@@ -228,37 +174,14 @@ mod tests {
     }
 
     #[test]
-    fn journal_recovers_an_interrupted_trailing_record() {
+    fn json_line_reader_ignores_an_interrupted_trailing_record() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("records.jsonl");
-        append_json_line(&path, &Record { value: 1 }).unwrap();
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(br#"{"value":"#)
-            .unwrap();
+        fs::write(&path, b"{\"value\":1}\n{\"value\":").unwrap();
 
         assert_eq!(
             read_json_lines::<Record>(&path).unwrap(),
             [Record { value: 1 }]
-        );
-        append_json_line(&path, &Record { value: 2 }).unwrap();
-        assert_eq!(
-            read_json_lines::<Record>(&path).unwrap(),
-            [Record { value: 1 }, Record { value: 2 }]
-        );
-        assert!(fs::read(&path).unwrap().ends_with(b"\n"));
-    }
-
-    #[test]
-    fn latest_record_does_not_require_legacy_records_to_deserialize() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("records.jsonl");
-        fs::write(&path, b"{\"legacy\":true}\n{\"value\":2}\n").unwrap();
-        assert_eq!(
-            read_last_json_line::<Record>(&path).unwrap(),
-            Some(Record { value: 2 })
         );
     }
 

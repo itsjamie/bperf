@@ -63,7 +63,7 @@ Repeat this loop:
 If `accept` requests independent evidence:
 
 ```text
-bperf confirm <cycle-id> <benchmark.ts> --budget <duration>
+bperf confirm <benchmark.ts> <cycle-id> --budget <duration>
 bperf accept <cycle-id>
 ```
 
@@ -103,22 +103,23 @@ that. Use two spaces only to group metric rows under an engine heading.
 - Use the default `run` and `confirm` output for decisions. `--json` emits the
   complete machine-readable document and is for programmatic consumers, not the
   normal agent loop.
-- The summary links to `summary.json`, `sampling.json`,
-  `artifact-retention.json`, and, when a baseline exists, `comparison.json`.
+- Structured evidence is canonical in `.bperf/bperf.sqlite3`; use the CLI and
+  history TUI rather than opening the database or internal files directly.
   Resolve only the evidence needed for the current decision; do not dump a
-  complete JSON file into context when selecting a few fields is sufficient.
-- Read `comparison.json` when a result is negative or inconclusive, an engine
-  disagrees with the overall direction, correctness or an anchor does not pass,
-  a guardrail regresses, a warning is present, or an interval is close enough
-  to a policy threshold that the summary does not settle the decision.
-- Read `sampling.json` and the measurement `summary.json` when evidence is
+  complete `--json` document into context when a few fields are sufficient.
+- Use the comparison fields from `bperf show <cycle-id> --json` when a result
+  is negative or inconclusive, an engine disagrees with the overall direction,
+  correctness or an anchor does not pass, a guardrail regresses, a warning is
+  present, or an interval is close enough to a policy threshold that the
+  summary does not settle the decision.
+- Use command `--json` measurement and sampling fields when evidence is
   incomplete, budget-limited, insufficient, unexpectedly noisy, or when trial
   counts and pilot stopping behavior affect the next step.
-- Read `artifact-retention.json`, then only the selected CPU/flamegraph or heap
-  artifacts it names, when a representative profile could explain a result,
-  distinguish competing hypotheses, or validate an important engine-specific
-  tradeoff before promotion. Do not open profiles merely to restate a clear
-  statistical verdict.
+- Use the history artifact picker, then only the selected CPU/flamegraph or
+  heap artifacts it names, when a representative profile could explain a
+  result, distinguish competing hypotheses, or validate an important
+  engine-specific tradeoff before promotion. Do not open profiles merely to
+  restate a clear statistical verdict.
 - Use `bperf show <cycle-id> --diff` before promotion. Add `--json` only when a
   structured field not present in the compact output is required, and select
   that field rather than returning the whole document.

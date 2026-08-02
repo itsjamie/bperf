@@ -11,16 +11,16 @@ use bperf_browser::{
     artifacts::{validate_artifact_files, validate_artifact_set},
     lab::{ArtifactEvidence, ArtifactKind, Engine},
 };
+use bperf_storage::database::Database;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     schedule::{MeasurementSchedule, TrialPhase},
-    store::{MeasurementSet, TrialResult, write_immutable},
+    store::{MeasurementSet, TrialResult},
 };
 
 const SCHEMA_VERSION: u32 = 2;
 const POLICY: &str = "representative_per_workload_engine_scope_v2";
-const MANIFEST_NAME: &str = "artifact-retention.json";
 const CPU_METRIC: &str = "browser.cpu_profile.active_ms";
 const HEAP_METRIC: &str = "browser.js_heap.live_bytes";
 
@@ -57,17 +57,17 @@ pub struct RetentionSummary {
     pub discarded_bytes: u64,
 }
 
-pub(crate) fn load(root: &Path) -> Result<Option<ArtifactRetention>> {
-    let path = root.join(MANIFEST_NAME);
-    if !path.exists() {
+pub(crate) fn load(
+    database: &Database,
+    measurement_set_id: &str,
+) -> Result<Option<ArtifactRetention>> {
+    let Some(manifest): Option<ArtifactRetention> =
+        database.read_document("measurement", &format!("{measurement_set_id}/retention"))?
+    else {
         return Ok(None);
-    }
-    let manifest: ArtifactRetention = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("invalid {}", path.display()))?;
+    };
     if manifest.schema_version != SCHEMA_VERSION || manifest.policy != POLICY {
-        bail!("unsupported artifact retention manifest {}", path.display());
+        bail!("measurement set {measurement_set_id:?} has unsupported artifact retention data");
     }
     Ok(Some(manifest))
 }
@@ -78,19 +78,19 @@ pub fn finalize(measurement: &MeasurementSet) -> Result<Option<RetentionSummary>
     }
 
     let expected = build_manifest(measurement)?;
-    let path = measurement.root().join(MANIFEST_NAME);
-    if let Some(existing) = load(measurement.root())? {
+    if let Some(existing) = load(&measurement.database, measurement.measurement_set_id())? {
         if let Some(mismatch) = manifest_mismatch(&existing, &expected) {
             bail!(
-                "artifact retention manifest {} does not match the immutable trial evidence: {mismatch}",
-                path.display(),
+                "artifact retention data for measurement set {:?} does not match the immutable trial evidence: {mismatch}",
+                measurement.measurement_set_id(),
             );
         }
     } else {
         validate_retained_files(measurement.root(), &expected)?;
-        write_immutable(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&expected)?).as_bytes(),
+        measurement.database.publish_document(
+            "measurement",
+            &format!("{}/retention", measurement.measurement_set_id()),
+            &expected,
         )?;
     }
     prune_unselected(measurement.root(), &expected)?;
@@ -524,7 +524,9 @@ mod tests {
 
         let completed = MeasurementSet::open(&root).unwrap();
         let summary = finalize(&completed).unwrap().unwrap();
-        let manifest = load(&root).unwrap().unwrap();
+        let manifest = load(&completed.database, completed.measurement_set_id())
+            .unwrap()
+            .unwrap();
         assert_eq!(summary.retained_artifacts, manifest.selections.len());
         assert!(summary.discarded_artifacts > 0);
         assert_eq!(

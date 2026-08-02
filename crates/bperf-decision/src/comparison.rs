@@ -1,6 +1,6 @@
 //! Comparative analysis over two immutable measurement sets.
 
-use std::{collections::BTreeMap, fmt::Write as _, fs, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::Engine;
@@ -8,6 +8,7 @@ use bperf_measurement::{
     manifest::{AnalysisPolicy, MetricPolicy},
     store::{MeasurementSet, TrialResult},
 };
+use bperf_storage::database::Database;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +20,7 @@ use crate::{
 const ANCHOR_MAX_DRIFT_PCT: f64 = 5.0;
 const ANCHOR_BOOTSTRAP_SAMPLES: u32 = 5_000;
 const BASELINE_AGE_WARNING_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const COMPARISON_DOCUMENTS: &str = "comparison";
 
 pub struct CompareOptions {
     pub candidate_root: PathBuf,
@@ -40,20 +42,17 @@ pub fn run(options: CompareOptions) -> Result<ComparisonOutcome> {
 
     let comparison_id = comparison_id(&baseline, &candidate);
     let report = compare(&comparison_id, &baseline, &candidate, environments.as_ref())?;
-    let encoded = format!("{}\n", serde_json::to_string_pretty(&report)?);
-    let output_path = match options.output {
-        Some(path) => path,
-        None => options
-            .artifact_root
-            .join(&comparison_id)
-            .join("comparison.json"),
-    };
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(&output_path, &encoded)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    let database = Database::for_collection(&options.artifact_root, "comparisons")?;
+    database.publish_document(COMPARISON_DOCUMENTS, &comparison_id, &report)?;
+    let output_path = options
+        .output
+        .map(|path| {
+            let encoded = format!("{}\n", serde_json::to_string_pretty(&report)?);
+            bperf_storage::replace_file(&path, encoded.as_bytes())
+                .with_context(|| format!("failed to write comparison export {}", path.display()))?;
+            Ok::<_, anyhow::Error>(path)
+        })
+        .transpose()?;
 
     Ok(ComparisonOutcome {
         report,
@@ -63,7 +62,7 @@ pub fn run(options: CompareOptions) -> Result<ComparisonOutcome> {
 
 pub struct ComparisonOutcome {
     report: ComparisonReport,
-    output_path: PathBuf,
+    output_path: Option<PathBuf>,
 }
 
 impl ComparisonOutcome {
@@ -87,7 +86,10 @@ impl ComparisonOutcome {
             self.report.candidate.variant_id, self.report.candidate.measurement_set_id
         );
         print!("{}", self.summary().render_decision_summary());
-        println!("  comparison: {}", self.output_path.display());
+        println!("  comparison: {}", self.report.comparison_id);
+        if let Some(path) = &self.output_path {
+            println!("  comparison export: {}", path.display());
+        }
     }
 
     pub fn exit_code(&self) -> std::process::ExitCode {
@@ -102,8 +104,8 @@ impl ComparisonOutcome {
         }
     }
 
-    pub fn report_path(&self) -> &std::path::Path {
-        &self.output_path
+    pub fn comparison_id(&self) -> &str {
+        &self.report.comparison_id
     }
 
     pub fn report_data(&self) -> &ComparisonReport {
@@ -113,7 +115,10 @@ impl ComparisonOutcome {
     pub fn summary(&self) -> ComparisonSummary {
         ComparisonSummary {
             comparison_id: self.report.comparison_id.clone(),
-            report_path: self.output_path.to_string_lossy().into_owned(),
+            report_path: self
+                .output_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             baseline_measurement_set: self.report.baseline.measurement_set_id.clone(),
             candidate_measurement_set: self.report.candidate.measurement_set_id.clone(),
             environment_fingerprint: self.report.environment_fingerprint.clone(),
@@ -160,7 +165,8 @@ impl ComparisonOutcome {
 #[serde(deny_unknown_fields)]
 pub struct ComparisonSummary {
     pub comparison_id: String,
-    pub report_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<String>,
     pub baseline_measurement_set: String,
     pub candidate_measurement_set: String,
     pub environment_fingerprint: Option<String>,
@@ -1443,7 +1449,7 @@ mod tests {
     fn decision_summary_contains_only_decision_relevant_engine_evidence() {
         let summary = ComparisonSummary {
             comparison_id: "compare-candidate".to_owned(),
-            report_path: ".bperf/comparisons/compare-candidate/comparison.json".to_owned(),
+            report_path: None,
             baseline_measurement_set: "baseline".to_owned(),
             candidate_measurement_set: "candidate".to_owned(),
             environment_fingerprint: Some("environment".to_owned()),

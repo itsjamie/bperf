@@ -67,15 +67,15 @@ authoring module, and pinned browser registry. Extract the archive, put its
 directory on `PATH`, then install the browser builds:
 
 ```text
-bperf browsers install --engine all
-bperf doctor --engine all
+bperf browsers install
+bperf doctor
 ```
 
 On Linux, pass `--with-deps` to let bperf install the required
 operating-system packages as well:
 
 ```text
-bperf browsers install --engine all --with-deps
+bperf browsers install --with-deps
 ```
 
 Cargo can build and install the same self-contained executable directly from a
@@ -83,21 +83,21 @@ tag:
 
 ```text
 cargo install --git https://github.com/itsjamie/bperf --tag v0.1.0 --locked bperf
-bperf browsers install --engine all
-bperf doctor --engine all
+bperf browsers install
+bperf doctor
 ```
 
 From a source checkout:
 
 ```text
 cargo build --locked
-cargo run -- browsers install --engine all
-cargo run -- doctor --engine all
+cargo run -- browsers install
+cargo run -- doctor
 ```
 
-`doctor --engine all` is the capability gate. Run it on a new machine or after
-changing Playwright or the installed browsers. Every doctor launches its browser
-directly from Rust.
+`doctor` checks all three engines and is the capability gate. Run it on a new
+machine or after changing Playwright or the installed browsers. Every doctor
+launches its browser directly from Rust.
 
 To create and install an optimized build for the current platform:
 
@@ -195,24 +195,41 @@ CommonJS hls.js checkout is in
 
 ## Run the optimization loop
 
-The example benchmark can be run directly from this checkout:
+In an interactive terminal, bare `bperf run` scans `benchmarks/**/*.bench.ts`
+and opens a benchmark picker. Passing a directory scans that directory
+recursively instead:
+
+```text
+cargo run -- run examples/managed
+```
+
+The picker shows literal benchmark IDs and cases, fixtures, run count, latest
+verdict, promoted baseline, per-engine medians, and recent Chromium wall-time
+trend without starting a browser. Press `enter` or `m` to record the cycle
+message and start the selected benchmark. `/` filters modules; `b` edits the
+budget; `d` changes the scan directory. Managed runs continue to capture
+Chromium, Firefox, and WebKit together.
+
+Passing an exact benchmark file keeps the direct, scriptable path:
 
 ```text
 cargo run -- run examples/managed/fragment-parser.bench.ts --budget 5m --message "Establish parser baseline"
 ```
 
+Redirected output and `--json` require that exact file path.
+
 The first run has no comparison, so it reports `measured` and prints a cycle
-ID. Promote it explicitly:
+selector. Promote the latest cycle explicitly:
 
 ```text
-cargo run -- accept <cycle-id>
+cargo run -- accept
 ```
 
 After changing the subject, run the same benchmark again:
 
 ```text
 cargo run -- run examples/managed/fragment-parser.bench.ts --budget 5m --message "Reuse parsed box metadata"
-cargo run -- show <cycle-id> --diff
+cargo run -- show --diff
 ```
 
 With a promoted baseline, `run` reports one of four outcomes:
@@ -231,11 +248,20 @@ After five candidates have been compared with one baseline, `accept` asks for
 an independent confirmation:
 
 ```text
-cargo run -- confirm <cycle-id> examples/managed/fragment-parser.bench.ts
-cargo run -- accept <cycle-id>
+cargo run -- confirm examples/managed/fragment-parser.bench.ts
+cargo run -- accept
 ```
 
 Do not edit the source between the candidate and its confirmation.
+
+`show`, `accept`, `history`, and `confirm` select the latest local work when an
+identifier is omitted. A printed short cycle ID is also an accepted selector,
+so use it when working with more than one cycle. Bare `history` opens an
+interactive terminal view when stdin and stdout are terminals. It keeps the
+cycle lineage, per-engine evidence, representative artifacts, and promotion
+readiness visible together. Redirected output, an explicit benchmark ID, or an
+explicit `--format` stays non-interactive. Benchmark state and evidence live
+under `.bperf/`; pass `--data-dir <directory>` to relocate that complete store.
 
 The full baseline, candidate, confirmation, recovery, and evidence-reading
 workflow is in [Running an optimization](docs/OPTIMIZATION.md).
@@ -251,7 +277,7 @@ Each completed `run` writes:
 - an immutable measurement set under `.bperf/measurements/`;
 - complete timing, CPU, flamegraph, heap, and correctness evidence for each
   case and engine;
-- the adaptive pilot and final-sample decision in `sampling.json`;
+- the adaptive pilot and final-sample decision;
 - one representative CPU profile, flamegraph, and heap snapshot per case and
   engine;
 - a content-addressed checkpoint of the project module graph that defined the
@@ -259,6 +285,10 @@ Each completed `run` writes:
 - an append-only optimization-cycle event, including negative, equivalent,
   inconclusive, and reverted changes;
 - a comparison report when a promoted baseline exists.
+
+Structured state is stored in `.bperf/bperf.sqlite3`. Large native profiles,
+heap snapshots, source bytes, fixture bodies, and frozen workload payloads stay
+as files. JSON is an output format (`--json`), not the persistence layout.
 
 An interrupted `run` or `confirm` resumes the compatible immutable schedule.
 Valid trials remain valid; only missing or invalid attempts are retried.
@@ -282,7 +312,8 @@ A fixed count of `N` means `N` complete final trials for each benchmark case
 and engine. Each trial contains wall timing, CPU, flamegraph, and heap evidence
 from the same workload execution.
 
-Most benchmark authors should use `bperf run <benchmark.ts>`.
+Most benchmark authors should use bare `bperf run` to choose interactively or
+`bperf run <benchmark.ts>` in scripts.
 
 ## Development
 

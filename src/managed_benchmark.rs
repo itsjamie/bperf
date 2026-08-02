@@ -19,6 +19,7 @@ use bperf_measurement::{
     store::MeasurementSet,
 };
 use bperf_runtime::installation::{BrowserInstallation, portable_path as path_value};
+use bperf_storage::database::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -37,6 +38,7 @@ const STANDARD_TRIAL_POLICY: TrialPolicy = TrialPolicy {
     min_final_samples: 20,
     max_final_samples: 100,
 };
+const MEASUREMENT_INDEX_DOCUMENTS: &str = "measurement_index";
 
 #[derive(Clone, Copy)]
 struct TrialPolicy {
@@ -101,7 +103,7 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
     let exit_code = comparison
         .as_ref()
         .map_or(0, ComparisonOutcome::exit_code_value);
-    let index_path = record_measurement_index(MeasurementIndexOptions {
+    let index_id = record_measurement_index(MeasurementIndexOptions {
         measurement_root: measurement.measurement_root(),
         benchmark_id: measurement.benchmark_id(),
         measurement_set_id: measurement.measurement_set_id(),
@@ -110,13 +112,13 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
         outcome: cycle.outcome(),
         event: "cycle",
         record_id: cycle.cycle_id(),
-        comparison_path: comparison.as_ref().map(ComparisonOutcome::report_path),
+        comparison_id: comparison.as_ref().map(ComparisonOutcome::comparison_id),
     })?;
     Ok(RunOutcome {
         measurement,
         comparison,
         cycle,
-        index_path,
+        index_id,
     })
 }
 
@@ -213,13 +215,13 @@ fn confirm_with_policy(
     })?;
     let confirmation = lineage::record_confirmation(lineage::RecordConfirmationOptions {
         root: execution.lineage_root,
-        cycle_id: options.cycle_id,
+        cycle_id: target.cycle_id().to_owned(),
         workspace_root,
         source_files,
         measurement_root: measurement.measurement_root().to_owned(),
         comparison: comparison.summary(),
     })?;
-    let index_path = record_measurement_index(MeasurementIndexOptions {
+    let index_id = record_measurement_index(MeasurementIndexOptions {
         measurement_root: measurement.measurement_root(),
         benchmark_id: measurement.benchmark_id(),
         measurement_set_id: measurement.measurement_set_id(),
@@ -228,13 +230,13 @@ fn confirm_with_policy(
         outcome: confirmation.outcome(),
         event: "confirmation",
         record_id: confirmation.confirmation_id(),
-        comparison_path: Some(comparison.report_path()),
+        comparison_id: Some(comparison.comparison_id()),
     })?;
     Ok(ConfirmOutcome {
         measurement,
         comparison,
         confirmation,
-        index_path,
+        index_id,
     })
 }
 
@@ -242,7 +244,7 @@ pub(crate) struct ConfirmOutcome {
     measurement: runner::MeasurementOutcome,
     comparison: ComparisonOutcome,
     confirmation: lineage::ConfirmationRecord,
-    index_path: PathBuf,
+    index_id: String,
 }
 
 impl ConfirmOutcome {
@@ -256,7 +258,7 @@ impl ConfirmOutcome {
                     measurement: &self.measurement,
                     comparison: self.comparison.report_data(),
                     confirmation: &self.confirmation,
-                    measurement_index: &self.index_path,
+                    measurement_index: &self.index_id,
                 })?
             );
         } else {
@@ -264,7 +266,13 @@ impl ConfirmOutcome {
             self.measurement.report_details();
             self.comparison.report_details();
             println!("  confirmation: {}", self.confirmation.confirmation_id());
-            println!("  measurement index: {}", self.index_path.display());
+            println!("  measurement record: {}", self.index_id);
+            if self.confirmation.outcome() == "positive" {
+                println!(
+                    "  next: bperf accept {}",
+                    self.confirmation.cycle_selector()
+                );
+            }
         }
         Ok(())
     }
@@ -281,7 +289,7 @@ struct ConfirmationReport<'a> {
     measurement: &'a runner::MeasurementOutcome,
     comparison: &'a ComparisonReport,
     confirmation: &'a lineage::ConfirmationRecord,
-    measurement_index: &'a Path,
+    measurement_index: &'a str,
 }
 
 fn compare_current(
@@ -307,7 +315,7 @@ pub(crate) struct RunOutcome {
     measurement: runner::MeasurementOutcome,
     comparison: Option<ComparisonOutcome>,
     cycle: CycleRecord,
-    index_path: PathBuf,
+    index_id: String,
 }
 
 impl RunOutcome {
@@ -320,7 +328,7 @@ impl RunOutcome {
                 measurement: &self.measurement,
                 comparison: self.comparison.as_ref().map(ComparisonOutcome::report_data),
                 cycle: &self.cycle,
-                measurement_index: &self.index_path,
+                measurement_index: &self.index_id,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -332,12 +340,12 @@ impl RunOutcome {
                 self.measurement.report_engine_results()?;
                 println!("  comparison: no promoted baseline");
             }
-            println!("  cycle: {}", self.cycle.cycle_id());
-            println!(
-                "  source change: bperf show {} --diff",
-                self.cycle.cycle_id()
-            );
-            println!("  measurement index: {}", self.index_path.display());
+            println!("  cycle: {}", self.cycle.selector());
+            println!("  inspect: bperf show {} --diff", self.cycle.selector());
+            if matches!(status, "measured" | "positive" | "equivalent") {
+                println!("  promote: bperf accept {}", self.cycle.selector());
+            }
+            println!("  measurement record: {}", self.index_id);
         }
         Ok(())
     }
@@ -358,7 +366,7 @@ struct RunReport<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<&'a ComparisonReport>,
     cycle: &'a CycleRecord,
-    measurement_index: &'a Path,
+    measurement_index: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -371,7 +379,7 @@ struct MeasurementIndexOptions<'a> {
     outcome: &'a str,
     event: &'static str,
     record_id: &'a str,
-    comparison_path: Option<&'a Path>,
+    comparison_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -385,12 +393,11 @@ struct MeasurementIndexRecord<'a> {
     benchmark_id: &'a str,
     measurement_set_id: &'a str,
     measurement_path: &'a Path,
-    measurement_summary: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
-    comparison_path: Option<&'a Path>,
+    comparison_id: Option<&'a str>,
 }
 
-fn record_measurement_index(options: MeasurementIndexOptions<'_>) -> Result<PathBuf> {
+fn record_measurement_index(options: MeasurementIndexOptions<'_>) -> Result<String> {
     if options.recorded_at_unix_ms == 0 {
         bail!("measurement index has no creation timestamp");
     }
@@ -400,24 +407,14 @@ fn record_measurement_index(options: MeasurementIndexOptions<'_>) -> Result<Path
             options.exit_code
         );
     }
-    let measurement_summary = options.measurement_root.join("summary.json");
-    if !measurement_summary.is_file() {
-        bail!(
-            "measurement index summary does not exist: {}",
-            measurement_summary.display()
-        );
-    }
     let artifact_root = options
         .measurement_root
         .parent()
         .context("measurement set has no artifact root")?;
-    let index_root = artifact_root.join("index");
-    fs::create_dir_all(&index_root)
-        .with_context(|| format!("failed to create {}", index_root.display()))?;
-    let index_path = index_root.join(format!(
-        "{:013}-exit-{}-{}.json",
+    let index_id = format!(
+        "{:013}-exit-{}-{}",
         options.recorded_at_unix_ms, options.exit_code, options.record_id
-    ));
+    );
     let record = MeasurementIndexRecord {
         schema_version: 1,
         recorded_at_unix_ms: options.recorded_at_unix_ms,
@@ -428,14 +425,11 @@ fn record_measurement_index(options: MeasurementIndexOptions<'_>) -> Result<Path
         benchmark_id: options.benchmark_id,
         measurement_set_id: options.measurement_set_id,
         measurement_path: options.measurement_root,
-        measurement_summary,
-        comparison_path: options.comparison_path,
+        comparison_id: options.comparison_id,
     };
-    write_immutable(
-        &index_path,
-        format!("{}\n", serde_json::to_string_pretty(&record)?).as_bytes(),
-    )?;
-    Ok(index_path)
+    let database = Database::for_collection(artifact_root, "measurements")?;
+    database.publish_document(MEASUREMENT_INDEX_DOCUMENTS, &index_id, &record)?;
+    Ok(index_id)
 }
 
 struct MaterializedInputs {
@@ -920,11 +914,6 @@ fn write_generated(path: &Path, content: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
-    bperf_storage::publish_immutable(path, content)
-        .with_context(|| format!("failed to publish immutable index {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, process::Command};
@@ -1022,7 +1011,6 @@ mod tests {
             .join("measurements")
             .join("measure-v5-test");
         fs::create_dir_all(&measurement_root).unwrap();
-        fs::write(measurement_root.join("summary.json"), b"{}\n").unwrap();
 
         let later = record_measurement_index(MeasurementIndexOptions {
             measurement_root: &measurement_root,
@@ -1033,7 +1021,7 @@ mod tests {
             outcome: "negative",
             event: "cycle",
             record_id: "cycle-later",
-            comparison_path: Some(Path::new("comparisons/later/comparison.json")),
+            comparison_id: Some("compare-later"),
         })
         .unwrap();
         let earlier_options = MeasurementIndexOptions {
@@ -1045,7 +1033,7 @@ mod tests {
             outcome: "positive",
             event: "cycle",
             record_id: "cycle-earlier",
-            comparison_path: Some(Path::new("comparisons/earlier/comparison.json")),
+            comparison_id: Some("compare-earlier"),
         };
         let earlier = record_measurement_index(earlier_options).unwrap();
         assert_eq!(
@@ -1054,37 +1042,26 @@ mod tests {
             "an exact retry must reuse its index receipt"
         );
 
-        let mut names = fs::read_dir(earlier.parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
+        let mut names = vec![earlier.clone(), later.clone()];
         names.sort();
         assert_eq!(
             names,
             [
-                "0000000000009-exit-0-cycle-earlier.json",
-                "0000000000010-exit-1-cycle-later.json",
+                "0000000000009-exit-0-cycle-earlier",
+                "0000000000010-exit-1-cycle-later",
             ]
         );
 
-        let receipt: Value =
-            serde_json::from_slice(&fs::read(later).unwrap()).expect("valid index receipt");
+        let receipt: Value = Database::open(temporary.path())
+            .unwrap()
+            .read_document(MEASUREMENT_INDEX_DOCUMENTS, &later)
+            .unwrap()
+            .expect("stored index receipt");
         assert_eq!(receipt["recorded_at_unix_ms"], 10);
         assert_eq!(receipt["exit_code"], 1);
         assert_eq!(receipt["outcome"], "negative");
         assert_eq!(receipt["measurement_set_id"], "measure-v5-test");
-        assert!(
-            receipt["measurement_summary"]
-                .as_str()
-                .unwrap()
-                .ends_with("summary.json")
-        );
-        assert!(
-            receipt["comparison_path"]
-                .as_str()
-                .unwrap()
-                .ends_with("comparison.json")
-        );
+        assert_eq!(receipt["comparison_id"], "compare-later");
     }
 
     #[test]
@@ -1171,11 +1148,10 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from(Engine::ALL)
         );
-        let records: Vec<Value> = fs::read_to_string(root.join("trials.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let database = Database::open(temporary.path()).unwrap();
+        let records: Vec<Value> = database
+            .read_events("measurement_trials", measurement.measurement_set_id())
+            .unwrap();
         assert_eq!(records.len(), 6 + sampling.selected_final_trials as usize);
         assert!(records.iter().all(|record| {
             record["valid"] == true
@@ -1184,9 +1160,13 @@ mod tests {
                     .as_array()
                     .is_some_and(|items| items.len() == 3)
         }));
-        let retention: Value =
-            serde_json::from_slice(&fs::read(root.join("artifact-retention.json")).unwrap())
-                .unwrap();
+        let retention: Value = database
+            .read_document(
+                "measurement",
+                &format!("{}/retention", measurement.measurement_set_id()),
+            )
+            .unwrap()
+            .unwrap();
         let retained_paths: HashSet<_> = retention["selections"]
             .as_array()
             .unwrap()
@@ -1238,11 +1218,10 @@ mod tests {
         .unwrap();
         assert_eq!(cycle.outcome(), expected_outcome);
         assert!(
-            fs::read_dir(comparison_root).unwrap().any(|entry| entry
+            database
+                .read_document_bytes("comparison", comparison.comparison_id())
                 .unwrap()
-                .path()
-                .join("comparison.json")
-                .is_file())
+                .is_some()
         );
 
         let confirmation = confirm_with_policy(

@@ -1,10 +1,10 @@
 use std::{
-    collections::HashSet,
-    fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
+use bperf_browser::lab::Engine;
+use bperf_measurement::store::MeasurementSet;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -63,30 +63,23 @@ fn variants_can_be_measured_and_compared_on_every_engine() {
             PathBuf::from(summary["measurement_root"].as_str().expect("root path"));
         assert!(!measurement_root.join("preflight").exists());
         assert!(!measurement_root.join("workloads").exists());
-        let trials =
-            fs::read_to_string(measurement_root.join("trials.jsonl")).expect("read trial log");
-        let records: Vec<Value> = trials
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("valid trial JSON"))
-            .collect();
-        assert_eq!(records.len(), 3);
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record["engine"].as_str().unwrap())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["chromium", "firefox", "webkit"])
-        );
-        for record in records {
-            assert_eq!(record["valid"], true);
-            assert_eq!(record["success"], true);
-            assert_eq!(record["artifacts"].as_array().unwrap().len(), 3);
+        let measurement =
+            MeasurementSet::open(&measurement_root).expect("open completed measurement set");
+        assert_eq!(measurement.completed_active_trial_count(), 3);
+        for engine in Engine::ALL {
+            let records = measurement.final_results(engine);
+            assert_eq!(records.len(), 1, "expected one final {engine} trial");
+            let record = records[0];
+            assert_eq!(record.engine, engine);
+            assert!(record.valid);
+            assert!(record.success);
+            assert_eq!(record.artifacts.len(), 3);
             for metric in [
                 "workload.wall_ms",
                 "browser.cpu_profile.active_ms",
                 "browser.js_heap.live_bytes",
             ] {
-                assert!(record["metrics"][metric].as_f64().unwrap() > 0.0);
+                assert!(record.metrics.get(metric).copied().unwrap() > 0.0);
             }
         }
     }

@@ -10,7 +10,7 @@ Run the complete capability gate on a new host or after changing the browser
 installation:
 
 ```text
-bperf doctor --engine all
+bperf doctor
 ```
 
 Chromium, Firefox, and WebKit must all pass. If one engine cannot produce a
@@ -24,6 +24,19 @@ browser process permissions. Do not disable Firefox's content sandbox.
 
 ## Establish the baseline
 
+From an interactive terminal, start with:
+
+```text
+bperf run
+```
+
+This scans `benchmarks/**/*.bench.ts`. Pass a directory to scan a different
+workspace subtree, use `/` to filter by benchmark ID or path, and press `enter`
+to supply the message before measurement starts. The picker reads only static
+literal metadata for its preview; normal browser preflight remains
+authoritative when the selected module runs. Pass an exact `.bench.ts` file
+for automation, redirected output, or `--json`.
+
 Measure the first source state once:
 
 ```text
@@ -34,11 +47,16 @@ With no promoted baseline, the outcome is `measured`. Check that correctness
 passed in every engine, then promote the cycle:
 
 ```text
-bperf accept <cycle-id>
+bperf accept
 ```
 
 Promotion appends a reference to the immutable measurement set. It does not
 rename, merge, or rewrite the evidence.
+
+Cycle commands select the latest local cycle by default. bperf prints short,
+unique cycle selectors when an explicit selection is useful; full immutable
+IDs remain available in JSON output. Pass `--data-dir <directory>` to relocate
+the complete `.bperf` data store.
 
 ## Measure one hypothesis
 
@@ -55,7 +73,7 @@ what changed or what work should disappear, not merely "optimize parser."
 Before promoting the result, verify the recorded source boundary:
 
 ```text
-bperf show <cycle-id> --diff
+bperf show --diff
 ```
 
 The main thing to avoid is selecting the one flattering browser or metric.
@@ -90,7 +108,7 @@ do. Compare a candidate with its baseline within the same engine.
 The compact output links to the persisted evidence. Start there, then open only
 what answers the current question.
 
-Read `comparison.json` when:
+Use the comparison section of `bperf show <cycle> --json` when:
 
 - the result is negative or inconclusive;
 - browsers disagree;
@@ -99,15 +117,16 @@ Read `comparison.json` when:
 - a confidence interval sits near a policy threshold;
 - the summary reports a warning.
 
-Read `sampling.json` and the candidate's `summary.json` when:
+Use the measurement and sampling sections of command `--json` output when:
 
 - measurement is incomplete or budget-limited;
 - a case was unexpectedly noisy;
 - pilot stopping or final trial counts affect the next step.
 
-Read `artifact-retention.json` before opening profiles. It identifies the final
-trial nearest the median CPU metric and the final trial nearest the median heap
-metric for each case and engine. Those may be different trials because they
+Use the selected cycle's artifact picker before opening profiles. Its retained
+artifact records identify the final trial nearest the median CPU metric and
+the final trial nearest the median heap metric for each case and engine. Those
+may be different trials because they
 represent different distributions. For a trial with dedicated-worker or OOPIF
 capture scopes, every CPU/flamegraph scope from the CPU representative and
 every heap scope from the heap representative is retained.
@@ -152,7 +171,7 @@ caller's worktree.
 Promote a candidate only when its engine-specific tradeoff is acceptable:
 
 ```text
-bperf accept <cycle-id>
+bperf accept
 ```
 
 Negative, equivalent, inconclusive, and reverted cycles remain in history. They
@@ -169,8 +188,8 @@ After five candidate cycles use the same baseline, `accept` requires a new
 measurement of the unchanged candidate:
 
 ```text
-bperf confirm <cycle-id> benchmarks/parser.bench.ts --budget 5m
-bperf accept <cycle-id>
+bperf confirm benchmarks/parser.bench.ts --budget 5m
+bperf accept
 ```
 
 Do not edit the benchmark or source between the original candidate and its
@@ -195,10 +214,27 @@ budget. Fix or stabilize the environment first.
 ## Inspect history
 
 ```text
-bperf history <benchmark-id>
-bperf history <benchmark-id> --format agent-context
-bperf show <cycle-id> --diff
+bperf history
+bperf history --format text
+bperf history --format agent-context
+bperf show --diff
 ```
+
+Bare `history` selects the benchmark with the latest run and opens the
+keyboard-driven TUI when attached to a terminal. Move between cycles with the
+arrow keys; filter by acceptance, verdict, lineage, benchmark, or date; change
+graph scope; and open retained artifacts from the selected cycle. Every engine
+keeps its own correctness, runtime-anchor, wall, CPU, and heap evidence.
+
+Use `--format text` for the compact case-grouped timeline. Redirected bare
+history also falls back to that text form so scripts and pipes never receive
+terminal control sequences. `--format json` and `--format agent-context` remain
+the complete machine-readable and agent-oriented forms. Use `show <cycle>` when
+you want the source delta or the non-interactive detail for one selection.
+
+Pass a benchmark ID to `history`, a cycle selector to `show` or `accept`, or a
+cycle selector after the benchmark path to `confirm` only when the latest work
+is not the intended target.
 
 History is independent of Git. It includes uncommitted and untracked project
 modules that were present in the measured graph. It does not record edits until
