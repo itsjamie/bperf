@@ -42,6 +42,7 @@ bperf doctor --engine all
 bperf run <benchmark.ts> --budget 5m --message <text>
 bperf history <benchmark-id> --format agent-context
 bperf show <cycle-id> --diff
+bperf show <cycle-id> --benchmark <benchmark-id>
 bperf confirm <benchmark.ts> <cycle-id> --budget 5m
 bperf accept <cycle-id>
 bperf baseline show <benchmark-id> --json
@@ -50,6 +51,11 @@ bperf baseline show <benchmark-id> --json
 `run` records a source-history cycle even when the candidate is negative,
 equivalent, or inconclusive. History is independent of Git and preserves the
 measured sequence of working-tree changes.
+
+`show` and `accept` default to the latest cycle across every measured
+benchmark; `--benchmark <benchmark-id>` scopes them to one benchmark's
+cycles. Their text output names the selected benchmark, and an unscoped
+`latest` in a multi-benchmark store prints a stderr notice.
 
 ## Reading evidence
 
@@ -79,6 +85,13 @@ retained profiles only when they can explain the result or choose the next
 hypothesis. Query the specific fields needed instead of printing a complete
 JSON document. `.bperf/bperf.sqlite3` is internal canonical state, not a direct
 inspection interface.
+
+`bperf show <cycle-id>` lists retained artifact paths grouped by engine, and
+`show --json` carries the same descriptors in `artifacts` (kind, engine,
+capture scope, path). Cycles recorded by older bperf versions may omit the
+field. `run`, `confirm`, and `show` JSON also carry `promotion_readiness`
+(`ready`, `confirmation_required`, `searched_candidates`, `search_threshold`)
+for branching between `accept` and `confirm` without provoking a refusal.
 
 ## Accepted-change commit template
 

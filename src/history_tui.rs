@@ -12,7 +12,7 @@ use bperf_decision::{
     comparison::{EngineSummary, MetricSummary},
     lineage::{
         HistoryArtifact, HistoryArtifactKind, HistoryCycle, HistoryCycleSummary, HistoryIndex,
-        HistoryOverview, HistoryReader,
+        HistoryOverview, HistoryReader, promotable_outcome,
     },
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1471,7 +1471,7 @@ fn render_promotion(frame: &mut Frame<'_>, area: Rect, cycle: &HistoryCycle) {
 
 fn promotion_lines(cycle: &HistoryCycle) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let promotable = !matches!(cycle.outcome.as_str(), "negative" | "inconclusive");
+    let promotable = promotable_outcome(&cycle.outcome);
     let ready = cycle.promotion.ready && promotable;
     let readiness = if ready {
         "ready"
@@ -1534,7 +1534,11 @@ fn promotion_lines(cycle: &HistoryCycle) -> Vec<Line<'static>> {
         format!("bperf accept {}", bare_cycle_selector(&cycle.selector))
     } else if cycle.promotion.confirmation_required && promotable {
         format!(
-            "bperf confirm <benchmark.bench.ts> {}",
+            "bperf confirm {} {}",
+            cycle
+                .benchmark_module
+                .as_deref()
+                .unwrap_or("<benchmark.bench.ts>"),
             bare_cycle_selector(&cycle.selector)
         )
     } else {
@@ -2260,6 +2264,7 @@ mod tests {
             accepted: true,
             current_baseline: true,
             candidate_measurement_set: "measure-baseline".to_owned(),
+            benchmark_module: Some("benchmarks/parser.bench.ts".to_owned()),
             variant_id: "parser-main".to_owned(),
             case_ids: vec!["representative-fragment".to_owned()],
             environment: environment(now),
@@ -2291,6 +2296,7 @@ mod tests {
             accepted: false,
             current_baseline: false,
             candidate_measurement_set: "measure-candidate".to_owned(),
+            benchmark_module: Some("benchmarks/parser.bench.ts".to_owned()),
             variant_id: "parser-main".to_owned(),
             case_ids: vec!["representative-fragment".to_owned()],
             environment: environment(now),
@@ -2386,6 +2392,7 @@ mod tests {
             accepted: cycle.accepted,
             current_baseline: cycle.current_baseline,
             candidate_measurement_set: cycle.candidate_measurement_set.clone(),
+            benchmark_module: cycle.benchmark_module.clone(),
             comparison: cycle.comparison.clone(),
             promotion: cycle.promotion.clone(),
         }

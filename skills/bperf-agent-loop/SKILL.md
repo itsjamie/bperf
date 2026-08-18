@@ -50,17 +50,24 @@ Repeat this loop:
 5. Inspect the compact stdout summary: overall verdict, every engine's
    correctness and anchor, and every primary metric's classification, effect,
    baseline-to-candidate values, and confidence interval. Never pool or average
-   measurements across browsers.
+   measurements across browsers. The summary ends with the next command: a
+   `promote:` line when `accept` will succeed, or a `confirm:` line when
+   independent confirmation is required first. Run that command verbatim.
 6. Use `bperf show <cycle-id> --diff` to verify the recorded source change.
 7. For a positive candidate, inspect representative CPU/flamegraph and heap
-   evidence where it explains the result. Accept only when the per-engine
-   tradeoff matches the optimization goal.
+   evidence where it explains the result. `bperf show <cycle-id>` lists the
+   retained artifact paths grouped by engine; open only the artifact that
+   answers the current question. Accept only when the per-engine tradeoff
+   matches the optimization goal.
 8. For a negative or inconclusive candidate, keep the recorded cycle, learn
    from it, and make the next hypothesis. Treat an equivalent candidate the
    same way unless it is an intentional tradeoff with another concrete benefit.
    Do not promote a result merely because one engine improved.
 
-If `accept` requests independent evidence:
+When independent evidence is required, `run` and `show` print the exact
+`confirm` command, including the recorded benchmark module, and `--json`
+output carries the same state in a `promotion_readiness` field. Check
+readiness there instead of discovering it from a failed `accept`:
 
 ```text
 bperf confirm <benchmark.ts> <cycle-id> --budget <duration>
@@ -68,6 +75,11 @@ bperf accept <cycle-id>
 ```
 
 Do not edit the source between the candidate and its confirmation.
+
+With more than one measured benchmark in the same data store, an unscoped
+`latest` resolves across all of them; `show` and `accept` print a stderr
+notice naming the benchmark they selected. Pass `--benchmark <benchmark-id>`
+to `show` and `accept`, or use the explicit cycle selector printed by `run`.
 
 ## Commit an accepted change
 
@@ -115,11 +127,12 @@ that. Use two spaces only to group metric rows under an engine heading.
 - Use command `--json` measurement and sampling fields when evidence is
   incomplete, budget-limited, insufficient, unexpectedly noisy, or when trial
   counts and pilot stopping behavior affect the next step.
-- Use the history artifact picker, then only the selected CPU/flamegraph or
-  heap artifacts it names, when a representative profile could explain a
-  result, distinguish competing hypotheses, or validate an important
-  engine-specific tradeoff before promotion. Do not open profiles merely to
-  restate a clear statistical verdict.
+- Use the artifact paths listed by `bperf show <cycle-id>` (or its `--json`
+  `artifacts` field), then only the CPU/flamegraph or heap artifact that could
+  explain a result, distinguish competing hypotheses, or validate an important
+  engine-specific tradeoff before promotion. Paths are listed as recorded;
+  retention may have removed a file. Do not open profiles merely to restate a
+  clear statistical verdict.
 - Use `bperf show <cycle-id> --diff` before promotion. Add `--json` only when a
   structured field not present in the compact output is required, and select
   that field rather than returning the whole document.

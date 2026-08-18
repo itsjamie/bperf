@@ -58,6 +58,12 @@ unique cycle selectors when an explicit selection is useful; full immutable
 IDs remain available in JSON output. Pass `--data-dir <directory>` to relocate
 the complete `.bperf` data store.
 
+With more than one measured benchmark in the same data store, an unscoped
+`latest` resolves across all of them and `show` and `accept` print a stderr
+notice naming the benchmark it selected. Pass `--benchmark <id>` to scope
+`show` or `accept` to one benchmark's cycles. `confirm` scopes `latest` to the
+benchmark module it was given.
+
 ## Measure one hypothesis
 
 Make one source change whose expected effect can be stated plainly, run focused
@@ -107,6 +113,12 @@ do. Compare a candidate with its baseline within the same engine.
 
 The compact output links to the persisted evidence. Start there, then open only
 what answers the current question.
+
+`bperf show` lists the cycle's retained CPU-profile, flamegraph, and heap
+artifact paths grouped by engine, and `show --json` carries the same
+descriptors in an `artifacts` field, so scripts and agents can reach one
+profile without the interactive history view. Paths are listed as recorded;
+artifacts trimmed by retention may no longer exist on disk.
 
 Use the comparison section of `bperf show <cycle> --json` when:
 
@@ -185,7 +197,10 @@ not delete the failed cycle or overwrite its evidence.
 
 Repeatedly testing candidates against one baseline introduces selection risk.
 After five candidate cycles use the same baseline, `accept` requires a new
-measurement of the unchanged candidate:
+measurement of the unchanged candidate. `run` and `show` print the exact
+`confirm` command, including the recorded benchmark module, as the next step
+when this applies, and `--json` output carries the same state in a
+`promotion_readiness` field:
 
 ```text
 bperf confirm benchmarks/parser.bench.ts --budget 5m

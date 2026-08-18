@@ -114,6 +114,20 @@ fn cycle_commands_default_to_the_latest_work() {
 }
 
 #[test]
+fn show_and_accept_document_benchmark_scoping() {
+    for command in ["show", "accept"] {
+        let output = bperf().args([command, "--help"]).output().unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.contains("--benchmark <ID>"), "{command} help:\n{help}");
+        assert!(
+            help.contains("Restrict cycle selection to one benchmark stream"),
+            "{command} help:\n{help}"
+        );
+    }
+}
+
+#[test]
 fn one_data_directory_relocates_measurement_state() {
     let temporary = tempdir().unwrap();
     let data = temporary.path().join("bperf-data");
