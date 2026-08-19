@@ -35,11 +35,20 @@ pub struct RecordRunOptions {
     pub workspace_root: PathBuf,
     pub source_files: Vec<PathBuf>,
     pub measurement_root: PathBuf,
+    /// Benchmark module path as invoked; recorded workspace-relative.
+    pub benchmark_module: PathBuf,
     pub message: Option<String>,
     pub comparison: Option<ComparisonSummary>,
 }
 
-pub fn record_run(options: RecordRunOptions) -> Result<CycleRecord> {
+/// A recorded cycle together with its promotion readiness, computed from the
+/// lineage state that includes the new cycle.
+pub struct RecordedRun {
+    pub cycle: CycleRecord,
+    pub readiness: PromotionReadiness,
+}
+
+pub fn record_run(options: RecordRunOptions) -> Result<RecordedRun> {
     let measurement = MeasurementSet::open(&options.measurement_root)?;
     let environment_fingerprint = complete_environment(&measurement)?;
     if let Some(comparison) = &options.comparison {
@@ -47,6 +56,8 @@ pub fn record_run(options: RecordRunOptions) -> Result<CycleRecord> {
     }
 
     let store = LineageStore::open(&options.root)?;
+    let benchmark_module =
+        workspace_relative_module(&options.workspace_root, &options.benchmark_module)?;
     let state = capture_measured_state(
         &store,
         &options.workspace_root,
@@ -63,7 +74,7 @@ pub fn record_run(options: RecordRunOptions) -> Result<CycleRecord> {
         environment: environment::summary(&measurement)?,
         artifacts: retained_history_artifacts(&measurement),
     };
-    store.append_cycle_with_evidence(
+    let cycle = store.append_cycle_with_evidence(
         NewCycle {
             benchmark_id: measurement.benchmark_id().to_owned(),
             subject_id: measurement.subject_id().to_owned(),
@@ -74,9 +85,32 @@ pub fn record_run(options: RecordRunOptions) -> Result<CycleRecord> {
             source_after: state,
             message: normalize_message(options.message)?,
             comparison: options.comparison,
+            benchmark_module: Some(benchmark_module),
         },
         Some(evidence),
-    )
+    )?;
+    let events = store.read_events(&cycle.benchmark_id)?;
+    let readiness = promotion_readiness(&cycle, &events);
+    Ok(RecordedRun { cycle, readiness })
+}
+
+fn workspace_relative_module(workspace_root: &Path, module: &Path) -> Result<String> {
+    let workspace_root = fs::canonicalize(workspace_root).with_context(|| {
+        format!(
+            "failed to resolve lineage workspace {}",
+            workspace_root.display()
+        )
+    })?;
+    let module = fs::canonicalize(module)
+        .with_context(|| format!("failed to resolve benchmark module {}", module.display()))?;
+    let relative = module.strip_prefix(&workspace_root).with_context(|| {
+        format!(
+            "benchmark module {} is outside workspace {}",
+            module.display(),
+            workspace_root.display()
+        )
+    })?;
+    portable_path(relative)
 }
 
 pub struct ConfirmationTarget {
@@ -104,9 +138,13 @@ impl ConfirmationTarget {
     }
 }
 
-pub fn confirmation_target(root: &Path, cycle_id: &str) -> Result<ConfirmationTarget> {
+pub fn confirmation_target(
+    root: &Path,
+    cycle_id: &str,
+    benchmark_id: Option<&str>,
+) -> Result<ConfirmationTarget> {
     let store = LineageStore::load(root)?;
-    let (cycle, _, _) = store.find_cycle(cycle_id)?;
+    let (cycle, _, _) = store.find_cycle(cycle_id, benchmark_id)?;
     let baseline_measurement_set = cycle
         .baseline_measurement_set
         .clone()
@@ -128,14 +166,22 @@ pub struct RecordConfirmationOptions {
     pub comparison: ComparisonSummary,
 }
 
-pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<ConfirmationRecord> {
+/// A recorded confirmation together with the confirmed cycle and its
+/// promotion readiness after the confirmation was appended.
+pub struct RecordedConfirmation {
+    pub cycle: CycleRecord,
+    pub confirmation: ConfirmationRecord,
+    pub readiness: PromotionReadiness,
+}
+
+pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<RecordedConfirmation> {
     require_cycle_id(&options.cycle_id)?;
     let measurement = MeasurementSet::open(&options.measurement_root)?;
     let environment_fingerprint = complete_environment(&measurement)?;
     validate_comparison(&measurement, &options.comparison)?;
 
     let store = LineageStore::open(&options.root)?;
-    let (cycle, _, _) = store.find_cycle(&options.cycle_id)?;
+    let (cycle, _, _) = store.find_cycle(&options.cycle_id, None)?;
     let original = MeasurementSet::open(Path::new(&cycle.candidate_measurement_path))?;
     if original.benchmark_sha256() != measurement.benchmark_sha256()
         || original.variant_sha256() != measurement.variant_sha256()
@@ -158,13 +204,20 @@ pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<Confirm
     if state.state_id != cycle.source_after {
         bail!("current source state does not match the selected optimization cycle");
     }
-    store.append_confirmation(
+    let confirmation = store.append_confirmation(
         &cycle,
         measurement.measurement_set_id(),
         measurement.root(),
         environment_fingerprint,
         options.comparison,
-    )
+    )?;
+    let events = store.read_events(&cycle.benchmark_id)?;
+    let readiness = promotion_readiness(&cycle, &events);
+    Ok(RecordedConfirmation {
+        cycle,
+        confirmation,
+        readiness,
+    })
 }
 
 fn complete_environment(measurement: &MeasurementSet) -> Result<&str> {
@@ -274,6 +327,7 @@ pub struct HistoryCycleSummary {
     pub accepted: bool,
     pub current_baseline: bool,
     pub candidate_measurement_set: String,
+    pub benchmark_module: Option<String>,
     pub comparison: Option<ComparisonSummary>,
     pub promotion: HistoryPromotionSummary,
 }
@@ -314,6 +368,7 @@ pub struct HistoryCycle {
     pub accepted: bool,
     pub current_baseline: bool,
     pub candidate_measurement_set: String,
+    pub benchmark_module: Option<String>,
     pub variant_id: String,
     pub case_ids: Vec<String>,
     pub environment: EnvironmentSummary,
@@ -348,6 +403,18 @@ pub enum HistoryArtifactKind {
     HeapSnapshot,
     Comparison,
     Sampling,
+}
+
+impl HistoryArtifactKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CpuProfile => "cpu_profile",
+            Self::Flamegraph => "flamegraph",
+            Self::HeapSnapshot => "heap_snapshot",
+            Self::Comparison => "comparison",
+            Self::Sampling => "sampling",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -475,6 +542,7 @@ pub fn history(options: HistoryOptions) -> Result<()> {
 
 pub struct ShowOptions {
     pub cycle_id: String,
+    pub benchmark_id: Option<String>,
     pub root: PathBuf,
     pub diff: bool,
     pub json: bool,
@@ -482,9 +550,20 @@ pub struct ShowOptions {
 
 pub fn show(options: ShowOptions) -> Result<()> {
     let store = LineageStore::load(&options.root)?;
-    let (cycle, promotions, confirmations) = store.find_cycle(&options.cycle_id)?;
+    let (cycle, promotions, confirmations) =
+        store.find_cycle(&options.cycle_id, options.benchmark_id.as_deref())?;
+    if options.benchmark_id.is_none()
+        && cycle_selector_prefix(&options.cycle_id)?.is_none()
+        && let Some(notice) = store.crossover_notice(&cycle.benchmark_id)?
+    {
+        eprintln!("{notice}");
+    }
     let events = store.read_events(&cycle.benchmark_id)?;
     let promotion_readiness = promotion_readiness(&cycle, &events);
+    let reader = store.database.reader()?;
+    let artifacts = store
+        .read_cycle_evidence(&reader, &cycle.cycle_id)?
+        .map(|evidence| evidence.artifacts);
     let diff = options
         .diff
         .then(|| store.render_change(&cycle.change_id))
@@ -502,6 +581,7 @@ pub fn show(options: ShowOptions) -> Result<()> {
                 promotions: &promotions,
                 confirmations: &confirmations,
                 promotion_readiness: &promotion_readiness,
+                artifacts: artifacts.as_deref(),
                 change,
                 diff,
             })?
@@ -531,17 +611,13 @@ pub fn show(options: ShowOptions) -> Result<()> {
                 confirmation.outcome
             )?;
         }
+        if let Some(artifacts) = &artifacts {
+            print!("{}", render_artifacts(artifacts));
+        }
         if promotions.is_empty()
-            && matches!(cycle.outcome(), "measured" | "positive" | "equivalent")
+            && let Some(next) = cycle.next_command(&promotion_readiness)
         {
-            if promotion_readiness.ready {
-                println!("  next: bperf accept {}", cycle.selector());
-            } else {
-                println!(
-                    "  next: bperf confirm <benchmark.bench.ts> {}",
-                    cycle.selector()
-                );
-            }
+            println!("  next: {next}");
         }
         if let Some(diff) = diff {
             print!("{diff}");
@@ -552,13 +628,20 @@ pub fn show(options: ShowOptions) -> Result<()> {
 
 pub struct AcceptOptions {
     pub cycle_id: String,
+    pub benchmark_id: Option<String>,
     pub root: PathBuf,
     pub registry_root: PathBuf,
 }
 
 pub fn accept(options: AcceptOptions) -> Result<AcceptOutcome> {
     let store = LineageStore::load(&options.root)?;
-    let (cycle, _, _) = store.find_cycle(&options.cycle_id)?;
+    let (cycle, _, _) = store.find_cycle(&options.cycle_id, options.benchmark_id.as_deref())?;
+    if options.benchmark_id.is_none()
+        && cycle_selector_prefix(&options.cycle_id)?.is_none()
+        && let Some(notice) = store.crossover_notice(&cycle.benchmark_id)?
+    {
+        eprintln!("{notice}");
+    }
     let events = store.read_events(&cycle.benchmark_id)?;
     require_promotion_confirmation(&cycle, &events)?;
     let pending = baseline::prepare_measurement(Path::new(&cycle.candidate_measurement_path))?;
@@ -603,13 +686,20 @@ impl AcceptOutcome {
                 })?
             );
         } else {
-            println!("bperf accept: {}", self.cycle.selector());
-            println!(
-                "  baseline measurement set: {}",
-                self.baseline.measurement_set_id()
-            );
+            print!("{}", self.render_text());
         }
         Ok(())
+    }
+
+    fn render_text(&self) -> String {
+        let mut output = format!("bperf accept: {}\n", self.cycle.selector());
+        let _ = writeln!(output, "  benchmark: {}", self.cycle.benchmark_id);
+        let _ = writeln!(
+            output,
+            "  baseline measurement set: {}",
+            self.baseline.measurement_set_id()
+        );
+        output
     }
 }
 
@@ -633,6 +723,16 @@ pub struct CycleRecord {
     environment_fingerprint: String,
     outcome: String,
     comparison: Option<ComparisonSummary>,
+    /// Workspace-relative portable path of the measured benchmark module,
+    /// e.g. `benchmarks/parser.bench.ts`. Absent in records written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    benchmark_module: Option<String>,
+}
+
+/// Outcomes that may be promoted to a baseline.
+pub fn promotable_outcome(outcome: &str) -> bool {
+    matches!(outcome, "measured" | "positive" | "equivalent")
 }
 
 impl CycleRecord {
@@ -650,6 +750,42 @@ impl CycleRecord {
 
     pub fn outcome(&self) -> &str {
         &self.outcome
+    }
+
+    pub fn benchmark_module(&self) -> Option<&str> {
+        self.benchmark_module.as_deref()
+    }
+
+    pub fn promotable(&self) -> bool {
+        promotable_outcome(&self.outcome)
+    }
+
+    pub fn accept_command(&self) -> String {
+        format!("bperf accept {}", self.selector())
+    }
+
+    /// Records without a stored module path fall back to a
+    /// `<benchmark.bench.ts>` placeholder the caller must substitute.
+    pub fn confirm_command(&self) -> String {
+        format!(
+            "bperf confirm {} {}",
+            self.benchmark_module
+                .as_deref()
+                .unwrap_or("<benchmark.bench.ts>"),
+            self.selector()
+        )
+    }
+
+    /// The command that advances this cycle toward promotion, or `None` when
+    /// the outcome is not promotable.
+    pub fn next_command(&self, readiness: &PromotionReadiness) -> Option<String> {
+        self.promotable().then(|| {
+            if readiness.ready {
+                self.accept_command()
+            } else {
+                self.confirm_command()
+            }
+        })
     }
 }
 
@@ -761,6 +897,7 @@ struct NewCycle {
     source_after: SourceState,
     message: Option<String>,
     comparison: Option<ComparisonSummary>,
+    benchmark_module: Option<String>,
 }
 
 struct NewCycleEvidence {
@@ -949,6 +1086,7 @@ impl LineageStore {
             environment_fingerprint: cycle.environment_fingerprint,
             outcome,
             comparison: cycle.comparison,
+            benchmark_module: cycle.benchmark_module,
         };
         let event = LineageEvent::Cycle(Box::new(record.clone()));
         if let Some(evidence) = evidence {
@@ -1172,11 +1310,19 @@ impl LineageStore {
     fn find_cycle(
         &self,
         selector: &str,
+        benchmark_id: Option<&str>,
     ) -> Result<(CycleRecord, Vec<PromotionRecord>, Vec<ConfirmationRecord>)> {
         let prefix = cycle_selector_prefix(selector)?;
+        let streams = match benchmark_id {
+            Some(benchmark_id) => {
+                require_identifier("benchmark", benchmark_id)?;
+                vec![benchmark_id.to_owned()]
+            }
+            None => self.database.streams(LINEAGE_EVENTS)?,
+        };
         let mut matches = Vec::new();
-        for benchmark_id in self.database.streams(LINEAGE_EVENTS)? {
-            let events = self.read_events(&benchmark_id)?;
+        for stream in &streams {
+            let events = self.read_events(stream)?;
             for cycle in events.iter().filter_map(|event| match event {
                 LineageEvent::Cycle(record) => Some(record.as_ref()),
                 LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
@@ -1203,9 +1349,15 @@ impl LineageStore {
                 )?
         } else {
             match matches.len() {
-                0 => bail!(
-                    "no optimization cycle matches {selector:?}; run `bperf history` to list cycles"
-                ),
+                0 => match benchmark_id {
+                    Some(benchmark_id) => bail!(
+                        "no optimization cycle matches {selector:?} for benchmark \
+                         {benchmark_id:?}; run `bperf history {benchmark_id}` to list cycles"
+                    ),
+                    None => bail!(
+                        "no optimization cycle matches {selector:?}; run `bperf history` to list cycles"
+                    ),
+                },
                 1 => matches.pop().expect("one cycle selector match"),
                 _ => {
                     let choices = matches
@@ -1242,7 +1394,15 @@ impl LineageStore {
     }
 
     fn latest_benchmark_id(&self) -> Result<String> {
-        Ok(self.find_cycle("latest")?.0.benchmark_id)
+        Ok(self.find_cycle("latest", None)?.0.benchmark_id)
+    }
+
+    /// A stderr notice for commands that resolved an unscoped `latest` in a
+    /// store holding more than one benchmark stream. `None` when the store
+    /// has a single stream and the resolution cannot surprise.
+    fn crossover_notice(&self, resolved: &str) -> Result<Option<String>> {
+        let benchmarks = self.database.streams(LINEAGE_EVENTS)?;
+        Ok(crossover_notice(resolved, &benchmarks))
     }
 
     fn history_index(&self, reader: &DatabaseReader) -> Result<HistoryIndex> {
@@ -1389,6 +1549,7 @@ impl LineageStore {
                 current_baseline: timeline.current_baseline_cycle.as_deref()
                     == Some(cycle.cycle_id.as_str()),
                 candidate_measurement_set: cycle.candidate_measurement_set.clone(),
+                benchmark_module: cycle.benchmark_module.clone(),
                 comparison: cycle.comparison.clone(),
                 promotion: HistoryPromotionSummary {
                     ready: readiness.ready,
@@ -1443,25 +1604,41 @@ impl LineageStore {
         })
     }
 
+    /// Reads one cycle's persisted evidence document. `None` means the cycle
+    /// predates evidence persistence; an incompatible schema or mismatched
+    /// identity is an error.
+    fn read_cycle_evidence(
+        &self,
+        reader: &DatabaseReader,
+        cycle_id: &str,
+    ) -> Result<Option<StoredCycleEvidence>> {
+        let Some(stored) =
+            reader.read_document::<StoredCycleEvidence>(HISTORY_EVIDENCE, cycle_id)?
+        else {
+            return Ok(None);
+        };
+        if stored.schema_version != SCHEMA_VERSION || stored.cycle_id != cycle_id {
+            bail!(
+                "history evidence for {} has incompatible identity",
+                short_id(cycle_id)
+            );
+        }
+        Ok(Some(stored))
+    }
+
     fn load_history_cycle(
         &self,
         reader: &DatabaseReader,
         summary: HistoryCycleSummary,
     ) -> Result<HistoryCycle> {
-        let stored: StoredCycleEvidence = reader
-            .read_document(HISTORY_EVIDENCE, &summary.cycle_id)?
+        let stored = self
+            .read_cycle_evidence(reader, &summary.cycle_id)?
             .with_context(|| {
                 format!(
                     "cycle {} has no persisted history evidence",
                     summary.selector
                 )
             })?;
-        if stored.schema_version != SCHEMA_VERSION || stored.cycle_id != summary.cycle_id {
-            bail!(
-                "history evidence for {} has incompatible identity",
-                summary.selector
-            );
-        }
         let StoredCycleEvidence {
             schema_version: _,
             cycle_id: _,
@@ -1483,6 +1660,7 @@ impl LineageStore {
             accepted,
             current_baseline,
             candidate_measurement_set,
+            benchmark_module,
             comparison,
             promotion,
         } = summary;
@@ -1498,6 +1676,7 @@ impl LineageStore {
             accepted,
             current_baseline,
             candidate_measurement_set,
+            benchmark_module,
             variant_id,
             case_ids,
             environment,
@@ -1973,6 +2152,9 @@ fn validate_events(
                 }
                 require_hash_id("source state", &cycle.source_after, "state-")?;
                 require_hash_id("source change", &cycle.change_id, "change-")?;
+                if let Some(module) = &cycle.benchmark_module {
+                    require_portable_file_path(module)?;
+                }
                 if cycle.previous_cycle_id.as_deref() != last_cycle.as_deref() {
                     bail!(
                         "optimization history {} has a broken cycle chain",
@@ -2094,11 +2276,11 @@ fn require_promotion_confirmation(cycle: &CycleRecord, events: &[LineageEvent]) 
         .as_deref()
         .context("confirmation requirement has no baseline")?;
     bail!(
-        "cycle {} needs a fresh confirmation after {} candidates were searched against baseline {}; run `bperf confirm <benchmark.bench.ts> {}`",
+        "cycle {} needs a fresh confirmation after {} candidates were searched against baseline {}; run `{}`",
         cycle.selector(),
         readiness.searched_candidates,
         baseline_measurement_set,
-        cycle.selector()
+        cycle.confirm_command()
     );
 }
 
@@ -2270,6 +2452,27 @@ fn require_cycle_id(value: &str) -> Result<()> {
     require_hash_id("optimization cycle", value, "cycle-")
 }
 
+/// Validates a cycle selector's syntax without resolving it against a store.
+pub fn validate_cycle_selector(selector: &str) -> Result<()> {
+    cycle_selector_prefix(selector).map(|_| ())
+}
+
+fn crossover_notice(resolved: &str, benchmarks: &[String]) -> Option<String> {
+    let others = benchmarks
+        .iter()
+        .map(String::as_str)
+        .filter(|benchmark| *benchmark != resolved)
+        .collect::<Vec<_>>();
+    if others.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "note: latest resolved to benchmark {resolved:?}; other measured benchmarks: {} \
+         (scope with --benchmark)",
+        others.join(", ")
+    ))
+}
+
 fn cycle_selector_prefix(value: &str) -> Result<Option<String>> {
     if value == "latest" {
         return Ok(None);
@@ -2325,10 +2528,55 @@ fn render_cycle(cycle: &CycleRecord) -> String {
 
 fn render_cycle_heading(cycle: &CycleRecord) -> String {
     let mut output = format!("{}: {}\n", cycle.selector(), cycle.outcome);
+    let _ = writeln!(output, "  benchmark: {}", cycle.benchmark_id);
     if let Some(message) = &cycle.message {
         let _ = writeln!(output, "  hypothesis: {message}");
     }
     output
+}
+
+/// Renders retained artifact descriptors grouped by engine. Every engine
+/// appears even when it retained nothing; paths are listed as recorded and
+/// never checked for existence.
+fn render_artifacts(artifacts: &[HistoryArtifact]) -> String {
+    if artifacts.is_empty() {
+        return "  artifacts: (none retained)\n".to_owned();
+    }
+    let mut output = String::from("  artifacts:\n");
+    for engine in Engine::ALL {
+        let retained = artifacts
+            .iter()
+            .filter(|artifact| artifact.engine == Some(engine))
+            .collect::<Vec<_>>();
+        if retained.is_empty() {
+            let _ = writeln!(output, "    {engine}: (none)");
+            continue;
+        }
+        let _ = writeln!(output, "    {engine}:");
+        for artifact in retained {
+            let _ = writeln!(output, "{}", render_artifact_line(artifact));
+        }
+    }
+    let shared = artifacts
+        .iter()
+        .filter(|artifact| artifact.engine.is_none())
+        .collect::<Vec<_>>();
+    if !shared.is_empty() {
+        output.push_str("    shared:\n");
+        for artifact in shared {
+            let _ = writeln!(output, "{}", render_artifact_line(artifact));
+        }
+    }
+    output
+}
+
+fn render_artifact_line(artifact: &HistoryArtifact) -> String {
+    let mut line = format!("      {}", artifact.kind.label());
+    if let Some(scope) = &artifact.capture_scope {
+        let _ = write!(line, " {scope}");
+    }
+    let _ = write!(line, ": {}", artifact.path.display());
+    line
 }
 
 fn render_engine_results(cycle: &CycleRecord) -> String {
@@ -2421,17 +2669,19 @@ struct ShowReport<'a> {
     confirmations: &'a [ConfirmationRecord],
     promotion_readiness: &'a PromotionReadiness,
     #[serde(skip_serializing_if = "Option::is_none")]
+    artifacts: Option<&'a [HistoryArtifact]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     change: Option<SourceChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<String>,
 }
 
-#[derive(Serialize)]
-struct PromotionReadiness {
-    confirmation_required: bool,
-    ready: bool,
-    searched_candidates: usize,
-    search_threshold: usize,
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PromotionReadiness {
+    pub confirmation_required: bool,
+    pub ready: bool,
+    pub searched_candidates: usize,
+    pub search_threshold: usize,
 }
 
 #[derive(Serialize)]
@@ -2461,6 +2711,7 @@ mod tests {
             source_after: state,
             message: Some(format!("measure {measurement}")),
             comparison: None,
+            benchmark_module: None,
         }
     }
 
@@ -2709,6 +2960,7 @@ mod tests {
                         environment_fingerprint: "environment".to_owned(),
                         outcome: "measured".to_owned(),
                         comparison: None,
+                        benchmark_module: None,
                     };
                     let evidence = StoredCycleEvidence {
                         schema_version: SCHEMA_VERSION,
@@ -2840,10 +3092,10 @@ mod tests {
             .append_cycle(cycle(second_state, "measure-2"))
             .unwrap();
 
-        let by_prefix = store.find_cycle(second.selector()).unwrap().0;
+        let by_prefix = store.find_cycle(second.selector(), None).unwrap().0;
         assert_eq!(by_prefix.cycle_id(), second.cycle_id());
         let bare_prefix = second.selector().strip_prefix("cycle-").unwrap();
-        let by_bare_prefix = store.find_cycle(bare_prefix).unwrap().0;
+        let by_bare_prefix = store.find_cycle(bare_prefix, None).unwrap().0;
         assert_eq!(by_bare_prefix.cycle_id(), second.cycle_id());
 
         let expected_latest = [&first, &second]
@@ -2854,11 +3106,11 @@ mod tests {
                     .then_with(|| left.cycle_id.cmp(&right.cycle_id))
             })
             .unwrap();
-        let latest = store.find_cycle("latest").unwrap().0;
+        let latest = store.find_cycle("latest", None).unwrap().0;
         assert_eq!(latest.cycle_id(), expected_latest.cycle_id());
         assert_eq!(store.latest_benchmark_id().unwrap(), "parser");
 
-        let error = store.find_cycle("cycle-nope").unwrap_err();
+        let error = store.find_cycle("cycle-nope", None).unwrap_err();
         assert!(error.to_string().contains("at least 8 hexadecimal"));
     }
 
@@ -2986,6 +3238,14 @@ mod tests {
         let events = store.read_events("parser").unwrap();
         let error = require_promotion_confirmation(&selected, &events).unwrap_err();
         assert!(error.to_string().contains("needs a fresh confirmation"));
+        let readiness = promotion_readiness(&selected, &events);
+        assert!(readiness.confirmation_required);
+        assert!(!readiness.ready);
+        assert_eq!(
+            readiness.searched_candidates,
+            PROMOTION_CONFIRMATION_SEARCHES
+        );
+        assert_eq!(readiness.search_threshold, PROMOTION_CONFIRMATION_SEARCHES);
 
         store
             .append_confirmation(
@@ -2998,5 +3258,387 @@ mod tests {
             .unwrap();
         let events = store.read_events("parser").unwrap();
         require_promotion_confirmation(&selected, &events).unwrap();
+        let readiness = promotion_readiness(&selected, &events);
+        assert!(readiness.confirmation_required);
+        assert!(readiness.ready);
+    }
+
+    fn module_cycle(state: SourceState, measurement: &str) -> NewCycle {
+        NewCycle {
+            benchmark_module: Some("benchmarks/parser.bench.ts".to_owned()),
+            ..cycle(state, measurement)
+        }
+    }
+
+    fn stream_cycle(benchmark_id: &str, state: SourceState, measurement: &str) -> NewCycle {
+        NewCycle {
+            benchmark_id: benchmark_id.to_owned(),
+            subject_id: benchmark_id.to_owned(),
+            ..cycle(state, measurement)
+        }
+    }
+
+    #[test]
+    fn latest_and_prefixes_scope_to_one_benchmark_stream() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let parser_source = workspace.join("parser.ts");
+        let encoder_source = workspace.join("encoder.ts");
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+
+        fs::write(&parser_source, "export const value = 1;\n").unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&parser_source))
+            .unwrap();
+        let parser_first = store
+            .append_cycle(stream_cycle("parser", state, "measure-parser-1"))
+            .unwrap();
+        fs::write(&parser_source, "export const value = 2;\n").unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&parser_source))
+            .unwrap();
+        let parser_second = store
+            .append_cycle(stream_cycle("parser", state, "measure-parser-2"))
+            .unwrap();
+        fs::write(&encoder_source, "export const value = 3;\n").unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&encoder_source))
+            .unwrap();
+        let encoder = store
+            .append_cycle(stream_cycle("encoder", state, "measure-encoder-1"))
+            .unwrap();
+
+        let expected_parser_latest = [&parser_first, &parser_second]
+            .into_iter()
+            .max_by(|left, right| {
+                left.recorded_at_unix_ms
+                    .cmp(&right.recorded_at_unix_ms)
+                    .then_with(|| left.cycle_id.cmp(&right.cycle_id))
+            })
+            .unwrap();
+        let scoped_latest = store.find_cycle("latest", Some("parser")).unwrap().0;
+        assert_eq!(scoped_latest.cycle_id(), expected_parser_latest.cycle_id());
+        assert_eq!(scoped_latest.benchmark_id, "parser");
+        let encoder_latest = store.find_cycle("latest", Some("encoder")).unwrap().0;
+        assert_eq!(encoder_latest.cycle_id(), encoder.cycle_id());
+
+        let error = store
+            .find_cycle(parser_second.selector(), Some("encoder"))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("for benchmark \"encoder\""),
+            "unexpected error: {error}"
+        );
+        let error = store.find_cycle("latest", Some("tokenizer")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no optimization history for benchmark"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn crossover_notice_names_other_benchmark_streams() {
+        let streams = ["encoder", "parser", "tokenizer"]
+            .map(str::to_owned)
+            .to_vec();
+        let notice = crossover_notice("parser", &streams).unwrap();
+        assert!(notice.contains("latest resolved to benchmark \"parser\""));
+        assert!(notice.contains("encoder, tokenizer"));
+        assert!(notice.contains("--benchmark"));
+        assert_eq!(crossover_notice("parser", &["parser".to_owned()]), None);
+    }
+
+    #[test]
+    fn render_cycle_heading_names_the_benchmark() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let record = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let heading = render_cycle_heading(&record);
+        let lines = heading.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], format!("{}: measured", record.selector()));
+        assert_eq!(lines[1], "  benchmark: parser");
+        assert_eq!(lines[2], "  hypothesis: measure measure-1");
+    }
+
+    #[test]
+    fn cycle_records_without_benchmark_module_still_load_and_fall_back() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let record = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(
+            !serialized.contains("benchmark_module"),
+            "an absent module must serialize exactly like a pre-field record"
+        );
+        let loaded = store.find_cycle(record.selector(), None).unwrap().0;
+        assert_eq!(loaded.benchmark_module(), None);
+        assert_eq!(
+            loaded.confirm_command(),
+            format!("bperf confirm <benchmark.bench.ts> {}", loaded.selector())
+        );
+    }
+
+    #[test]
+    fn recorded_benchmark_module_produces_copy_pasteable_hints() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+
+        let mut selected = None;
+        for index in 1..=PROMOTION_CONFIRMATION_SEARCHES {
+            fs::write(&source, format!("export const value = {index};\n")).unwrap();
+            let state = store
+                .capture_state(&workspace, std::slice::from_ref(&source))
+                .unwrap();
+            let record = store
+                .append_cycle(NewCycle {
+                    comparison: Some(comparison(&format!("measure-{index}"), "positive")),
+                    ..module_cycle(state, &format!("measure-{index}"))
+                })
+                .unwrap();
+            selected = Some(record);
+        }
+        let selected = selected.unwrap();
+        assert_eq!(
+            selected.confirm_command(),
+            format!(
+                "bperf confirm benchmarks/parser.bench.ts {}",
+                selected.selector()
+            )
+        );
+
+        let events = store.read_events("parser").unwrap();
+        let error = require_promotion_confirmation(&selected, &events).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "run `bperf confirm benchmarks/parser.bench.ts {}`",
+                selected.selector()
+            )),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn benchmark_module_does_not_change_cycle_identity() {
+        let temporary = tempdir().unwrap();
+        let mut cycle_ids = Vec::new();
+        for (store_name, with_module) in [("with", true), ("without", false)] {
+            let workspace = temporary.path().join(format!("workspace-{store_name}"));
+            fs::create_dir_all(&workspace).unwrap();
+            let source = workspace.join("parser.ts");
+            fs::write(&source, "export const value = 1;\n").unwrap();
+            let store =
+                LineageStore::open(&temporary.path().join(format!("lineages-{store_name}")))
+                    .unwrap();
+            let state = store
+                .capture_state(&workspace, std::slice::from_ref(&source))
+                .unwrap();
+            let new_cycle = if with_module {
+                module_cycle(state, "measure-1")
+            } else {
+                cycle(state, "measure-1")
+            };
+            cycle_ids.push(store.append_cycle(new_cycle).unwrap().cycle_id().to_owned());
+        }
+        assert_eq!(
+            cycle_ids[0], cycle_ids[1],
+            "the recorded module must not participate in cycle identity"
+        );
+    }
+
+    #[test]
+    fn stored_benchmark_modules_must_be_portable() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let valid = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let mut escaped = valid.clone();
+        escaped.benchmark_module = Some("../escape.bench.ts".to_owned());
+        escaped.previous_cycle_id = Some(valid.cycle_id().to_owned());
+        escaped.source_before = Some(valid.source_after.clone());
+        escaped.cycle_id = format!("cycle-{}", "f".repeat(64));
+        store
+            .append_event("parser", &LineageEvent::Cycle(Box::new(escaped)))
+            .unwrap();
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error.to_string().contains("non-relative component"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn next_command_follows_promotion_readiness() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let promotable = store
+            .append_cycle(module_cycle(state, "measure-1"))
+            .unwrap();
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let negative = store
+            .append_cycle(NewCycle {
+                comparison: Some(comparison("measure-2", "negative")),
+                ..module_cycle(state, "measure-2")
+            })
+            .unwrap();
+
+        let ready = PromotionReadiness {
+            confirmation_required: false,
+            ready: true,
+            searched_candidates: 1,
+            search_threshold: PROMOTION_CONFIRMATION_SEARCHES,
+        };
+        let unready = PromotionReadiness {
+            confirmation_required: true,
+            ready: false,
+            searched_candidates: PROMOTION_CONFIRMATION_SEARCHES,
+            search_threshold: PROMOTION_CONFIRMATION_SEARCHES,
+        };
+        assert_eq!(
+            promotable.next_command(&ready),
+            Some(format!("bperf accept {}", promotable.selector()))
+        );
+        assert_eq!(
+            promotable.next_command(&unready),
+            Some(format!(
+                "bperf confirm benchmarks/parser.bench.ts {}",
+                promotable.selector()
+            ))
+        );
+        assert_eq!(negative.next_command(&ready), None);
+    }
+
+    #[test]
+    fn cycle_evidence_is_optional_for_pre_evidence_cycles() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let bare = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let reader = store.database.reader().unwrap();
+        assert!(
+            store
+                .read_cycle_evidence(&reader, bare.cycle_id())
+                .unwrap()
+                .is_none(),
+            "cycles recorded without evidence must not fail show"
+        );
+
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let retained_path = temporary.path().join("cpu.json");
+        let with_evidence = store
+            .append_cycle_with_evidence(
+                cycle(state, "measure-2"),
+                Some(NewCycleEvidence {
+                    variant_id: "worktree".to_owned(),
+                    case_ids: vec!["parse".to_owned()],
+                    environment: EnvironmentSummary {
+                        recorded_at_unix_ms: 1,
+                        fingerprint: "environment".to_owned(),
+                        platform: "windows".to_owned(),
+                        arch: "x86_64".to_owned(),
+                        os_release: "test".to_owned(),
+                        browser_versions: Engine::ALL
+                            .into_iter()
+                            .map(|engine| (engine, "test".to_owned()))
+                            .collect(),
+                    },
+                    artifacts: vec![HistoryArtifact {
+                        kind: HistoryArtifactKind::CpuProfile,
+                        engine: Some(Engine::Chromium),
+                        capture_scope: Some("parse/final/0".to_owned()),
+                        path: retained_path.clone(),
+                    }],
+                }),
+            )
+            .unwrap();
+        let reader = store.database.reader().unwrap();
+        let evidence = store
+            .read_cycle_evidence(&reader, with_evidence.cycle_id())
+            .unwrap()
+            .expect("recorded evidence must be readable");
+        assert_eq!(evidence.artifacts.len(), 1);
+        assert_eq!(evidence.artifacts[0].path, retained_path);
+    }
+
+    #[test]
+    fn artifact_listing_groups_three_engines_without_pooling() {
+        assert_eq!(render_artifacts(&[]), "  artifacts: (none retained)\n");
+
+        let artifacts = vec![
+            HistoryArtifact {
+                kind: HistoryArtifactKind::CpuProfile,
+                engine: Some(Engine::Chromium),
+                capture_scope: Some("parse/final/2".to_owned()),
+                path: PathBuf::from("/evidence/chromium-cpu.json"),
+            },
+            HistoryArtifact {
+                kind: HistoryArtifactKind::HeapSnapshot,
+                engine: Some(Engine::Webkit),
+                capture_scope: None,
+                path: PathBuf::from("/evidence/webkit-heap.json"),
+            },
+        ];
+        let listing = render_artifacts(&artifacts);
+        let lines = listing.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "  artifacts:",
+                "    chromium:",
+                "      cpu_profile parse/final/2: /evidence/chromium-cpu.json",
+                "    firefox: (none)",
+                "    webkit:",
+                "      heap_snapshot: /evidence/webkit-heap.json",
+            ]
+        );
     }
 }

@@ -92,14 +92,16 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
         execution.registry_root,
         execution.comparison_root,
     )?;
-    let cycle = lineage::record_run(lineage::RecordRunOptions {
+    let recorded = lineage::record_run(lineage::RecordRunOptions {
         root: execution.lineage_root,
         workspace_root: inputs.workspace_root,
         source_files: inputs.source_files,
         measurement_root: measurement.measurement_root().to_owned(),
+        benchmark_module: options.benchmark,
         message: options.message,
         comparison: comparison.as_ref().map(ComparisonOutcome::summary),
     })?;
+    let lineage::RecordedRun { cycle, readiness } = recorded;
     let exit_code = comparison
         .as_ref()
         .map_or(0, ComparisonOutcome::exit_code_value);
@@ -118,6 +120,7 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
         measurement,
         comparison,
         cycle,
+        readiness,
         index_id,
     })
 }
@@ -140,7 +143,7 @@ fn confirm_with_policy(
     host_executable: &Path,
 ) -> Result<ConfirmOutcome> {
     let execution = options.execution;
-    let target = lineage::confirmation_target(&execution.lineage_root, &options.cycle_id)?;
+    lineage::validate_cycle_selector(&options.cycle_id)?;
     let installation = BrowserInstallation::discover()?;
     let inputs = materialize(
         &options.benchmark,
@@ -150,17 +153,17 @@ fn confirm_with_policy(
         host_executable,
         trial_policy,
     )?;
-    let original = MeasurementSet::open(target.candidate_measurement_path())?;
     let current_benchmark = BenchmarkManifest::load(&inputs.benchmark)?;
+    // Resolving after materialize scopes `latest` to the passed module's
+    // benchmark, so a multi-benchmark store cannot confirm the wrong stream.
+    let target = lineage::confirmation_target(
+        &execution.lineage_root,
+        &options.cycle_id,
+        Some(current_benchmark.benchmark_id()),
+    )?;
+    let original = MeasurementSet::open(target.candidate_measurement_path())?;
     let current_variant = VariantDescriptor::load(&inputs.variant)?;
     let mut source_mismatches = Vec::new();
-    if current_benchmark.benchmark_id() != target.benchmark_id() {
-        source_mismatches.push(format!(
-            "benchmark id expected {}, current {}",
-            target.benchmark_id(),
-            current_benchmark.benchmark_id()
-        ));
-    }
     if current_benchmark.source_sha256() != original.benchmark_sha256() {
         source_mismatches.push(format!(
             "benchmark SHA-256 expected {}, current {}",
@@ -213,7 +216,7 @@ fn confirm_with_policy(
         artifact_root: execution.comparison_root,
         output: None,
     })?;
-    let confirmation = lineage::record_confirmation(lineage::RecordConfirmationOptions {
+    let recorded = lineage::record_confirmation(lineage::RecordConfirmationOptions {
         root: execution.lineage_root,
         cycle_id: target.cycle_id().to_owned(),
         workspace_root,
@@ -221,6 +224,11 @@ fn confirm_with_policy(
         measurement_root: measurement.measurement_root().to_owned(),
         comparison: comparison.summary(),
     })?;
+    let lineage::RecordedConfirmation {
+        cycle,
+        confirmation,
+        readiness,
+    } = recorded;
     let index_id = record_measurement_index(MeasurementIndexOptions {
         measurement_root: measurement.measurement_root(),
         benchmark_id: measurement.benchmark_id(),
@@ -235,7 +243,9 @@ fn confirm_with_policy(
     Ok(ConfirmOutcome {
         measurement,
         comparison,
+        cycle,
         confirmation,
+        readiness,
         index_id,
     })
 }
@@ -243,7 +253,9 @@ fn confirm_with_policy(
 pub(crate) struct ConfirmOutcome {
     measurement: runner::MeasurementOutcome,
     comparison: ComparisonOutcome,
+    cycle: CycleRecord,
     confirmation: lineage::ConfirmationRecord,
+    readiness: lineage::PromotionReadiness,
     index_id: String,
 }
 
@@ -258,6 +270,7 @@ impl ConfirmOutcome {
                     measurement: &self.measurement,
                     comparison: self.comparison.report_data(),
                     confirmation: &self.confirmation,
+                    promotion_readiness: &self.readiness,
                     measurement_index: &self.index_id,
                 })?
             );
@@ -267,11 +280,8 @@ impl ConfirmOutcome {
             self.comparison.report_details();
             println!("  confirmation: {}", self.confirmation.confirmation_id());
             println!("  measurement record: {}", self.index_id);
-            if self.confirmation.outcome() == "positive" {
-                println!(
-                    "  next: bperf accept {}",
-                    self.confirmation.cycle_selector()
-                );
+            if let Some(next) = self.cycle.next_command(&self.readiness) {
+                println!("  next: {next}");
             }
         }
         Ok(())
@@ -289,6 +299,7 @@ struct ConfirmationReport<'a> {
     measurement: &'a runner::MeasurementOutcome,
     comparison: &'a ComparisonReport,
     confirmation: &'a lineage::ConfirmationRecord,
+    promotion_readiness: &'a lineage::PromotionReadiness,
     measurement_index: &'a str,
 }
 
@@ -315,6 +326,7 @@ pub(crate) struct RunOutcome {
     measurement: runner::MeasurementOutcome,
     comparison: Option<ComparisonOutcome>,
     cycle: CycleRecord,
+    readiness: lineage::PromotionReadiness,
     index_id: String,
 }
 
@@ -328,6 +340,7 @@ impl RunOutcome {
                 measurement: &self.measurement,
                 comparison: self.comparison.as_ref().map(ComparisonOutcome::report_data),
                 cycle: &self.cycle,
+                promotion_readiness: &self.readiness,
                 measurement_index: &self.index_id,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -342,8 +355,13 @@ impl RunOutcome {
             }
             println!("  cycle: {}", self.cycle.selector());
             println!("  inspect: bperf show {} --diff", self.cycle.selector());
-            if matches!(status, "measured" | "positive" | "equivalent") {
-                println!("  promote: bperf accept {}", self.cycle.selector());
+            if let Some(next) = self.cycle.next_command(&self.readiness) {
+                let label = if self.readiness.ready {
+                    "promote"
+                } else {
+                    "confirm"
+                };
+                println!("  {label}: {next}");
             }
             println!("  measurement record: {}", self.index_id);
         }
@@ -366,6 +384,7 @@ struct RunReport<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<&'a ComparisonReport>,
     cycle: &'a CycleRecord,
+    promotion_readiness: &'a lineage::PromotionReadiness,
     measurement_index: &'a str,
 }
 
@@ -1207,16 +1226,32 @@ mod tests {
             .expect("a promoted baseline must produce a comparison");
         let comparison_summary = comparison.summary();
         let expected_outcome = comparison_summary.verdict.clone();
-        let cycle = lineage::record_run(lineage::RecordRunOptions {
+        let expected_module = fs::canonicalize(&benchmark)
+            .unwrap()
+            .strip_prefix(fs::canonicalize(&workspace_root).unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let recorded = lineage::record_run(lineage::RecordRunOptions {
             root: temporary.path().join("lineages"),
             workspace_root,
             source_files,
             measurement_root: outcome.measurement_root().to_owned(),
+            benchmark_module: benchmark.clone(),
             message: Some("verify managed lineage".to_owned()),
             comparison: Some(comparison_summary),
         })
         .unwrap();
+        let cycle = recorded.cycle;
         assert_eq!(cycle.outcome(), expected_outcome);
+        assert_eq!(
+            cycle.benchmark_module(),
+            Some(expected_module.as_str()),
+            "recorded cycles must carry the workspace-relative benchmark module"
+        );
+        assert_eq!(recorded.readiness.searched_candidates, 1);
+        assert!(recorded.readiness.ready);
+        assert!(!recorded.readiness.confirmation_required);
         assert!(
             database
                 .read_document_bytes("comparison", comparison.comparison_id())

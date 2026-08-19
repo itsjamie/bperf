@@ -406,6 +406,10 @@ struct ShowArgs {
     #[arg(default_value = "latest")]
     cycle_id: String,
 
+    /// Restrict cycle selection to one benchmark stream.
+    #[arg(long, value_name = "ID")]
+    benchmark: Option<String>,
+
     #[arg(long, hide = true)]
     lineage_dir: Option<PathBuf>,
 
@@ -423,6 +427,10 @@ struct AcceptArgs {
     /// Cycle ID, unique ID prefix, or `latest`.
     #[arg(default_value = "latest")]
     cycle_id: String,
+
+    /// Restrict cycle selection to one benchmark stream.
+    #[arg(long, value_name = "ID")]
+    benchmark: Option<String>,
 
     #[arg(long, hide = true)]
     lineage_dir: Option<PathBuf>,
@@ -607,6 +615,7 @@ fn main() -> Result<ExitCode> {
         Command::Show(args) => {
             lineage::show(lineage::ShowOptions {
                 cycle_id: args.cycle_id,
+                benchmark_id: args.benchmark,
                 root: data.lineages(args.lineage_dir),
                 diff: args.diff,
                 json: args.json,
@@ -616,6 +625,7 @@ fn main() -> Result<ExitCode> {
         Command::Accept(args) => {
             let outcome = lineage::accept(lineage::AcceptOptions {
                 cycle_id: args.cycle_id,
+                benchmark_id: args.benchmark,
                 root: data.lineages(args.lineage_dir),
                 registry_root: data.baselines(args.registry_dir),
             })?;
