@@ -569,6 +569,14 @@ Confirmation uses a distinct resumable identity and is recorded as a lineage
 event, not another source-change cycle. Historical, candidate, anchor, and
 confirmation samples are never concatenated.
 
+Promotion readiness is computed once, inside the lineage module, from the
+event stream that includes the newly recorded cycle or confirmation. `run`,
+`confirm`, and `show` report it as the next command (`accept` or `confirm`)
+and as a `promotion_readiness` JSON field, so the confirmation requirement is
+visible before `accept` refuses. New cycles record the workspace-relative
+benchmark module so that command is complete; cycles recorded before the field
+existed keep a placeholder.
+
 [ADR 0001](adr/0001-runtime-validity.md) records the rejected design that tried
 to reconstruct and rerun old source.
 
@@ -636,16 +644,20 @@ cycle.
 ```text
 bperf history [<benchmark-id>]
 bperf history [<benchmark-id>] --format agent-context
-bperf show [<cycle-selector>] --diff
+bperf show [<cycle-selector>] [--benchmark <benchmark-id>] --diff
 bperf confirm <benchmark.ts> [<cycle-selector>]
-bperf accept [<cycle-selector>]
+bperf accept [<cycle-selector>] [--benchmark <benchmark-id>]
 ```
 
 With no history arguments and an attached input/output terminal, `history`
 loads a compact database overview of the latest benchmark, then reads the
 selected cycle's persisted evidence projection. Details are cached as the
 selection moves. Navigation does not reopen measurements, hash retained
-profiles, or reconstruct source changes.
+profiles, or reconstruct source changes. `show` reads the same evidence
+projection for one cycle and lists its retained artifact descriptors grouped
+by engine, so non-interactive callers reach profiles without the terminal
+view; a cycle recorded before evidence persistence simply has no artifact
+section.
 The application owns terminal layout, keyboard state, filters, and artifact
 launching; the lineage module supplies terminal-neutral benchmark, cycle,
 baseline, environment, comparison, change, promotion, and retained-artifact
@@ -760,12 +772,17 @@ bperf browsers install [--engine chromium|firefox|webkit|all] [--with-deps]
 bperf run [<benchmark.ts|directory>] [--budget <duration>] [--message <text>] [--json]
 bperf confirm <benchmark.ts> [<cycle-selector>] [--budget <duration>] [--json]
 bperf history [<benchmark-id>] [--format text|json|agent-context]
-bperf show [<cycle-selector>] [--diff] [--json]
-bperf accept [<cycle-selector>]
+bperf show [<cycle-selector>] [--benchmark <benchmark-id>] [--diff] [--json]
+bperf accept [<cycle-selector>] [--benchmark <benchmark-id>] [--json]
 ```
 
 Cycle selectors default to the latest local cycle and accept a unique ID
-prefix. Generated state is rooted at `.bperf` by default; one global
+prefix. An unscoped `latest` resolves across every measured benchmark; `show`
+and `accept` name the selected benchmark in their output and print a stderr
+notice when other benchmark streams exist, and `--benchmark` restricts them to
+one stream. `confirm` resolves its selector after the module is materialized,
+scoped to that module's benchmark, so it cannot confirm another benchmark's
+cycle. Generated state is rooted at `.bperf` by default; one global
 `--data-dir <directory>` option relocates it without exposing the internal
 storage layout. With a terminal, omitting the `run` target opens the recursive
 `benchmarks` picker; a directory opens the same picker at that subtree. An

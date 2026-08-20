@@ -245,7 +245,9 @@ A baseline-free `measured` run also exits 0. That only means the measurement
 completed; it is not an improvement verdict.
 
 After five candidates have been compared with one baseline, `accept` asks for
-an independent confirmation:
+an independent confirmation. `run` and `show` print the exact `confirm`
+command as the next step when this applies, and their `--json` output carries
+a `promotion_readiness` field:
 
 ```text
 cargo run -- confirm examples/managed/fragment-parser.bench.ts
@@ -256,12 +258,18 @@ Do not edit the source between the candidate and its confirmation.
 
 `show`, `accept`, `history`, and `confirm` select the latest local work when an
 identifier is omitted. A printed short cycle ID is also an accepted selector,
-so use it when working with more than one cycle. Bare `history` opens an
-interactive terminal view when stdin and stdout are terminals. It keeps the
-cycle lineage, per-engine evidence, representative artifacts, and promotion
-readiness visible together. Redirected output, an explicit benchmark ID, or an
-explicit `--format` stays non-interactive. Benchmark state and evidence live
-under `.bperf/`; pass `--data-dir <directory>` to relocate that complete store.
+so use it when working with more than one cycle. With more than one measured
+benchmark in the same store, pass `--benchmark <id>` to scope `show` or
+`accept` to one benchmark; an unscoped `latest` prints a stderr notice naming
+the benchmark it selected, and `confirm` scopes `latest` to the module it was
+given. `show` also lists the cycle's retained CPU-profile, flamegraph, and heap
+artifact paths by engine, and `show --json` carries them in an `artifacts`
+field. Bare `history` opens an interactive terminal view when stdin and stdout
+are terminals. It keeps the cycle lineage, per-engine evidence, representative
+artifacts, and promotion readiness visible together. Redirected output, an
+explicit benchmark ID, or an explicit `--format` stays non-interactive.
+Benchmark state and evidence live under `.bperf/`; pass
+`--data-dir <directory>` to relocate that complete store.
 
 The full baseline, candidate, confirmation, recovery, and evidence-reading
 workflow is in [Running an optimization](docs/OPTIMIZATION.md).
