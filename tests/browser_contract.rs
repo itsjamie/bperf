@@ -25,7 +25,7 @@ fn every_engine_satisfies_the_capture_contract() {
     );
 
     let summary: Value = serde_json::from_slice(&output.stdout).expect("doctor emitted JSON");
-    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["schema_version"], 3);
     assert_eq!(summary["verdict"], "supported");
     let engines = summary["engines"].as_array().expect("engines is an array");
     assert_eq!(engines.len(), 3);
@@ -51,8 +51,22 @@ fn every_engine_satisfies_the_capture_contract() {
                 engine["engine"]
             );
         }
-        assert_eq!(engine["artifacts"].as_array().unwrap().len(), 3);
+        let expected_artifacts = if engine["engine"] == "chromium" { 4 } else { 3 };
+        assert_eq!(
+            engine["artifacts"].as_array().unwrap().len(),
+            expected_artifacts,
+            "{} artifact count",
+            engine["engine"]
+        );
     }
+
+    assert_eq!(
+        engines
+            .iter()
+            .map(|engine| engine["sampler_overhead"]["state"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["measured", "not_applicable", "not_applicable"]
+    );
 }
 
 /// This remains an ignored release gate because it launches the pinned WebKit
@@ -75,9 +89,13 @@ fn webkit_doctor_uses_the_native_adapter() {
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: Value = serde_json::from_slice(&output.stdout).expect("doctor emitted JSON");
-    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["schema_version"], 3);
     assert_eq!(summary["engines"][0]["engine"], "webkit");
     assert_eq!(summary["engines"][0]["adapter"]["kind"], "rust-webkit");
+    assert_eq!(
+        summary["engines"][0]["sampler_overhead"]["state"],
+        "not_applicable"
+    );
 }
 
 #[test]
@@ -98,9 +116,13 @@ fn chromium_doctor_uses_the_native_adapter() {
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: Value = serde_json::from_slice(&output.stdout).expect("doctor emitted JSON");
-    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["schema_version"], 3);
     assert_eq!(summary["engines"][0]["engine"], "chromium");
     assert_eq!(summary["engines"][0]["adapter"]["kind"], "rust-chromium");
+    assert_eq!(
+        summary["engines"][0]["sampler_overhead"]["state"],
+        "measured"
+    );
 }
 
 #[test]
@@ -121,7 +143,11 @@ fn firefox_doctor_uses_the_native_adapter() {
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: Value = serde_json::from_slice(&output.stdout).expect("doctor emitted JSON");
-    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["schema_version"], 3);
     assert_eq!(summary["engines"][0]["engine"], "firefox");
     assert_eq!(summary["engines"][0]["adapter"]["kind"], "rust-firefox");
+    assert_eq!(
+        summary["engines"][0]["sampler_overhead"]["state"],
+        "not_applicable"
+    );
 }

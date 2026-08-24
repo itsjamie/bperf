@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const VERSION = 2;
+  const VERSION = 3;
   const RUNTIME_ANCHOR = Object.freeze({
     workload: "javascript_cpu_v1",
     samples: 31,
@@ -149,6 +149,66 @@
     return total;
   }
 
+  // Fixed allocation-heavy work, unlike the deadline-bound doctorProbe, so a
+  // sampling heap profiler's cost lands in wall time. The doctor compares one
+  // call with the sampler off against one with it on. The per-sample object
+  // count keeps one timed sample in the milliseconds: Chromium quantizes
+  // performance.now() to 100 microseconds, and a sample near the quantum
+  // reads zero half the time.
+  const DOCTOR_ALLOCATION = Object.freeze({
+    workload: "javascript_allocation_v1",
+    samples: 25,
+    warmupSamples: 8,
+    objectsPerSample: 500_000,
+  });
+
+  function doctorAllocationProbe() {
+    function run() {
+      let checksum = 2_166_136_261;
+      for (
+        let index = 0;
+        index < DOCTOR_ALLOCATION.objectsPerSample;
+        index += 1
+      ) {
+        const entry = {
+          index,
+          marker: `bperf-alloc-${index & 1_023}`,
+          payload: [index, index + 1, index + 2, index + 3],
+        };
+        checksum = Math.imul(
+          checksum ^ entry.payload[3] ^ entry.marker.length,
+          16_777_619,
+        ) >>> 0;
+      }
+      return checksum;
+    }
+
+    for (
+      let index = 0;
+      index < DOCTOR_ALLOCATION.warmupSamples;
+      index += 1
+    ) {
+      run();
+    }
+
+    const wallMs = [];
+    let checksum = 0;
+    for (let index = 0; index < DOCTOR_ALLOCATION.samples; index += 1) {
+      const started = performance.now();
+      const result = run();
+      wallMs.push(performance.now() - started);
+      if (index > 0 && result !== checksum) {
+        throw new Error("allocation probe produced an unstable checksum");
+      }
+      checksum = result;
+    }
+    return {
+      workload: DOCTOR_ALLOCATION.workload,
+      wall_ms: wallMs,
+      checksum,
+    };
+  }
+
   function runtimeAnchor() {
     const values = new Uint32Array(4_096);
     for (let index = 0; index < values.length; index += 1) {
@@ -226,6 +286,7 @@
     selectBatchSize,
     settle,
     doctorProbe,
+    doctorAllocationProbe,
     runtimeAnchor,
   });
 })();

@@ -31,12 +31,12 @@ use crate::{
     },
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
-        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, ProbeCapture,
-        TrialCapture,
+        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, MetricCapture,
+        ProbeCapture, SamplerOverheadCheck, TrialCapture,
     },
 };
 
-pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 3;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -85,6 +85,15 @@ const REQUIRED_PROTOCOL_COMMANDS: &[&str] = &[
     "Worker.initialized",
     "Worker.sendMessageToWorker",
 ];
+/// Commands the pinned protocol may lack. Preflight records their absence so
+/// the affected metric is reported as unsupported instead of failing the
+/// adapter.
+const OPTIONAL_PROTOCOL_COMMANDS: &[&str] = &[HEAP_GET_STATISTICS_COMMAND];
+const HEAP_GET_STATISTICS_COMMAND: &str = "Heap.getStatistics";
+const ALLOCATED_BYTES_UNSUPPORTED_REASON: &str =
+    "pinned WebKit protocol has no Heap.getStatistics (github.com/itsjamie/bperf#4)";
+const SAMPLER_OVERHEAD_NOT_APPLICABLE_REASON: &str = "allocated bytes come from \
+     Heap.getStatistics reads outside the timed batch; no sampler runs";
 const REQUIRED_PROTOCOL_EVENTS: &[&str] = &[
     "Network.loadingFailed",
     "Network.loadingFinished",
@@ -140,6 +149,7 @@ pub(crate) struct WebKitAdapter {
     playwright_version: String,
     executable_sha256: String,
     launch_arguments: Vec<String>,
+    heap_statistics_supported: bool,
 }
 
 impl EngineAdapter for WebKitAdapter {
@@ -148,7 +158,8 @@ impl EngineAdapter for WebKitAdapter {
     fn discover(installation: &BrowserInstallation) -> Result<Self> {
         let webkit = installation.browser(BrowserName::Webkit)?;
         let browser_directory = webkit.directory().to_owned();
-        validate_private_protocol(&browser_directory.join("protocol.json"))?;
+        let optional_commands =
+            validate_private_protocol(&browser_directory.join("protocol.json"))?;
         let executable = webkit.executable().to_owned();
         if !executable.is_file() {
             bail!(
@@ -184,6 +195,7 @@ impl EngineAdapter for WebKitAdapter {
             browser_version: webkit.browser_version().to_owned(),
             playwright_version: installation.playwright_version().to_owned(),
             launch_arguments,
+            heap_statistics_supported: optional_commands.contains(HEAP_GET_STATISTICS_COMMAND),
         })
     }
 
@@ -225,7 +237,9 @@ struct ProtocolParameter {
     name: String,
 }
 
-fn validate_private_protocol(path: &Path) -> Result<()> {
+/// Rejects a pinned protocol missing any required command, event, or
+/// parameter, and reports which of `OPTIONAL_PROTOCOL_COMMANDS` it carries.
+fn validate_private_protocol(path: &Path) -> Result<HashSet<&'static str>> {
     let domains: Vec<ProtocolDomain> = serde_json::from_slice(
         &fs::read(path)
             .with_context(|| format!("failed to read WebKit protocol {}", path.display()))?,
@@ -286,13 +300,18 @@ fn validate_private_protocol(path: &Path) -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(OPTIONAL_PROTOCOL_COMMANDS
+        .iter()
+        .filter(|method| commands.contains_key(**method))
+        .copied()
+        .collect())
 }
 
 pub(crate) struct WebKitLane {
     connection: InspectorConnection<BrowserProcess>,
     browser: BrowserEvidence,
     adapter: AdapterEvidence,
+    heap_statistics_supported: bool,
     closed: bool,
 }
 
@@ -326,6 +345,7 @@ impl WebKitLane {
             connection,
             browser,
             adapter: installation.adapter_evidence(),
+            heap_statistics_supported: installation.heap_statistics_supported,
             closed: false,
         })
     }
@@ -412,11 +432,29 @@ impl WebKitLane {
                 decode_batch_size(selected).context("WebKit batch calibration failed")?;
 
             self.connection.start_profile_capture(&page.page_proxy_id)?;
-            let workload = decode_workload(
-                self.connection
-                    .evaluate(&page.page_proxy_id, &script.execute(batch_size))?,
-            )
-            .context("WebKit workload execution failed")?;
+            // The allocation counter brackets the batch itself so profiler
+            // start and stop traffic stays out of the difference.
+            let allocated_before = if self.heap_statistics_supported {
+                Some(
+                    self.connection
+                        .page_heap_allocated_bytes(&page.page_proxy_id)?,
+                )
+            } else {
+                None
+            };
+            let executed = self
+                .connection
+                .evaluate(&page.page_proxy_id, &script.execute(batch_size))?;
+            let js_heap_allocated_bytes = match allocated_before {
+                Some(before) => {
+                    let after = self
+                        .connection
+                        .page_heap_allocated_bytes(&page.page_proxy_id)?;
+                    MetricCapture::Measured(allocated_bytes_per_call(before, after, batch_size)?)
+                }
+                None => MetricCapture::Unsupported(ALLOCATED_BYTES_UNSUPPORTED_REASON.to_owned()),
+            };
+            let workload = decode_workload(executed).context("WebKit workload execution failed")?;
             let profiles = self.connection.stop_profile_capture(&page.page_proxy_id)?;
             let cpu_active_ms = profiles.iter().try_fold(0.0, |total, realm| {
                 Ok::<_, anyhow::Error>(
@@ -456,6 +494,7 @@ impl WebKitLane {
                 workload,
                 cpu_active_ms,
                 js_heap_live_bytes: heap_bytes,
+                js_heap_allocated_bytes,
                 artifacts: artifact_evidence,
             })
         })();
@@ -518,6 +557,17 @@ impl EngineLane for WebKitLane {
 
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TrialCapture> {
         WebKitLane::measure_trial(self, request)
+    }
+
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck> {
+        let reason = if self.heap_statistics_supported {
+            SAMPLER_OVERHEAD_NOT_APPLICABLE_REASON
+        } else {
+            ALLOCATED_BYTES_UNSUPPORTED_REASON
+        };
+        Ok(SamplerOverheadCheck::NotApplicable {
+            reason: reason.to_owned(),
+        })
     }
 
     fn inspect_benchmark(
@@ -2014,6 +2064,18 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
             .context("WebKit heap snapshot returned no data")
     }
 
+    /// Reads the page realm's monotonic allocation counter. Only valid when
+    /// preflight found `Heap.getStatistics` in the pinned protocol.
+    fn page_heap_allocated_bytes(&mut self, page_proxy_id: &str) -> Result<u64> {
+        let statistics = self.send_current_target(
+            page_proxy_id,
+            "Heap.getStatistics",
+            json!({}),
+            REQUEST_TIMEOUT,
+        )?;
+        heap_statistics_allocated_bytes(&statistics)
+    }
+
     fn finish_complete_capture(&mut self, page_proxy_id: &str) -> Result<()> {
         let page = self
             .pages
@@ -2191,6 +2253,32 @@ fn parse_live_heap_bytes(snapshot_data: &str) -> Result<u64> {
         bail!("WebKit heap snapshot contains no live heap bytes");
     }
     Ok(total)
+}
+
+/// The upstream `Heap.getStatistics` response shape is not final (bperf
+/// issue #4); accept the counter at the top level or under a `statistics`
+/// object.
+fn heap_statistics_allocated_bytes(statistics: &Value) -> Result<u64> {
+    statistics
+        .get("bytesAllocated")
+        .or_else(|| {
+            statistics
+                .get("statistics")
+                .and_then(|nested| nested.get("bytesAllocated"))
+        })
+        .and_then(Value::as_u64)
+        .context("WebKit Heap.getStatistics returned no bytesAllocated counter")
+}
+
+fn allocated_bytes_per_call(before: u64, after: u64, batch_size: u32) -> Result<f64> {
+    let allocated = after
+        .checked_sub(before)
+        .context("WebKit Heap.getStatistics allocation counter went backwards")?;
+    let per_call = allocated as f64 / f64::from(batch_size);
+    if !per_call.is_finite() || per_call <= 0.0 {
+        bail!("WebKit Heap.getStatistics observed no allocation during the batch");
+    }
+    Ok(per_call)
 }
 
 fn finish_capture_artifacts(
@@ -2429,6 +2517,18 @@ mod tests {
         )
     }
 
+    fn with_heap_statistics(mut protocol: Value) -> Value {
+        for domain in protocol.as_array_mut().unwrap() {
+            if domain["domain"] == "Heap" {
+                domain["commands"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name": "getStatistics", "parameters": []}));
+            }
+        }
+        protocol
+    }
+
     #[test]
     fn private_protocol_preflight_rejects_missing_commands() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -2446,6 +2546,84 @@ mod tests {
             .to_string();
         assert!(error.contains("Page.overrideUserAgent"));
         assert!(error.contains("incompatible"));
+    }
+
+    #[test]
+    fn preflight_records_optional_heap_statistics_support() {
+        let mut absent = tempfile::NamedTempFile::new().unwrap();
+        serde_json::to_writer(&mut absent, &synthetic_private_protocol(None)).unwrap();
+        assert!(
+            !validate_private_protocol(absent.path())
+                .unwrap()
+                .contains(HEAP_GET_STATISTICS_COMMAND)
+        );
+
+        let mut present = tempfile::NamedTempFile::new().unwrap();
+        serde_json::to_writer(
+            &mut present,
+            &with_heap_statistics(synthetic_private_protocol(None)),
+        )
+        .unwrap();
+        assert!(
+            validate_private_protocol(present.path())
+                .unwrap()
+                .contains(HEAP_GET_STATISTICS_COMMAND)
+        );
+    }
+
+    #[test]
+    fn heap_statistics_parsing_accepts_both_response_shapes() {
+        assert_eq!(
+            heap_statistics_allocated_bytes(&json!({"bytesAllocated": 4096})).unwrap(),
+            4096
+        );
+        assert_eq!(
+            heap_statistics_allocated_bytes(&json!({"statistics": {"bytesAllocated": 4096}}))
+                .unwrap(),
+            4096
+        );
+        assert!(heap_statistics_allocated_bytes(&json!({})).is_err());
+        assert!(heap_statistics_allocated_bytes(&json!({"bytesAllocated": -1})).is_err());
+    }
+
+    #[test]
+    fn allocated_bytes_metric_differences_the_counter_per_call() {
+        assert_eq!(allocated_bytes_per_call(1_000, 9_000, 8).unwrap(), 1_000.0);
+        assert!(allocated_bytes_per_call(9_000, 1_000, 8).is_err());
+        assert!(allocated_bytes_per_call(1_000, 1_000, 8).is_err());
+    }
+
+    #[test]
+    fn heap_statistics_are_requested_from_the_page_target() {
+        let mut transport = ScriptedTransport::default();
+        transport.incoming.get_mut().extend([
+            json!({"id": 2, "result": {}, "pageProxyId": "proxy"}),
+            target_dispatch(json!({
+                "id": 1,
+                "result": {"bytesAllocated": 65536}
+            })),
+        ]);
+        let mut connection = InspectorConnection::new(
+            transport,
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        connection
+            .pages
+            .insert("proxy".to_owned(), route("target", None));
+
+        assert_eq!(
+            connection.page_heap_allocated_bytes("proxy").unwrap(),
+            65536
+        );
+
+        let nested: Value = serde_json::from_str(
+            connection.process.sent[0]["params"]["message"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(nested["method"], "Heap.getStatistics");
     }
 
     #[test]

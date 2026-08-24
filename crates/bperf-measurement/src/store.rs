@@ -266,6 +266,37 @@ fn required_measurement_document(
         .with_context(|| format!("measurement set {measurement_set_id:?} has no {document} record"))
 }
 
+/// Reads a measurement set's recorded schedule schema version without opening
+/// the set, so callers can distinguish a set recorded by an older bperf from
+/// a corrupt one before full validation refuses it.
+pub fn peek_schedule_schema_version(root: &Path) -> Result<u32> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve measurement set {}", root.display()))?;
+    let measurement_set_id = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("measurement directory has a non-UTF-8 name")?;
+    let collection_root = root
+        .parent()
+        .context("measurement set has no collection root")?;
+    let database = Database::for_collection(collection_root, "measurements")?;
+    let schedule: serde_json::Value = database
+        .read_document(
+            MEASUREMENT_DOCUMENTS,
+            &measurement_document_key(measurement_set_id, "schedule"),
+        )?
+        .with_context(|| {
+            format!("measurement set {measurement_set_id:?} has no schedule record")
+        })?;
+    schedule
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .with_context(|| {
+            format!("measurement set {measurement_set_id:?} has no schedule schema version")
+        })
+}
+
 pub(crate) fn write_immutable(path: &Path, content: &[u8]) -> Result<()> {
     bperf_storage::publish_immutable(path, content).with_context(|| {
         format!(
@@ -924,6 +955,10 @@ pub struct TrialResult {
     pub invalidation_reason: Option<String>,
     #[serde(default)]
     pub metrics: BTreeMap<String, f64>,
+    /// Metrics the engine cannot capture, keyed by metric name, each carrying
+    /// a non-empty reason. A metric never appears in both maps.
+    #[serde(default)]
+    pub unsupported_metrics: BTreeMap<String, String>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactEvidence>,
 }
@@ -1088,8 +1123,25 @@ fn validate_result(result: &TrialResult, policy: &AnalysisPolicy) -> Result<()> 
             );
         }
     }
+    for (metric, reason) in &result.unsupported_metrics {
+        if reason.trim().is_empty() {
+            bail!(
+                "trial {} marked metric {metric:?} as unsupported without a reason",
+                result.trial_id
+            );
+        }
+        if result.metrics.contains_key(metric) {
+            bail!(
+                "trial {} reports metric {metric:?} as both measured and unsupported",
+                result.trial_id
+            );
+        }
+    }
     if result.valid && result.success {
         for metric in &policy.primary_metrics {
+            if result.unsupported_metrics.contains_key(&metric.name) {
+                continue;
+            }
             let value = result.metrics.get(&metric.name).with_context(|| {
                 format!(
                     "successful trial {} has no primary metric {:?}",
@@ -1402,6 +1454,71 @@ mod tests {
         MeasurementSet::open(&root).unwrap();
     }
 
+    #[test]
+    fn a_successful_trial_may_mark_a_primary_metric_unsupported() {
+        validate_result(
+            &unsupported_metric_result("collector not implemented yet"),
+            &allocation_policy(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unsupported_metric_needs_a_reason_and_no_measured_value() {
+        let error =
+            validate_result(&unsupported_metric_result(" "), &allocation_policy()).unwrap_err();
+        assert!(error.to_string().contains("without a reason"));
+
+        let mut conflicting = unsupported_metric_result("collector not implemented yet");
+        conflicting
+            .metrics
+            .insert("browser.js_heap.allocated_bytes".to_owned(), 1.0);
+        let error = validate_result(&conflicting, &allocation_policy()).unwrap_err();
+        assert!(error.to_string().contains("both measured and unsupported"));
+    }
+
+    fn allocation_policy() -> AnalysisPolicy {
+        AnalysisPolicy {
+            confidence: 0.95,
+            bootstrap_samples: 1_000,
+            primary_metrics: ["workload.wall_ms", "browser.js_heap.allocated_bytes"]
+                .into_iter()
+                .map(|name| crate::manifest::MetricPolicy {
+                    name: name.to_owned(),
+                    minimum_effect_pct: 5.0,
+                })
+                .collect(),
+            minimum_success_rate: 0.95,
+            max_regression_percentage_points: 1.0,
+            protected_metric_max_regression_pct: 3.0,
+        }
+    }
+
+    fn unsupported_metric_result(reason: &str) -> TrialResult {
+        TrialResult {
+            schema_version: MEASUREMENT_SCHEMA_VERSION,
+            measurement_set_id: "measure-test".to_owned(),
+            trial_id: "final-checkout-flow-chromium-0001".to_owned(),
+            attempt: 1,
+            workload_id: "checkout-flow".to_owned(),
+            engine: Engine::Chromium,
+            phase: TrialPhase::Final,
+            sample_index: 1,
+            environment_fingerprint: "test-environment".to_owned(),
+            valid: true,
+            success: true,
+            failure_category: None,
+            failure_detail: None,
+            invalidation_reason: None,
+            metrics: BTreeMap::from([("workload.wall_ms".to_owned(), 10.0)]),
+            unsupported_metrics: BTreeMap::from([(
+                "browser.js_heap.allocated_bytes".to_owned(),
+                reason.to_owned(),
+            )]),
+            artifacts: Vec::new(),
+        }
+    }
+
     fn example(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -1441,10 +1558,12 @@ mod tests {
                         ("variant.call_wall_ms".into(), metric_value / 2.0),
                         ("browser.cpu_profile.active_ms".into(), metric_value),
                         ("browser.js_heap.live_bytes".into(), metric_value),
+                        ("browser.js_heap.allocated_bytes".into(), metric_value),
                         (CAPTURE_ELAPSED_METRIC.into(), 30.0),
                         (BATCH_SIZE_METRIC.into(), 1.0),
                         (TRIAL_ELAPSED_METRIC.into(), 30.0),
                     ]),
+                    unsupported_metrics: BTreeMap::new(),
                     artifacts,
                 })
                 .unwrap();
@@ -1452,39 +1571,43 @@ mod tests {
     }
 
     fn synthetic_artifacts(root: &Path, trial_id: &str, engine: Engine) -> Vec<ArtifactEvidence> {
-        [
+        let mut kinds = vec![
             ArtifactKind::CpuProfile,
             ArtifactKind::JsHeap,
             ArtifactKind::Flamegraph,
-        ]
-        .iter()
-        .copied()
-        .map(|kind| {
-            let name = match kind {
-                ArtifactKind::CpuProfile => "cpu",
-                ArtifactKind::JsHeap => "heap",
-                ArtifactKind::Flamegraph => "flamegraph",
-            };
-            let relative = PathBuf::from("synthetic")
-                .join(trial_id)
-                .join(format!("{name}.txt"));
-            let path = root.join(&relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let bytes = format!("{trial_id}-{name}").into_bytes();
-            fs::write(&path, &bytes).unwrap();
-            ArtifactEvidence {
-                capture_scope: match engine {
-                    Engine::Firefox => "browser-context",
-                    Engine::Chromium | Engine::Webkit => "page",
+        ];
+        if engine == Engine::Chromium {
+            kinds.push(ArtifactKind::HeapSamplingProfile);
+        }
+        kinds
+            .into_iter()
+            .map(|kind| {
+                let name = match kind {
+                    ArtifactKind::CpuProfile => "cpu",
+                    ArtifactKind::JsHeap => "heap",
+                    ArtifactKind::Flamegraph => "flamegraph",
+                    ArtifactKind::HeapSamplingProfile => "heap-sampling",
+                };
+                let relative = PathBuf::from("synthetic")
+                    .join(trial_id)
+                    .join(format!("{name}.txt"));
+                let path = root.join(&relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes = format!("{trial_id}-{name}").into_bytes();
+                fs::write(&path, &bytes).unwrap();
+                ArtifactEvidence {
+                    capture_scope: match engine {
+                        Engine::Firefox => "browser-context",
+                        Engine::Chromium | Engine::Webkit => "page",
+                    }
+                    .to_owned(),
+                    kind,
+                    path: relative.to_string_lossy().replace('\\', "/"),
+                    size_bytes: bytes.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    format: "synthetic".into(),
                 }
-                .to_owned(),
-                kind,
-                path: relative.to_string_lossy().replace('\\', "/"),
-                size_bytes: bytes.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
-                format: "synthetic".into(),
-            }
-        })
-        .collect()
+            })
+            .collect()
     }
 }

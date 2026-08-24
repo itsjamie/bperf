@@ -20,9 +20,10 @@ use crate::{
 };
 
 const SCHEMA_VERSION: u32 = 2;
-const POLICY: &str = "representative_per_workload_engine_scope_v2";
+const POLICY: &str = "representative_per_workload_engine_scope_v3";
 const CPU_METRIC: &str = "browser.cpu_profile.active_ms";
 const HEAP_METRIC: &str = "browser.js_heap.live_bytes";
+const ALLOC_METRIC: &str = "browser.js_heap.allocated_bytes";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +188,23 @@ fn build_manifest_from(
                 HEAP_METRIC,
                 ArtifactKind::JsHeap,
             )?);
+            // An engine can measure allocation without a sampling profile, so
+            // the kind is retained only where every trial captured one.
+            if results.iter().all(|result| {
+                result
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == ArtifactKind::HeapSamplingProfile)
+            }) {
+                let allocation = representative(&results, ALLOC_METRIC)?;
+                selections.extend(selections_for_kind(
+                    workload_id,
+                    *engine,
+                    allocation,
+                    ALLOC_METRIC,
+                    ArtifactKind::HeapSamplingProfile,
+                )?);
+            }
         }
     }
     selections.sort_by(|left, right| {
@@ -510,9 +528,11 @@ mod tests {
                         ("variant.call_wall_ms".to_owned(), 10.0),
                         (CPU_METRIC.to_owned(), cpu),
                         (HEAP_METRIC.to_owned(), heap),
+                        (ALLOC_METRIC.to_owned(), cpu),
                         (BATCH_SIZE_METRIC.to_owned(), 1.0),
                         (TRIAL_ELAPSED_METRIC.to_owned(), 20.0),
                     ]),
+                    unsupported_metrics: BTreeMap::new(),
                     artifacts: synthetic_artifacts(
                         measurement.root(),
                         &trial.trial_id,
@@ -536,7 +556,9 @@ mod tests {
 
         for selection in &manifest.selections {
             let expected_sample = match selection.artifact.kind {
-                ArtifactKind::CpuProfile | ArtifactKind::Flamegraph => "0011",
+                ArtifactKind::CpuProfile
+                | ArtifactKind::Flamegraph
+                | ArtifactKind::HeapSamplingProfile => "0011",
                 ArtifactKind::JsHeap => "0005",
             };
             assert!(selection.trial_id.ends_with(expected_sample));
@@ -544,11 +566,15 @@ mod tests {
             assert_eq!(selection.observed_value, 11.0);
         }
         for engine in [Engine::Chromium, Engine::Webkit] {
-            for kind in [
+            let mut kinds = vec![
                 ArtifactKind::CpuProfile,
                 ArtifactKind::JsHeap,
                 ArtifactKind::Flamegraph,
-            ] {
+            ];
+            if engine == Engine::Chromium {
+                kinds.push(ArtifactKind::HeapSamplingProfile);
+            }
+            for kind in kinds {
                 assert!(manifest.selections.iter().any(|selection| {
                     selection.engine == engine
                         && selection.artifact.capture_scope == "worker-1"
@@ -591,16 +617,20 @@ mod tests {
         scopes
             .iter()
             .flat_map(|scope| {
-                [
+                let mut kinds = vec![
                     ArtifactKind::CpuProfile,
                     ArtifactKind::JsHeap,
                     ArtifactKind::Flamegraph,
-                ]
-                .map(|kind| {
+                ];
+                if engine == Engine::Chromium {
+                    kinds.push(ArtifactKind::HeapSamplingProfile);
+                }
+                kinds.into_iter().map(move |kind| {
                     let name = match kind {
                         ArtifactKind::CpuProfile => "cpu",
                         ArtifactKind::JsHeap => "heap",
                         ArtifactKind::Flamegraph => "flamegraph",
+                        ArtifactKind::HeapSamplingProfile => "heap-sampling",
                     };
                     let relative = PathBuf::from("artifacts")
                         .join(trial_id)

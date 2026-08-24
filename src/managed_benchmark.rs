@@ -87,7 +87,7 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
         artifact_root: execution.artifact_root,
         runtime: installation.clone(),
     })?;
-    let comparison = compare_current(
+    let (comparison, comparison_skipped) = compare_current(
         &measurement,
         execution.registry_root,
         execution.comparison_root,
@@ -119,6 +119,7 @@ pub(crate) fn run(options: RunOptions) -> Result<RunOutcome> {
     Ok(RunOutcome {
         measurement,
         comparison,
+        comparison_skipped,
         cycle,
         readiness,
         index_id,
@@ -307,24 +308,41 @@ fn compare_current(
     measurement: &runner::MeasurementOutcome,
     registry_root: PathBuf,
     comparison_root: PathBuf,
-) -> Result<Option<ComparisonOutcome>> {
-    let comparison =
-        match baseline::current_path_if_present(&registry_root, measurement.benchmark_id())? {
-            Some(baseline_root) => Some(comparison::run(comparison::CompareOptions {
-                candidate_root: measurement.measurement_root().to_owned(),
-                baseline_root: Some(baseline_root),
-                registry_root,
-                artifact_root: comparison_root,
-                output: None,
-            })?),
-            None => None,
-        };
-    Ok(comparison)
+) -> Result<(Option<ComparisonOutcome>, Option<String>)> {
+    let Some(baseline_root) =
+        baseline::current_path_if_present(&registry_root, measurement.benchmark_id())?
+    else {
+        return Ok((None, None));
+    };
+    // A baseline recorded under an older measurement schema cannot be
+    // compared against; treat it as absent, with the reason surfaced, so a
+    // schema bump asks for a fresh baseline instead of failing the run after
+    // its trials completed.
+    let baseline_schema = bperf_measurement::store::peek_schedule_schema_version(&baseline_root)?;
+    if baseline_schema != bperf_measurement::MEASUREMENT_SCHEMA_VERSION {
+        return Ok((
+            None,
+            Some(format!(
+                "promoted baseline records measurement schema {baseline_schema}, this bperf \
+                 records schema {}; promote a new baseline",
+                bperf_measurement::MEASUREMENT_SCHEMA_VERSION
+            )),
+        ));
+    }
+    let comparison = comparison::run(comparison::CompareOptions {
+        candidate_root: measurement.measurement_root().to_owned(),
+        baseline_root: Some(baseline_root),
+        registry_root,
+        artifact_root: comparison_root,
+        output: None,
+    })?;
+    Ok((Some(comparison), None))
 }
 
 pub(crate) struct RunOutcome {
     measurement: runner::MeasurementOutcome,
     comparison: Option<ComparisonOutcome>,
+    comparison_skipped: Option<String>,
     cycle: CycleRecord,
     readiness: lineage::PromotionReadiness,
     index_id: String,
@@ -339,6 +357,7 @@ impl RunOutcome {
                 status,
                 measurement: &self.measurement,
                 comparison: self.comparison.as_ref().map(ComparisonOutcome::report_data),
+                comparison_skipped: self.comparison_skipped.as_deref(),
                 cycle: &self.cycle,
                 promotion_readiness: &self.readiness,
                 measurement_index: &self.index_id,
@@ -351,7 +370,10 @@ impl RunOutcome {
                 comparison.report_details();
             } else {
                 self.measurement.report_engine_results()?;
-                println!("  comparison: no promoted baseline");
+                match &self.comparison_skipped {
+                    Some(reason) => println!("  comparison: skipped ({reason})"),
+                    None => println!("  comparison: no promoted baseline"),
+                }
             }
             println!("  cycle: {}", self.cycle.selector());
             println!("  inspect: bperf show {} --diff", self.cycle.selector());
@@ -383,6 +405,8 @@ struct RunReport<'a> {
     measurement: &'a runner::MeasurementOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<&'a ComparisonReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comparison_skipped: Option<&'a str>,
     cycle: &'a CycleRecord,
     promotion_readiness: &'a lineage::PromotionReadiness,
     measurement_index: &'a str,
@@ -857,11 +881,13 @@ fn write_inputs(
                 "workload.wall_ms",
                 "browser.cpu_profile.active_ms",
                 "browser.js_heap.live_bytes",
+                "browser.js_heap.allocated_bytes",
             ],
             "minimum_effect_pct": {
                 "workload.wall_ms": 5.0,
                 "browser.cpu_profile.active_ms": 5.0,
                 "browser.js_heap.live_bytes": 5.0,
+                "browser.js_heap.allocated_bytes": 5.0,
             },
             "correctness": {
                 "minimum_success_rate": 0.95,
@@ -1173,11 +1199,14 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 6 + sampling.selected_final_trials as usize);
         assert!(records.iter().all(|record| {
+            // Chromium trials carry the heap sampling profile as a fourth
+            // artifact; the other engines produce three.
+            let expected_artifacts = if record["engine"] == "chromium" { 4 } else { 3 };
             record["valid"] == true
                 && record["success"] == true
                 && record["artifacts"]
                     .as_array()
-                    .is_some_and(|items| items.len() == 3)
+                    .is_some_and(|items| items.len() == expected_artifacts)
         }));
         let retention: Value = database
             .read_document(
@@ -1192,7 +1221,9 @@ mod tests {
             .iter()
             .map(|selection| selection["artifact"]["path"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(retained_paths.len(), 9);
+        // Three artifacts per engine plus Chromium's retained heap sampling
+        // profile.
+        assert_eq!(retained_paths.len(), 10);
         assert_eq!(
             retention["summary"]["discarded_artifacts"],
             records
@@ -1223,6 +1254,7 @@ mod tests {
         let comparison_root = temporary.path().join("comparisons");
         let comparison = compare_current(&outcome, registry_root.clone(), comparison_root.clone())
             .unwrap()
+            .0
             .expect("a promoted baseline must produce a comparison");
         let comparison_summary = comparison.summary();
         let expected_outcome = comparison_summary.verdict.clone();

@@ -94,6 +94,7 @@ impl BenchmarkRuntime {
             failure_detail: verdict.detail,
             invalidation_reason: None,
             metrics: evidence.metrics,
+            unsupported_metrics: evidence.unsupported_metrics,
             artifacts: evidence.artifacts,
         })
     }

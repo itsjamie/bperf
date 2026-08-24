@@ -1282,10 +1282,11 @@ fn compact_engine_line(cycle: &HistoryCycle, engine: Engine) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             format!(
-                "anchor {anchor:<11}  wall {}  cpu {}  heap {}",
+                "anchor {anchor:<11}  wall {}  cpu {}  heap {}  alloc {}",
                 metric("workload.wall_ms"),
                 metric("browser.cpu_profile.active_ms"),
-                metric("browser.js_heap.live_bytes")
+                metric("browser.js_heap.live_bytes"),
+                metric("browser.js_heap.allocated_bytes")
             ),
             Style::default().fg(MUTED),
         ),
@@ -1389,6 +1390,7 @@ fn artifact_overview(cycle: &HistoryCycle) -> Vec<&HistoryArtifact> {
         HistoryArtifactKind::CpuProfile,
         HistoryArtifactKind::Flamegraph,
         HistoryArtifactKind::HeapSnapshot,
+        HistoryArtifactKind::HeapSampling,
     ] {
         if let Some(artifact) = cycle
             .artifacts
@@ -1449,6 +1451,14 @@ fn artifact_overview_detail(artifact: &HistoryArtifact) -> String {
             .filter(|scope| *scope != "page")
             .map_or_else(
                 || "heap median".to_owned(),
+                |scope| format!("scope {scope}"),
+            ),
+        HistoryArtifactKind::HeapSampling => artifact
+            .capture_scope
+            .as_deref()
+            .filter(|scope| *scope != "page")
+            .map_or_else(
+                || "alloc median".to_owned(),
                 |scope| format!("scope {scope}"),
             ),
         HistoryArtifactKind::Comparison | HistoryArtifactKind::Sampling => {
@@ -1667,11 +1677,12 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn primary_metrics() -> [(&'static str, &'static str); 3] {
+fn primary_metrics() -> [(&'static str, &'static str); 4] {
     [
         ("workload.wall_ms", "wall"),
         ("browser.cpu_profile.active_ms", "cpu"),
         ("browser.js_heap.live_bytes", "heap"),
+        ("browser.js_heap.allocated_bytes", "alloc"),
     ]
 }
 
@@ -1799,6 +1810,7 @@ fn artifact_kind_label(kind: HistoryArtifactKind) -> &'static str {
         HistoryArtifactKind::CpuProfile => "cpuprofile",
         HistoryArtifactKind::Flamegraph => "speedscope",
         HistoryArtifactKind::HeapSnapshot => "heapsnapshot",
+        HistoryArtifactKind::HeapSampling => "heapsampling",
         HistoryArtifactKind::Comparison => "comparison",
         HistoryArtifactKind::Sampling => "sampling",
     }
@@ -1809,6 +1821,7 @@ fn artifact_kind_detail(kind: HistoryArtifactKind) -> &'static str {
         HistoryArtifactKind::CpuProfile => "native cpu",
         HistoryArtifactKind::Flamegraph => "flamegraph",
         HistoryArtifactKind::HeapSnapshot => "native heap",
+        HistoryArtifactKind::HeapSampling => "allocation sites",
         HistoryArtifactKind::Comparison => "verdict evidence",
         HistoryArtifactKind::Sampling => "pilot + final",
     }
@@ -1816,7 +1829,9 @@ fn artifact_kind_detail(kind: HistoryArtifactKind) -> &'static str {
 
 fn artifact_color(kind: HistoryArtifactKind) -> Color {
     match kind {
-        HistoryArtifactKind::HeapSnapshot | HistoryArtifactKind::Sampling => AMBER,
+        HistoryArtifactKind::HeapSnapshot
+        | HistoryArtifactKind::HeapSampling
+        | HistoryArtifactKind::Sampling => AMBER,
         HistoryArtifactKind::Comparison => BLUE,
         HistoryArtifactKind::CpuProfile | HistoryArtifactKind::Flamegraph => CYAN,
     }
@@ -1840,9 +1855,9 @@ fn artifact_picker_label(artifact: &HistoryArtifact, display_root: &Path) -> Str
 fn format_metric_values(metric: &str, baseline: f64, candidate: f64) -> String {
     let magnitude = baseline.abs().max(candidate.abs());
     let (scale, unit) = match metric {
-        "heap" if magnitude >= 1_048_576.0 => (1.0 / 1_048_576.0, " MB"),
-        "heap" if magnitude >= 1_024.0 => (1.0 / 1_024.0, " KB"),
-        "heap" => (1.0, " B"),
+        "heap" | "alloc" if magnitude >= 1_048_576.0 => (1.0 / 1_048_576.0, " MB"),
+        "heap" | "alloc" if magnitude >= 1_024.0 => (1.0 / 1_024.0, " KB"),
+        "heap" | "alloc" => (1.0, " B"),
         _ if magnitude < 0.001 => (1_000_000.0, " ns"),
         _ if magnitude < 1.0 => (1_000.0, " us"),
         _ if magnitude < 1_000.0 => (1.0, " ms"),
@@ -2446,6 +2461,10 @@ mod tests {
                                 "browser.js_heap.live_bytes".to_owned(),
                                 metric(effect - 1.4, 54.5 * 1_048_576.0, 52.4 * 1_048_576.0),
                             ),
+                            (
+                                "browser.js_heap.allocated_bytes".to_owned(),
+                                metric(effect - 2.1, 3.3 * 1_048_576.0, 3.1 * 1_048_576.0),
+                            ),
                         ]),
                     }
                 })
@@ -2462,6 +2481,7 @@ mod tests {
             guardrail_regressed: false,
             baseline_value: Some(baseline),
             candidate_value: Some(candidate),
+            unsupported_reason: None,
         }
     }
 }

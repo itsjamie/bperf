@@ -138,11 +138,14 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
         let artifact_dir = root.join("synthetic-artifacts").join(trial_id);
         fs::create_dir_all(&artifact_dir).unwrap();
         let mut artifacts = Vec::new();
-        let artifact_kinds: &[(&str, &str)] = &[
+        let mut artifact_kinds: Vec<(&str, &str)> = vec![
             ("cpu_profile", "cpu.json"),
             ("js_heap", "heap.json"),
             ("flamegraph", "flamegraph.json"),
         ];
+        if trial["engine"] == "chromium" {
+            artifact_kinds.push(("heap_sampling_profile", "heap-sampling.json"));
+        }
         for (kind, name) in artifact_kinds {
             let bytes = format!("{trial_id}-{kind}").into_bytes();
             let path = artifact_dir.join(name);
@@ -164,12 +167,38 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                 "format": "synthetic test evidence"
             }));
         }
+        // WebKit has no `Heap.getStatistics` in the pinned protocol yet
+        // (bperf issue #4), so its synthetic trials mark the allocation
+        // metric unsupported instead of measuring it.
+        let (allocated_metric, unsupported_metrics) = if trial["engine"] == "webkit" {
+            (
+                serde_json::Map::new(),
+                serde_json::json!({
+                    "browser.js_heap.allocated_bytes":
+                        "pinned WebKit protocol has no Heap.getStatistics"
+                }),
+            )
+        } else {
+            let mut metric = serde_json::Map::new();
+            metric.insert("browser.js_heap.allocated_bytes".to_owned(), value.into());
+            (metric, serde_json::json!({}))
+        };
+        let mut metrics = serde_json::json!({
+            "workload.wall_ms": value,
+            "variant.call_wall_ms": value,
+            "browser.cpu_profile.active_ms": value,
+            "browser.js_heap.live_bytes": value,
+            "bperf.capture.elapsed_ms": value,
+            "bperf.batch_size": 1,
+            "bperf.trial.elapsed_ms": value
+        });
+        metrics.as_object_mut().unwrap().extend(allocated_metric);
         database
             .append_event(
                 "measurement_trials",
                 measurement_set_id,
                 &serde_json::json!({
-                "schema_version": 5,
+                "schema_version": 6,
                 "measurement_set_id": measurement_set_id,
                 "trial_id": trial["trial_id"],
                 "attempt": 1,
@@ -180,15 +209,8 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                 "environment_fingerprint": environment_fingerprint,
                 "valid": true,
                 "success": true,
-                "metrics": {
-                    "workload.wall_ms": value,
-                    "variant.call_wall_ms": value,
-                    "browser.cpu_profile.active_ms": value,
-                    "browser.js_heap.live_bytes": value,
-                    "bperf.capture.elapsed_ms": value,
-                    "bperf.batch_size": 1,
-                    "bperf.trial.elapsed_ms": value
-                },
+                "metrics": metrics,
+                "unsupported_metrics": unsupported_metrics,
                 "artifacts": artifacts
                 }),
             )
@@ -568,6 +590,8 @@ fn independent_measurements_can_be_promoted_and_compared() {
         "firefox: positive correctness=pass anchor=stable",
         "webkit: positive correctness=pass anchor=stable",
         "workload.wall_ms: improved effect=+10.00% (100ms -> 90ms) ci=[+10.00%, +10.00%]",
+        "browser.js_heap.allocated_bytes: improved effect=+10.00% (100b -> 90b) ci=[+10.00%, +10.00%]",
+        "browser.js_heap.allocated_bytes: n/a (unsupported: pinned WebKit protocol has no Heap.getStatistics)",
         comparison["comparison_id"].as_str().unwrap(),
     ] {
         assert!(

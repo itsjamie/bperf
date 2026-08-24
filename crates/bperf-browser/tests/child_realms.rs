@@ -331,7 +331,12 @@ fn assert_child_realm_evidence(engine: Engine) {
             cpu_profiles.push_str(&fs::read_to_string(root.join(&artifact.path)).unwrap());
         }
     }
-    assert!(kinds_by_scope.values().all(|kinds| kinds.len() == 3));
+    let expected_kinds = if engine == Engine::Chromium { 4 } else { 3 };
+    assert!(
+        kinds_by_scope
+            .values()
+            .all(|kinds| kinds.len() == expected_kinds)
+    );
     match engine {
         Engine::Chromium => {
             assert!(kinds_by_scope.contains_key("page"));

@@ -25,6 +25,14 @@
       "size_bytes": 449,
       "sha256": "8facdec9ea2343d78ef52ce82e746e80cd338ca5d3b00f3d93e91a4e6c455a6d",
       "format": "Speedscope sampled profile"
+    },
+    {
+      "capture_scope": "page",
+      "kind": "heap_sampling_profile",
+      "path": "heap-sampling.json",
+      "size_bytes": 669,
+      "sha256": "f630fa06cace721f936fa5ba54e6b73d53b6791132be331a16f3992df2786993",
+      "format": "V8 sampling heap profile"
     }
   ]
 }

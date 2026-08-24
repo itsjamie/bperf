@@ -133,11 +133,28 @@ impl FirefoxDebugSession {
         Ok(source)
     }
 
+    /// Forces a full garbage and cycle collection in the target tab without
+    /// taking a heap snapshot.
+    pub(crate) fn force_garbage_collection(&mut self) -> Result<()> {
+        self.with_memory_actor(|session, memory_actor| session.force_collections(memory_actor))
+    }
+
     pub(crate) fn capture_heap(
         &mut self,
         destination: &Path,
         snapshots: &mut FirefoxHeapSnapshotFiles,
     ) -> Result<u64> {
+        self.with_memory_actor(|session, memory_actor| {
+            session.force_collections(memory_actor)?;
+            let snapshot_id = session.save_heap_snapshot(memory_actor)?;
+            snapshots.capture(&snapshot_id, destination)
+        })
+    }
+
+    fn with_memory_actor<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self, &str) -> Result<T>,
+    ) -> Result<T> {
         let listed = self
             .rdp
             .request(json!({"to": "root", "type": "listTabs"}))?;
@@ -164,24 +181,7 @@ impl FirefoxDebugSession {
 
         self.rdp
             .request(json!({"to": memory_actor, "type": "attach"}))?;
-        let result = (|| {
-            self.rdp.request(json!({
-                "to": memory_actor,
-                "type": "forceGarbageCollection",
-            }))?;
-            self.rdp.request(json!({
-                "to": memory_actor,
-                "type": "forceCycleCollection",
-            }))?;
-            let snapshot = self.rdp.request(json!({
-                "to": memory_actor,
-                "type": "saveHeapSnapshot",
-                "boundaries": Value::Null,
-            }))?;
-            let snapshot_id = required_string(&snapshot, "snapshotId")
-                .context("Firefox MemoryActor returned no heap snapshot ID")?;
-            snapshots.capture(&snapshot_id, destination)
-        })();
+        let result = operation(self, &memory_actor);
         let detached = self
             .rdp
             .request(json!({"to": memory_actor, "type": "detach"}))
@@ -191,9 +191,31 @@ impl FirefoxDebugSession {
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(error)) => Err(error.context("failed to detach Firefox MemoryActor")),
             (Err(error), Err(detach)) => Err(error.context(format!(
-                "Firefox heap capture also failed to detach its MemoryActor: {detach:#}"
+                "Firefox MemoryActor work also failed to detach: {detach:#}"
             ))),
         }
+    }
+
+    fn force_collections(&mut self, memory_actor: &str) -> Result<()> {
+        self.rdp.request(json!({
+            "to": memory_actor,
+            "type": "forceGarbageCollection",
+        }))?;
+        self.rdp.request(json!({
+            "to": memory_actor,
+            "type": "forceCycleCollection",
+        }))?;
+        Ok(())
+    }
+
+    fn save_heap_snapshot(&mut self, memory_actor: &str) -> Result<String> {
+        let snapshot = self.rdp.request(json!({
+            "to": memory_actor,
+            "type": "saveHeapSnapshot",
+            "boundaries": Value::Null,
+        }))?;
+        required_string(&snapshot, "snapshotId")
+            .context("Firefox MemoryActor returned no heap snapshot ID")
     }
 }
 

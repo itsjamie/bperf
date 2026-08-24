@@ -170,6 +170,7 @@ fn invalid_result(
         failure_detail: None,
         invalidation_reason: Some(reason.to_owned()),
         metrics: BTreeMap::new(),
+        unsupported_metrics: BTreeMap::new(),
         artifacts: Vec::new(),
     }
 }

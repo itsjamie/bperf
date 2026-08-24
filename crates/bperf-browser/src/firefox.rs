@@ -34,17 +34,19 @@ use crate::{
     firefox_rdp::{FirefoxDebugSession, FirefoxHeapSnapshotFiles, free_port},
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
-        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, ProbeCapture,
-        TrialCapture,
+        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, MetricCapture,
+        ProbeCapture, SamplerOverheadCheck, TrialCapture,
     },
 };
 
-pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 3;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const PROFILER_SETUP_ATTEMPTS: usize = 3;
+const SAMPLER_OVERHEAD_NOT_APPLICABLE_REASON: &str = "allocated bytes come from GCMinor markers \
+     in the Gecko profile every capture already records; no separate sampler runs";
 const FIREFOX_STARTUP_PREFERENCES: &str =
     "user_pref(\"extensions.systemAddon.update.url\", \"\");\n";
 
@@ -269,16 +271,25 @@ impl FirefoxLane {
                 decode_batch_size(selected).context("Firefox batch calibration failed")?;
 
             complete_profiler_setup(&mut debug, &artifacts, request.target_url)?;
+            // GC bookends around the profiled batch: the first empties the
+            // nursery before the profiler window opens, and the second runs
+            // inside it. SpiderMonkey evicts the nursery at the start of a
+            // major GC and records that eviction as a GCMinor marker, so the
+            // window's GCMinor markers cover exactly the batch's allocation.
+            debug.force_garbage_collection()?;
             debug.start_profiler()?;
             let workload = decode_workload(
                 self.connection
                     .evaluate(&page.session_id, &script.execute(batch_size))?,
             )
             .context("Firefox workload execution failed")?;
+            debug.force_garbage_collection()?;
             let profile_source = debug.capture_profile()?;
             let profile = record_profile(&artifacts, &profile_source)?;
             let cpu_active_ms =
                 cpu_active_milliseconds(&profile, request.target_url)? / f64::from(batch_size);
+            let allocated_bytes =
+                nursery_allocated_bytes(&profile, request.target_url)? / f64::from(batch_size);
             self.connection
                 .evaluate(&page.session_id, SETTLE_EXPRESSION)?;
             let heap_path = artifacts.heap_snapshot_path();
@@ -289,6 +300,7 @@ impl FirefoxLane {
                 workload,
                 cpu_active_ms,
                 js_heap_live_bytes: heap_bytes,
+                js_heap_allocated_bytes: MetricCapture::Measured(allocated_bytes),
                 artifacts,
             })
         })();
@@ -354,6 +366,12 @@ impl EngineLane for FirefoxLane {
 
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TrialCapture> {
         FirefoxLane::measure_trial(self, request)
+    }
+
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck> {
+        Ok(SamplerOverheadCheck::NotApplicable {
+            reason: SAMPLER_OVERHEAD_NOT_APPLICABLE_REASON.to_owned(),
+        })
     }
 
     fn inspect_benchmark(
@@ -1078,6 +1096,7 @@ struct GeckoThread {
     pid: Value,
     tid: Value,
     samples: GeckoSamples,
+    markers: Option<GeckoMarkers>,
     stack_table: GeckoStackTable,
     frame_table: GeckoFrameTable,
     string_table: Vec<String>,
@@ -1093,6 +1112,20 @@ struct GeckoSamples {
 struct GeckoSampleSchema {
     stack: usize,
     time: usize,
+}
+
+#[derive(Deserialize)]
+struct GeckoMarkers {
+    schema: GeckoMarkerSchema,
+    data: Vec<Vec<Value>>,
+}
+
+/// Marker rows are arrays indexed by this schema, like samples. Only the
+/// payload column is read: a `GCMinor` marker is identified by its payload
+/// `type`, so the marker name's string-table index is never resolved.
+#[derive(Deserialize)]
+struct GeckoMarkerSchema {
+    data: usize,
 }
 
 #[derive(Deserialize)]
@@ -1198,6 +1231,71 @@ fn cpu_active_milliseconds(profile: &GeckoProfile, target_url: &str) -> Result<f
         bail!("Firefox CPU profile has no positive sample duration");
     }
     Ok(duration)
+}
+
+/// Sums `nursery.bytes_used` over the `GCMinor` markers on the main threads of
+/// the processes whose pages match the target. With the GC bookends in
+/// `measure_trial`, that is the batch's nursery allocation. Direct tenured
+/// allocations report only a cell count, never bytes, so they are excluded
+/// from the metric. A `GCMinor` marker without `bytes_used` records an empty
+/// nursery and contributes zero. A marker whose `bytes_used` is not a
+/// non-negative number, or a matching main thread with no marker table at
+/// all, fails the capture; a partial sum must never pass as a measured value.
+fn nursery_allocated_bytes(profile: &GeckoProfile, target_url: &str) -> Result<f64> {
+    fn process_bytes(profile: &GeckoProfile, target_url: &str) -> Result<f64> {
+        let mut bytes = 0.0;
+        if !target_window_ids(profile, target_url).is_empty() {
+            for thread in profile
+                .threads
+                .iter()
+                .filter(|thread| thread.name == "GeckoMain")
+            {
+                bytes += thread_nursery_bytes(thread)?;
+            }
+        }
+        for child in &profile.processes {
+            bytes += process_bytes(child, target_url)?;
+        }
+        Ok(bytes)
+    }
+
+    let bytes = process_bytes(profile, target_url)?;
+    if !bytes.is_finite() {
+        bail!("Firefox profile recorded a non-finite GCMinor nursery total");
+    }
+    // An eviction of an already quiet nursery can report zero bytes for a
+    // batch that allocated almost nothing; report the shared resolution floor
+    // instead of failing the trial, matching the Chromium sampler.
+    Ok(crate::lab::apply_allocated_floor(bytes))
+}
+
+fn thread_nursery_bytes(thread: &GeckoThread) -> Result<f64> {
+    let Some(markers) = &thread.markers else {
+        bail!("Firefox profile has no marker table on the benchmark process's main thread");
+    };
+    let mut bytes = 0.0;
+    for row in &markers.data {
+        let Some(payload) = row.get(markers.schema.data) else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("GCMinor") {
+            continue;
+        }
+        let Some(used) = payload
+            .get("nursery")
+            .and_then(|nursery| nursery.get("bytes_used"))
+        else {
+            continue;
+        };
+        match used.as_f64() {
+            Some(value) if value.is_finite() && value >= 0.0 => bytes += value,
+            _ => bail!(
+                "Firefox profile has a GCMinor marker with a malformed nursery bytes_used of \
+                 {used}"
+            ),
+        }
+    }
+    Ok(bytes)
 }
 
 struct GeckoSample {
@@ -1626,6 +1724,306 @@ mod tests {
             speedscope["shared"]["frames"][0]["name"],
             "js::RunScript (http://127.0.0.1:4317/)"
         );
+    }
+
+    #[test]
+    fn gcminor_nursery_bytes_come_only_from_the_target_process_main_thread() {
+        let marker_schema = json!({
+            "name": 0,
+            "startTime": 1,
+            "endTime": 2,
+            "phase": 3,
+            "data": 4,
+        });
+        let source = json!({
+            "meta": {"interval": 1},
+            "pages": [],
+            "threads": [],
+            "processes": [
+                {
+                    "meta": {"interval": 1, "processType": 2},
+                    "pages": [{
+                        "innerWindowID": 42,
+                        "url": "http://127.0.0.1:4317/"
+                    }],
+                    "threads": [
+                        {
+                            "name": "GeckoMain",
+                            "pid": 10,
+                            "tid": 11,
+                            "samples": {
+                                "schema": {"stack": 0, "time": 1},
+                                "data": [[0, 0]]
+                            },
+                            "markers": {
+                                "schema": marker_schema,
+                                "data": [
+                                    [0, 1.0, 2.0, 1, {
+                                        "type": "GCMinor",
+                                        "nursery": {"bytes_used": 1_024_000}
+                                    }],
+                                    [0, 3.0, 4.0, 1, {
+                                        "type": "GCMinor",
+                                        "nursery": {"bytes_used": 512_000}
+                                    }],
+                                    [1, 5.0, 6.0, 1, {
+                                        "type": "GCMajor",
+                                        "nursery": {"bytes_used": 64_000}
+                                    }],
+                                    [0, 7.0],
+                                    [0, 8.0, 9.0, 1, {
+                                        "type": "GCMinor",
+                                        "nursery": {"reason": "EVICT_NURSERY"}
+                                    }]
+                                ]
+                            },
+                            "stackTable": {
+                                "schema": {"prefix": 0, "frame": 1},
+                                "data": [[null, 0]]
+                            },
+                            "frameTable": {
+                                "schema": {"location": 0, "innerWindowID": 1},
+                                "data": [[0, 42]]
+                            },
+                            "stringTable": ["js::RunScript"]
+                        },
+                        {
+                            "name": "DOM Worker",
+                            "pid": 10,
+                            "tid": 12,
+                            "samples": {
+                                "schema": {"stack": 0, "time": 1},
+                                "data": []
+                            },
+                            "markers": {
+                                "schema": marker_schema,
+                                "data": [
+                                    [0, 1.0, 2.0, 1, {
+                                        "type": "GCMinor",
+                                        "nursery": {"bytes_used": 2_048_000}
+                                    }]
+                                ]
+                            },
+                            "stackTable": {
+                                "schema": {"prefix": 0, "frame": 1},
+                                "data": []
+                            },
+                            "frameTable": {"schema": {"location": 0}, "data": []},
+                            "stringTable": []
+                        }
+                    ],
+                    "processes": []
+                },
+                {
+                    "meta": {"interval": 1, "processType": 2},
+                    "pages": [{
+                        "innerWindowID": 7,
+                        "url": "https://example.com/"
+                    }],
+                    "threads": [{
+                        "name": "GeckoMain",
+                        "pid": 20,
+                        "tid": 21,
+                        "samples": {
+                            "schema": {"stack": 0, "time": 1},
+                            "data": []
+                        },
+                        "markers": {
+                            "schema": marker_schema,
+                            "data": [
+                                [0, 1.0, 2.0, 1, {
+                                    "type": "GCMinor",
+                                    "nursery": {"bytes_used": 4_096_000}
+                                }]
+                            ]
+                        },
+                        "stackTable": {
+                            "schema": {"prefix": 0, "frame": 1},
+                            "data": []
+                        },
+                        "frameTable": {"schema": {"location": 0}, "data": []},
+                        "stringTable": []
+                    }],
+                    "processes": []
+                }
+            ]
+        })
+        .to_string();
+        let profile = parse_profile(&source).unwrap();
+        assert_eq!(
+            nursery_allocated_bytes(&profile, "http://127.0.0.1:4317/").unwrap(),
+            1_536_000.0
+        );
+    }
+
+    #[test]
+    fn profiles_without_gcminor_markers_read_the_floor() {
+        let source = json!({
+            "meta": {"interval": 1},
+            "pages": [{
+                "innerWindowID": 42,
+                "url": "http://127.0.0.1:4317/"
+            }],
+            "threads": [{
+                "name": "GeckoMain",
+                "pid": 10,
+                "tid": 11,
+                "samples": {
+                    "schema": {"stack": 0, "time": 1},
+                    "data": [[0, 0]]
+                },
+                "markers": {
+                    "schema": {"name": 0, "startTime": 1, "endTime": 2, "phase": 3, "data": 4},
+                    "data": [
+                        [0, 1.0, 2.0, 1, {"type": "GCMajor"}]
+                    ]
+                },
+                "stackTable": {
+                    "schema": {"prefix": 0, "frame": 1},
+                    "data": [[null, 0]]
+                },
+                "frameTable": {
+                    "schema": {"location": 0, "innerWindowID": 1},
+                    "data": [[0, 42]]
+                },
+                "stringTable": ["js::RunScript"]
+            }],
+            "processes": []
+        })
+        .to_string();
+        let profile = parse_profile(&source).unwrap();
+        assert_eq!(
+            nursery_allocated_bytes(&profile, "http://127.0.0.1:4317/").unwrap(),
+            crate::lab::JS_HEAP_ALLOCATED_FLOOR_BYTES
+        );
+    }
+
+    #[test]
+    fn target_main_threads_without_marker_tables_fail_explicitly() {
+        let source = json!({
+            "meta": {"interval": 1},
+            "pages": [],
+            "threads": [],
+            "processes": [
+                {
+                    "meta": {"interval": 1, "processType": 2},
+                    "pages": [{
+                        "innerWindowID": 42,
+                        "url": "http://127.0.0.1:4317/"
+                    }],
+                    "threads": [{
+                        "name": "GeckoMain",
+                        "pid": 10,
+                        "tid": 11,
+                        "samples": {
+                            "schema": {"stack": 0, "time": 1},
+                            "data": []
+                        },
+                        "markers": {
+                            "schema": {
+                                "name": 0,
+                                "startTime": 1,
+                                "endTime": 2,
+                                "phase": 3,
+                                "data": 4
+                            },
+                            "data": [
+                                [0, 1.0, 2.0, 1, {
+                                    "type": "GCMinor",
+                                    "nursery": {"bytes_used": 1024}
+                                }]
+                            ]
+                        },
+                        "stackTable": {
+                            "schema": {"prefix": 0, "frame": 1},
+                            "data": []
+                        },
+                        "frameTable": {"schema": {"location": 0}, "data": []},
+                        "stringTable": []
+                    }],
+                    "processes": []
+                },
+                {
+                    "meta": {"interval": 1, "processType": 2},
+                    "pages": [{
+                        "innerWindowID": 43,
+                        "url": "http://127.0.0.1:4317/"
+                    }],
+                    "threads": [{
+                        "name": "GeckoMain",
+                        "pid": 20,
+                        "tid": 21,
+                        "samples": {
+                            "schema": {"stack": 0, "time": 1},
+                            "data": []
+                        },
+                        "stackTable": {
+                            "schema": {"prefix": 0, "frame": 1},
+                            "data": []
+                        },
+                        "frameTable": {"schema": {"location": 0}, "data": []},
+                        "stringTable": []
+                    }],
+                    "processes": []
+                }
+            ]
+        })
+        .to_string();
+        let profile = parse_profile(&source).unwrap();
+        let error = nursery_allocated_bytes(&profile, "http://127.0.0.1:4317/").unwrap_err();
+        assert!(error.to_string().contains("no marker table"));
+    }
+
+    #[test]
+    fn malformed_gcminor_payloads_fail_explicitly() {
+        for bytes_used in [json!("2048"), json!(-64)] {
+            let source = json!({
+                "meta": {"interval": 1},
+                "pages": [{
+                    "innerWindowID": 42,
+                    "url": "http://127.0.0.1:4317/"
+                }],
+                "threads": [{
+                    "name": "GeckoMain",
+                    "pid": 10,
+                    "tid": 11,
+                    "samples": {
+                        "schema": {"stack": 0, "time": 1},
+                        "data": []
+                    },
+                    "markers": {
+                        "schema": {
+                            "name": 0,
+                            "startTime": 1,
+                            "endTime": 2,
+                            "phase": 3,
+                            "data": 4
+                        },
+                        "data": [
+                            [0, 1.0, 2.0, 1, {
+                                "type": "GCMinor",
+                                "nursery": {"bytes_used": 1024}
+                            }],
+                            [0, 3.0, 4.0, 1, {
+                                "type": "GCMinor",
+                                "nursery": {"bytes_used": bytes_used}
+                            }]
+                        ]
+                    },
+                    "stackTable": {
+                        "schema": {"prefix": 0, "frame": 1},
+                        "data": []
+                    },
+                    "frameTable": {"schema": {"location": 0}, "data": []},
+                    "stringTable": []
+                }],
+                "processes": []
+            })
+            .to_string();
+            let profile = parse_profile(&source).unwrap();
+            let error = nursery_allocated_bytes(&profile, "http://127.0.0.1:4317/").unwrap_err();
+            assert!(error.to_string().contains("malformed nursery bytes_used"));
+        }
     }
 
     #[test]

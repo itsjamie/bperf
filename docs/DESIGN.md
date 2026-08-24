@@ -129,6 +129,11 @@ sample for the benchmark case. Shared workers and service workers are not part
 of the common contract; an adapter that exposes one as a separate target fails
 instead of omitting it.
 
+`browser.js_heap.allocated_bytes` is the one metric that departs from this
+table: it carries an explicit per-engine support state instead of a preflight
+failure, because the metric itself, not a required artifact, is what one
+engine cannot yet produce. See "Allocated bytes" below.
+
 ### Correctness comes first
 
 A faster candidate that returns the wrong result is negative, not improved.
@@ -351,6 +356,7 @@ The resulting sample contains:
 - `variant.call_wall_ms`;
 - `browser.cpu_profile.active_ms`;
 - `browser.js_heap.live_bytes`;
+- `browser.js_heap.allocated_bytes`, on the engines that can capture it;
 - one complete native CPU, Speedscope, and heap artifact group for every
   capture scope.
 
@@ -375,6 +381,52 @@ pilot sizing already warms the retained lane.
 [ADR 0005](adr/0005-combined-final-trials.md) records why timing, CPU, and heap
 are captured around one execution rather than scheduled as independent streams.
 
+### Allocated bytes
+
+`browser.js_heap.allocated_bytes` is bytes allocated on the page's JS heap
+during the calibrated batch, divided by batch size the way `cpu_active_ms` is.
+It is not attributed to benchmark frames, so it includes the harness's
+per-call result serialization; that cost is constant across baseline and
+candidate. Unlike `browser.js_heap.live_bytes`, which is a snapshot taken
+after a forced GC, this metric counts what the batch allocated even if the
+collector reclaimed it before the snapshot, which is the only way to see a
+change in garbage generated rather than garbage retained.
+
+The metric has a resolution floor of one Chromium sampling interval (128 KB
+per batch): a batch whose captured allocation lands below the floor is
+reported as exactly the floor on every engine. A workload that allocates
+almost nothing would otherwise read zero on Chromium only when no allocation
+sample happened to land, which is a coin flip rather than a measurement; the
+floor makes sub-resolution workloads read one deterministic value everywhere.
+
+Support is explicit per engine rather than pooled or silently downgraded:
+
+- Chromium: `sum(selfSize)` over the CDP `HeapProfiler` sampling heap profile
+  taken across the batch, 128 KB sampling interval, with objects collected by
+  major and minor GC both included.
+- Firefox: `sum(GCMinor.nursery.bytes_used)` from the Gecko Profiler markers
+  on the content process's main thread, with forced-GC bookends so the
+  nursery is empty at both ends of the batch. Direct tenured allocations only
+  report a cell count, not bytes, so they are excluded from the sum; the
+  metric undercounts by that share.
+- WebKit: unsupported. The pinned Web Inspector protocol has no
+  `Heap.getStatistics` command, so there is no way to read allocated bytes
+  without a wall-time-tripling `JSC_gcMaxHeapSize` workaround. Tracked
+  upstream at [bperf issue #4](https://github.com/itsjamie/bperf/issues/4).
+
+A trial that cannot capture the metric records an explicit reason instead of
+a value or a zero. `bperf doctor`, the run summary, and both TUIs render
+`n/a (unsupported: reason)` for that engine rather than a number, and
+`analyze_engine` builds its effects only from metrics the engine supports, so
+verdict semantics are unaffected by an engine that cannot report it.
+
+`bperf doctor` also checks the Chromium sampler's wall cost on each host. It
+runs a fixed allocation workload once with the sampler off and once with it
+on, reports both median wall times, and warns when the sampled run is more
+than 5% slower, the minimum effect the decision policy resolves. Firefox and
+WebKit run no sampler inside the timed batch, so the doctor reports the check
+as not applicable for them.
+
 ## Native browser adapters
 
 All engines use browser archives published for one pinned Playwright version.
@@ -393,6 +445,7 @@ installed Safari application.
 | Automation | CDP remote-debugging pipe | Juggler pipe | Inspector pipe to patched WebKit |
 | CPU | CDP `Profiler` | Gecko Profiler through RDP | Web Inspector `ScriptProfiler` |
 | JavaScript heap | CDP `HeapProfiler` | RDP `MemoryActor` | Web Inspector `Heap` |
+| Allocated bytes | CDP `HeapProfiler.startSampling`, 128 KB | RDP Gecko Profiler `GCMinor` markers | unsupported, no `Heap.getStatistics` |
 | Flamegraph | V8 samples to Speedscope | Gecko tables to Speedscope | Inspector samples to Speedscope |
 | Capture scopes | Page plus separately attached dedicated workers and OOPIFs | One browser context containing page, iframe, and DOM-worker evidence | Page, including iframe work, plus each nested dedicated worker |
 
@@ -757,9 +810,9 @@ and activates each cache directory atomically. Linux `--with-deps` installs the
 package set fixed by the same registry. Browser binaries remain separate
 because they are platform-specific and substantially larger than bperf.
 
-Capture protocol 13, benchmark-host protocol 2, environment schema 6,
-measurement schema 5, and doctor schema 2 identify the child-realm-capable
-ownership model. Each Rust adapter protocol is version 2. Environment and
+Capture protocol 14, benchmark-host protocol 2, environment schema 6,
+measurement schema 6, and doctor schema 3 identify the allocation-metric-capable
+ownership model. Each Rust adapter protocol is version 3. Environment and
 measurement records from earlier capture shapes require remeasurement.
 
 ## CLI

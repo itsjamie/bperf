@@ -1,8 +1,9 @@
 //! Complete capture-file identity, validation, and Speedscope construction.
 //!
 //! Native payload construction and sample/frame selection remain engine-specific.
-//! Each prepared capture scope replaces exactly its three expected files and
-//! can finish only after producing nonempty CPU, heap, and flamegraph evidence.
+//! Each prepared capture scope replaces exactly its engine's expected files and
+//! can finish only after producing nonempty evidence for every kind in that
+//! engine's layout.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -17,12 +18,6 @@ use sha2::{Digest, Sha256};
 
 use crate::lab::{ArtifactEvidence, ArtifactKind, Engine};
 
-const REQUIRED_KINDS: [ArtifactKind; 3] = [
-    ArtifactKind::CpuProfile,
-    ArtifactKind::JsHeap,
-    ArtifactKind::Flamegraph,
-];
-
 #[derive(Clone, Copy)]
 struct ArtifactSpec {
     kind: ArtifactKind,
@@ -35,7 +30,7 @@ struct ArtifactFile {
     name: String,
 }
 
-const CHROMIUM_LAYOUT: [ArtifactSpec; 3] = [
+const CHROMIUM_LAYOUT: [ArtifactSpec; 4] = [
     ArtifactSpec {
         kind: ArtifactKind::CpuProfile,
         suffix: "cpu.cpuprofile",
@@ -50,6 +45,11 @@ const CHROMIUM_LAYOUT: [ArtifactSpec; 3] = [
         kind: ArtifactKind::Flamegraph,
         suffix: "flamegraph.speedscope.json",
         format: "Speedscope sampled profile",
+    },
+    ArtifactSpec {
+        kind: ArtifactKind::HeapSamplingProfile,
+        suffix: "heap-sampling.json",
+        format: "V8 sampling heap profile",
     },
 ];
 const FIREFOX_LAYOUT: [ArtifactSpec; 3] = [
@@ -87,7 +87,7 @@ const WEBKIT_LAYOUT: [ArtifactSpec; 3] = [
     },
 ];
 
-fn layout(engine: Engine) -> &'static [ArtifactSpec; 3] {
+fn layout(engine: Engine) -> &'static [ArtifactSpec] {
     match engine {
         Engine::Chromium => &CHROMIUM_LAYOUT,
         Engine::Firefox => &FIREFOX_LAYOUT,
@@ -95,7 +95,7 @@ fn layout(engine: Engine) -> &'static [ArtifactSpec; 3] {
     }
 }
 
-/// Prepares and completes the three immutable files required for one capture scope.
+/// Prepares and completes the immutable files required for one capture scope.
 ///
 /// Existing files at the engine's expected paths are replaced before capture.
 /// [`finish`](Self::finish) fails unless every required file is nonempty.
@@ -103,7 +103,7 @@ pub(crate) struct CaptureArtifacts {
     engine: Engine,
     capture_scope: String,
     root: PathBuf,
-    files: [ArtifactFile; 3],
+    files: Vec<ArtifactFile>,
 }
 
 impl CaptureArtifacts {
@@ -122,10 +122,13 @@ impl CaptureArtifacts {
         })?;
         let root = fs::canonicalize(root)
             .with_context(|| format!("failed to resolve artifact directory {}", root.display()))?;
-        let files = layout(engine).map(|spec| ArtifactFile {
-            spec,
-            name: artifact_name(engine, capture_scope, spec.suffix),
-        });
+        let files = layout(engine)
+            .iter()
+            .map(|spec| ArtifactFile {
+                spec: *spec,
+                name: artifact_name(engine, capture_scope, spec.suffix),
+            })
+            .collect::<Vec<_>>();
         for file in &files {
             replace_existing(&root.join(&file.name))?;
         }
@@ -147,6 +150,13 @@ impl CaptureArtifacts {
 
     pub(crate) fn write_heap_snapshot(&self, contents: impl AsRef<[u8]>) -> Result<()> {
         self.write(self.file(ArtifactKind::JsHeap), contents.as_ref())
+    }
+
+    pub(crate) fn write_heap_sampling_profile(&self, contents: impl AsRef<[u8]>) -> Result<()> {
+        self.write(
+            self.file(ArtifactKind::HeapSamplingProfile),
+            contents.as_ref(),
+        )
     }
 
     pub(crate) fn write_flamegraph(&self, document: &SpeedscopeDocument) -> Result<()> {
@@ -262,7 +272,8 @@ pub(crate) fn validate_artifacts(
 }
 
 pub fn validate_artifact_set(engine: Engine, artifacts: &[ArtifactEvidence]) -> Result<()> {
-    let expected_kinds = HashSet::from(REQUIRED_KINDS);
+    let expected_kinds: HashSet<ArtifactKind> =
+        layout(engine).iter().map(|spec| spec.kind).collect();
     let mut scopes = HashMap::<&str, HashSet<ArtifactKind>>::new();
     let mut paths = HashSet::new();
     for artifact in artifacts {
@@ -590,6 +601,11 @@ mod tests {
             fs::write(artifacts.heap_snapshot_path(), b"native heap").unwrap();
         }
         artifacts.write_flamegraph(&test_flamegraph()).unwrap();
+        if engine == Engine::Chromium {
+            artifacts
+                .write_heap_sampling_profile(b"native heap sampling")
+                .unwrap();
+        }
         artifacts.finish().unwrap()
     }
 
@@ -598,18 +614,19 @@ mod tests {
         for (engine, expected) in [
             (
                 Engine::Chromium,
-                [
+                vec![
                     ("chromium.cpu.cpuprofile", "V8 CPU profile"),
                     ("chromium.heap.heapsnapshot", "V8 heap snapshot"),
                     (
                         "chromium.flamegraph.speedscope.json",
                         "Speedscope sampled profile",
                     ),
+                    ("chromium.heap-sampling.json", "V8 sampling heap profile"),
                 ],
             ),
             (
                 Engine::Firefox,
-                [
+                vec![
                     ("firefox.cpu.json", "Gecko Profiler JSON"),
                     ("firefox.heap.fxsnapshot", "Firefox .fxsnapshot"),
                     (
@@ -620,7 +637,7 @@ mod tests {
             ),
             (
                 Engine::Webkit,
-                [
+                vec![
                     ("webkit.cpu.json", "WebKit ScriptProfiler JSON"),
                     ("webkit.heap.json", "WebKit Heap snapshot JSON"),
                     (
@@ -644,7 +661,10 @@ mod tests {
                     .iter()
                     .map(|artifact| artifact.kind)
                     .collect::<Vec<_>>(),
-                REQUIRED_KINDS
+                layout(engine)
+                    .iter()
+                    .map(|spec| spec.kind)
+                    .collect::<Vec<_>>()
             );
             assert!(
                 artifacts
@@ -665,9 +685,12 @@ mod tests {
         worker.write_cpu_profile(b"worker cpu").unwrap();
         fs::write(worker.heap_snapshot_path(), b"worker heap").unwrap();
         worker.write_flamegraph(&test_flamegraph()).unwrap();
+        worker
+            .write_heap_sampling_profile(b"worker heap sampling")
+            .unwrap();
         artifacts.extend(worker.finish().unwrap());
 
-        assert_eq!(artifacts.len(), 6);
+        assert_eq!(artifacts.len(), 8);
         assert!(
             artifacts
                 .iter()
