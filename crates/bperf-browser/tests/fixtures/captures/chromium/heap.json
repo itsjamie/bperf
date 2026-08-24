@@ -1,1 +1,1 @@
-{"snapshot":{"meta":{"node_fields":["type","name","id","self_size"]}},"nodes":[0,0,1,64,0,0,2,32]}
+{"snapshot":{"meta":{"node_fields":["type","name","id","self_size"],"node_types":[["hidden","object","code","native"],"string","number","number"]}},"nodes":[1,0,1,64,1,1,2,32,2,2,3,512,3,3,4,256],"strings":["a","b","c","system / ExternalStringData"]}

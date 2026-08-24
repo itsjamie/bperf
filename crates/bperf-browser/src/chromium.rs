@@ -1549,16 +1549,33 @@ fn parse_live_heap_bytes(path: &Path) -> Result<u64> {
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
     ))
     .context("Chromium emitted invalid heap JSON")?;
-    let fields = snapshot
+    let meta = snapshot
         .get("snapshot")
         .and_then(|snapshot| snapshot.get("meta"))
-        .and_then(|meta| meta.get("node_fields"))
+        .context("Chromium emitted an invalid V8 heap snapshot")?;
+    let fields = meta
+        .get("node_fields")
         .and_then(Value::as_array)
         .context("Chromium emitted an invalid V8 heap snapshot")?;
-    let self_size = fields
-        .iter()
-        .position(|field| field.as_str() == Some("self_size"))
-        .context("Chromium heap snapshot has no self_size field")?;
+    let field_index = |name: &str| {
+        fields
+            .iter()
+            .position(|field| field.as_str() == Some(name))
+            .with_context(|| format!("Chromium heap snapshot has no {name} field"))
+    };
+    let self_size = field_index("self_size")?;
+    let type_index = field_index("type")?;
+    let name_index = field_index("name")?;
+    let node_types = meta
+        .get("node_types")
+        .and_then(Value::as_array)
+        .and_then(|types| types.get(type_index))
+        .and_then(Value::as_array)
+        .context("Chromium heap snapshot has no node type table")?;
+    let strings = snapshot
+        .get("strings")
+        .and_then(Value::as_array)
+        .context("Chromium heap snapshot has no string table")?;
     let nodes = snapshot
         .get("nodes")
         .and_then(Value::as_array)
@@ -1567,10 +1584,34 @@ fn parse_live_heap_bytes(path: &Path) -> Result<u64> {
         bail!("Chromium emitted an invalid V8 heap snapshot");
     }
     let mut total = 0_u64;
-    for index in (self_size..nodes.len()).step_by(fields.len()) {
-        let size = nodes[index]
+    for base in (0..nodes.len()).step_by(fields.len()) {
+        let size = nodes[base + self_size]
             .as_u64()
             .context("Chromium heap snapshot contains an invalid node size")?;
+        let type_id = nodes[base + type_index]
+            .as_u64()
+            .context("Chromium heap snapshot contains an invalid node type")?;
+        let node_type = node_types
+            .get(usize::try_from(type_id).unwrap_or(usize::MAX))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // The metric is retained data. JIT code and script source scale with
+        // the amount of source loaded, so a change that adds code would
+        // otherwise read as a heap regression proportional to the code added
+        // (bperf issue #6).
+        if node_type == "code" {
+            continue;
+        }
+        if node_type == "native" {
+            let name_id = nodes[base + name_index].as_u64().unwrap_or(u64::MAX);
+            let name = strings
+                .get(usize::try_from(name_id).unwrap_or(usize::MAX))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if name == "system / ExternalStringData" {
+                continue;
+            }
+        }
         total = total
             .checked_add(size)
             .context("Chromium heap snapshot size overflowed")?;

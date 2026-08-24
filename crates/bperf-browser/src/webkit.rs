@@ -2230,9 +2230,42 @@ fn benchmark_profile_cpu_milliseconds(value: &Value, target_url: &str) -> Result
     Ok(count as f64)
 }
 
+/// JSC classes that hold compiled code or script source rather than retained
+/// data. They scale with the amount of source loaded, so a change that adds
+/// code would otherwise read as a heap regression proportional to the code
+/// added (bperf issue #6).
+const WEBKIT_CODE_CLASSES: &[&str] = &[
+    "EvalCodeBlock",
+    "EvalExecutable",
+    "FunctionCodeBlock",
+    "FunctionExecutable",
+    "JSSourceCode",
+    "ModuleProgramCodeBlock",
+    "ModuleProgramExecutable",
+    "NativeExecutable",
+    "ProgramCodeBlock",
+    "ProgramExecutable",
+    "UnlinkedEvalCodeBlock",
+    "UnlinkedFunctionCodeBlock",
+    "UnlinkedFunctionExecutable",
+    "UnlinkedModuleProgramCodeBlock",
+    "UnlinkedProgramCodeBlock",
+];
+
 fn parse_live_heap_bytes(snapshot_data: &str) -> Result<u64> {
     let snapshot: Value =
         serde_json::from_str(snapshot_data).context("WebKit emitted invalid heap JSON")?;
+    let class_names = snapshot
+        .get("nodeClassNames")
+        .and_then(Value::as_array)
+        .context("WebKit heap snapshot has no class name table")?;
+    let excluded: Vec<bool> = class_names
+        .iter()
+        .map(|name| {
+            name.as_str()
+                .is_some_and(|name| WEBKIT_CODE_CLASSES.contains(&name))
+        })
+        .collect();
     let nodes = snapshot
         .get("nodes")
         .and_then(Value::as_array)
@@ -2245,6 +2278,15 @@ fn parse_live_heap_bytes(snapshot_data: &str) -> Result<u64> {
         let size = node[1]
             .as_u64()
             .context("WebKit heap snapshot contains an invalid node size")?;
+        let class_id = node[2]
+            .as_u64()
+            .context("WebKit heap snapshot contains an invalid class index")?;
+        if *excluded
+            .get(usize::try_from(class_id).unwrap_or(usize::MAX))
+            .unwrap_or(&false)
+        {
+            continue;
+        }
         total = total
             .checked_add(size)
             .context("WebKit heap snapshot size overflowed")?;

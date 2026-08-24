@@ -120,7 +120,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "measurement",
             &format!("{measurement_set_id}/environment"),
             &serde_json::json!({
-            "schema_version": 6,
+            "schema_version": 7,
             "recorded_at_unix_ms": 1,
             "fingerprint": environment_fingerprint,
             "identity": identity,
@@ -198,7 +198,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                 "measurement_trials",
                 measurement_set_id,
                 &serde_json::json!({
-                "schema_version": 6,
+                "schema_version": 7,
                 "measurement_set_id": measurement_set_id,
                 "trial_id": trial["trial_id"],
                 "attempt": 1,

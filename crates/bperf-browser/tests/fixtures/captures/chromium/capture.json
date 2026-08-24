@@ -14,8 +14,8 @@
       "capture_scope": "page",
       "kind": "js_heap",
       "path": "heap.json",
-      "size_bytes": 99,
-      "sha256": "9cc6634bc7e92459abdee9d68334f10de96a7919bda929cae388039fbde71740",
+      "size_bytes": 251,
+      "sha256": "c7cc2e98b635934f6a31279da135f036e538d35ea4580187e9d92b90a63a6dd1",
       "format": "V8 heap snapshot"
     },
     {

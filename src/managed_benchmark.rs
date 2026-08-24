@@ -329,6 +329,22 @@ fn compare_current(
             )),
         ));
     }
+    // A baseline recorded for a different benchmark specification (the
+    // benchmark module or fixtures changed) cannot be compared against
+    // either; surface the reason and let the fresh measurement be promoted.
+    let baseline_set = bperf_measurement::store::MeasurementSet::open(&baseline_root)?;
+    let candidate_set =
+        bperf_measurement::store::MeasurementSet::open(measurement.measurement_root())?;
+    if baseline_set.benchmark_sha256() != candidate_set.benchmark_sha256() {
+        return Ok((
+            None,
+            Some(
+                "promoted baseline was recorded for a different benchmark specification; \
+                 promote a new baseline"
+                    .to_owned(),
+            ),
+        ));
+    }
     let comparison = comparison::run(comparison::CompareOptions {
         candidate_root: measurement.measurement_root().to_owned(),
         baseline_root: Some(baseline_root),
