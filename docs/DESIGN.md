@@ -370,7 +370,9 @@ settling, and heap-capture time are outside `workload.wall_ms`. The same
 contract applies to baseline and candidate within an engine.
 
 The CPU metric is restricted to activity attributed to the benchmark target.
-The heap metric is derived from the retained native snapshot. Neither claims to
+The heap metric is derived from the retained native snapshot. The benchmark
+bundle is served without a source map, so the retained heap does not carry a
+map data URL that grows with the bundled source text. Neither claims to
 measure whole-process CPU, RSS, native allocation, or browser-network-process
 work.
 

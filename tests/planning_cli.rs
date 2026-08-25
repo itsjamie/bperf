@@ -4,6 +4,7 @@ use std::{
     process::Command,
 };
 
+use bperf_measurement::MEASUREMENT_SCHEMA_VERSION;
 use bperf_storage::database::Database;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -120,7 +121,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "measurement",
             &format!("{measurement_set_id}/environment"),
             &serde_json::json!({
-            "schema_version": 7,
+            "schema_version": MEASUREMENT_SCHEMA_VERSION,
             "recorded_at_unix_ms": 1,
             "fingerprint": environment_fingerprint,
             "identity": identity,
@@ -198,7 +199,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                 "measurement_trials",
                 measurement_set_id,
                 &serde_json::json!({
-                "schema_version": 7,
+                "schema_version": MEASUREMENT_SCHEMA_VERSION,
                 "measurement_set_id": measurement_set_id,
                 "trial_id": trial["trial_id"],
                 "attempt": 1,

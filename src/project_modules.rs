@@ -5,7 +5,6 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +12,7 @@ use bperf_runtime::installation::portable_path;
 use rolldown::{
     AttachDebugInfo, BundlerBuilder, BundlerOptions, BundlerTransformOptions, CodeSplittingMode,
     Either, ExperimentalOptions, InputItem, LegalComments, OutputFormat, Platform, ResolveOptions,
-    SourceMapPathTransform, SourceMapType, TreeshakeOptions, TsConfig,
+    TreeshakeOptions, TsConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -229,8 +228,6 @@ async fn bundle_source(
         cwd: Some(root.to_owned()),
         platform: Some(Platform::Browser),
         format: Some(OutputFormat::Esm),
-        sourcemap: Some(SourceMapType::Inline),
-        sourcemap_path_transform: Some(source_map_path_transform(root, browser_sdk)),
         resolve: Some(ResolveOptions {
             alias: Some(vec![(
                 "bperf/browser".to_owned(),
@@ -318,24 +315,6 @@ fn collect_source_files<'a>(
         source_files.insert(source);
     }
     Ok(source_files.into_iter().collect())
-}
-
-fn source_map_path_transform(root: &Path, browser_sdk: &Path) -> SourceMapPathTransform {
-    let root = root.to_owned();
-    let browser_sdk = browser_sdk.to_owned();
-    let browser_sdk_alias = PathBuf::from(portable_path(&browser_sdk));
-    SourceMapPathTransform::new(Arc::new(move |source, _| {
-        let source_path = Path::new(source);
-        let transformed = if source_path == browser_sdk || source_path == browser_sdk_alias {
-            "bperf/browser".to_owned()
-        } else {
-            source_path.strip_prefix(&root).map_or_else(
-                |_| source.to_owned(),
-                |relative| relative.to_string_lossy().replace('\\', "/"),
-            )
-        };
-        Box::pin(async move { Ok(transformed) })
-    }))
 }
 
 fn record_resolution_files(
@@ -489,7 +468,7 @@ mod tests {
         assert!(source.contains("module.exports = 2"));
         assert!(source.contains("Promise.resolve"));
         assert!(source.contains("exact(40 + packageValue)"));
-        assert!(source.contains("sourceMappingURL=data:application/json"));
+        assert!(!source.contains("sourceMappingURL"));
         assert!(!source.contains(": number"));
 
         let source_files = bundle
