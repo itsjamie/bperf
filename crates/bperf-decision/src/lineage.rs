@@ -590,7 +590,9 @@ pub fn show(options: ShowOptions) -> Result<()> {
         print!("{}", render_cycle(&cycle));
         println!(
             "  promotion readiness: {}",
-            if promotion_readiness.ready {
+            if !cycle.promotable() {
+                "not promotable"
+            } else if promotion_readiness.ready {
                 "ready"
             } else {
                 "confirmation required"
@@ -643,7 +645,7 @@ pub fn accept(options: AcceptOptions) -> Result<AcceptOutcome> {
         eprintln!("{notice}");
     }
     let events = store.read_events(&cycle.benchmark_id)?;
-    require_promotion_confirmation(&cycle, &events)?;
+    require_promotion_ready(&cycle, &events)?;
     let pending = baseline::prepare_measurement(Path::new(&cycle.candidate_measurement_path))?;
     if pending.benchmark_id() != cycle.benchmark_id {
         bail!("accepted measurement does not match the cycle benchmark");
@@ -2266,7 +2268,14 @@ fn validate_events(
     Ok(events)
 }
 
-fn require_promotion_confirmation(cycle: &CycleRecord, events: &[LineageEvent]) -> Result<()> {
+fn require_promotion_ready(cycle: &CycleRecord, events: &[LineageEvent]) -> Result<()> {
+    if !cycle.promotable() {
+        bail!(
+            "cycle {} has outcome {} and cannot be promoted; select a measured, positive, or equivalent cycle",
+            cycle.selector(),
+            cycle.outcome()
+        );
+    }
     let readiness = promotion_readiness(cycle, events);
     if readiness.ready {
         return Ok(());
@@ -2288,7 +2297,7 @@ fn promotion_readiness(cycle: &CycleRecord, events: &[LineageEvent]) -> Promotio
     let Some(baseline_measurement_set) = cycle.baseline_measurement_set.as_deref() else {
         return PromotionReadiness {
             confirmation_required: false,
-            ready: true,
+            ready: cycle.promotable(),
             searched_candidates: 0,
             search_threshold: PROMOTION_CONFIRMATION_SEARCHES,
         };
@@ -2304,6 +2313,14 @@ fn promotion_readiness(cycle: &CycleRecord, events: &[LineageEvent]) -> Promotio
             )
         })
         .count();
+    if !cycle.promotable() {
+        return PromotionReadiness {
+            confirmation_required: false,
+            ready: false,
+            searched_candidates,
+            search_threshold: PROMOTION_CONFIRMATION_SEARCHES,
+        };
+    }
     let confirmation_required = searched_candidates >= PROMOTION_CONFIRMATION_SEARCHES;
     let confirmed = !confirmation_required
         || events.iter().any(|event| {
@@ -3229,14 +3246,14 @@ mod tests {
                 .unwrap();
             let events = store.read_events("parser").unwrap();
             if index < PROMOTION_CONFIRMATION_SEARCHES {
-                require_promotion_confirmation(&cycle, &events).unwrap();
+                require_promotion_ready(&cycle, &events).unwrap();
             }
             selected = Some(cycle);
         }
 
         let selected = selected.unwrap();
         let events = store.read_events("parser").unwrap();
-        let error = require_promotion_confirmation(&selected, &events).unwrap_err();
+        let error = require_promotion_ready(&selected, &events).unwrap_err();
         assert!(error.to_string().contains("needs a fresh confirmation"));
         let readiness = promotion_readiness(&selected, &events);
         assert!(readiness.confirmation_required);
@@ -3257,7 +3274,7 @@ mod tests {
             )
             .unwrap();
         let events = store.read_events("parser").unwrap();
-        require_promotion_confirmation(&selected, &events).unwrap();
+        require_promotion_ready(&selected, &events).unwrap();
         let readiness = promotion_readiness(&selected, &events);
         assert!(readiness.confirmation_required);
         assert!(readiness.ready);
@@ -3429,7 +3446,7 @@ mod tests {
         );
 
         let events = store.read_events("parser").unwrap();
-        let error = require_promotion_confirmation(&selected, &events).unwrap_err();
+        let error = require_promotion_ready(&selected, &events).unwrap_err();
         assert!(
             error.to_string().contains(&format!(
                 "run `bperf confirm benchmarks/parser.bench.ts {}`",
@@ -3545,6 +3562,45 @@ mod tests {
             ))
         );
         assert_eq!(negative.next_command(&ready), None);
+
+        let events = store.read_events("parser").unwrap();
+        let negative_readiness = promotion_readiness(&negative, &events);
+        assert!(!negative_readiness.ready);
+        assert!(!negative_readiness.confirmation_required);
+    }
+
+    #[test]
+    fn accept_rejects_negative_cycles_before_opening_the_measurement() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let lineage_root = temporary.path().join("lineages");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&lineage_root).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let negative = store
+            .append_cycle(NewCycle {
+                comparison: Some(comparison("missing-measurement", "negative")),
+                ..module_cycle(state, "missing-measurement")
+            })
+            .unwrap();
+
+        let error = accept(AcceptOptions {
+            cycle_id: negative.selector().to_owned(),
+            benchmark_id: None,
+            root: lineage_root,
+            registry_root: temporary.path().join("baselines"),
+        })
+        .err()
+        .expect("a negative cycle must not be accepted");
+        assert!(
+            error.to_string().contains("cannot be promoted"),
+            "unexpected error: {error}"
+        );
+        assert!(!temporary.path().join("baselines").exists());
     }
 
     #[test]
