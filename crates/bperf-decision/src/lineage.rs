@@ -1103,11 +1103,21 @@ impl LineageStore {
                     &record.cycle_id,
                     &evidence_payload,
                 )?;
-                transaction.append_event(LINEAGE_EVENTS, &record.benchmark_id, &event_payload)?;
+                transaction.append_event_if_unchanged(
+                    LINEAGE_EVENTS,
+                    &record.benchmark_id,
+                    events.len(),
+                    &event_payload,
+                )?;
                 Ok(())
             })?;
         } else {
-            self.append_event(&record.benchmark_id, &event)?;
+            self.database.append_event_if_unchanged(
+                LINEAGE_EVENTS,
+                &record.benchmark_id,
+                events.len(),
+                &event,
+            )?;
         }
         Ok(record)
     }
@@ -1214,8 +1224,10 @@ impl LineageStore {
             outcome: comparison.verdict.clone(),
             comparison,
         };
-        self.append_event(
+        self.database.append_event_if_unchanged(
+            LINEAGE_EVENTS,
             &cycle.benchmark_id,
+            events.len(),
             &LineageEvent::Confirmation(Box::new(record.clone())),
         )?;
         Ok(record)
@@ -1305,6 +1317,7 @@ impl LineageStore {
         validate_events(self.database.path(), events, benchmark_id)
     }
 
+    #[cfg(test)]
     fn append_event(&self, benchmark_id: &str, event: &LineageEvent) -> Result<()> {
         self.database
             .append_event(LINEAGE_EVENTS, benchmark_id, event)

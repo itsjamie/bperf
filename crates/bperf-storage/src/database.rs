@@ -137,6 +137,24 @@ impl Database {
         self.write(|transaction| transaction.append_event(namespace, stream, &payload))
     }
 
+    /// Appends only when the stream still has the number of events observed by
+    /// the caller. This turns a read/derive/append sequence into a safe
+    /// optimistic update instead of allowing a stale derivation to corrupt an
+    /// ordered domain journal.
+    pub fn append_event_if_unchanged<Value: Serialize>(
+        &self,
+        namespace: &str,
+        stream: &str,
+        observed_events: usize,
+        value: &Value,
+    ) -> Result<u64> {
+        let payload = serde_json::to_vec(value)
+            .with_context(|| format!("failed to encode {namespace} event for {stream:?}"))?;
+        self.write(|transaction| {
+            transaction.append_event_if_unchanged(namespace, stream, observed_events, &payload)
+        })
+    }
+
     pub fn read_events<Value: DeserializeOwned>(
         &self,
         namespace: &str,
@@ -457,6 +475,28 @@ impl WriteTransaction<'_> {
         )?;
         u64::try_from(next).context("event sequence does not fit in u64")
     }
+
+    pub fn append_event_if_unchanged(
+        &mut self,
+        namespace: &str,
+        stream: &str,
+        observed_events: usize,
+        payload: &[u8],
+    ) -> Result<u64> {
+        validate_storage_key("namespace", namespace)?;
+        validate_storage_key("event stream", stream)?;
+        let current: i64 = self.transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM storage_events \
+             WHERE namespace = ?1 AND stream = ?2",
+            params![namespace, stream],
+            |row| row.get(0),
+        )?;
+        let observed = i64::try_from(observed_events).context("event count does not fit in i64")?;
+        if current != observed {
+            bail!("{namespace} event stream {stream:?} changed after it was read");
+        }
+        self.append_event(namespace, stream, payload)
+    }
 }
 
 fn initialize_schema(connection: &Connection) -> Result<()> {
@@ -573,6 +613,27 @@ mod tests {
                 .read_last_event::<Record>("test", "history")
                 .unwrap(),
             Some(Record { value: 2 })
+        );
+    }
+
+    #[test]
+    fn conditional_append_rejects_a_stale_stream_snapshot() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        database
+            .append_event_if_unchanged("test", "history", 0, &Record { value: 1 })
+            .unwrap();
+        database
+            .append_event_if_unchanged("test", "history", 1, &Record { value: 2 })
+            .unwrap();
+
+        let error = database
+            .append_event_if_unchanged("test", "history", 1, &Record { value: 3 })
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after it was read"));
+        assert_eq!(
+            database.read_events::<Record>("test", "history").unwrap(),
+            [Record { value: 1 }, Record { value: 2 }]
         );
     }
 

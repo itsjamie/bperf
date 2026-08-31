@@ -715,9 +715,58 @@ impl MeasurementSet {
             );
         }
 
+        let payload = serde_json::to_vec(result).context("failed to encode trial result")?;
         self.database
-            .append_event(MEASUREMENT_TRIALS, self.measurement_set_id(), result)
-            .map(|_| ())
+            .write(|transaction| {
+                let current: Vec<TrialResult> = transaction
+                    .read_events(MEASUREMENT_TRIALS, self.measurement_set_id())?;
+                if current
+                    .iter()
+                    .any(|attempt| attempt.trial_id == result.trial_id && attempt.valid)
+                {
+                    bail!(
+                        "trial {} already has a valid terminal result",
+                        result.trial_id
+                    );
+                }
+                if let Some(expected) = current
+                    .first()
+                    .map(|attempt| &attempt.environment_fingerprint)
+                    && expected != &result.environment_fingerprint
+                {
+                    bail!("trial result environment differs from the measurement set");
+                }
+                let prior_attempts = current
+                    .iter()
+                    .filter(|attempt| attempt.trial_id == result.trial_id)
+                    .count();
+                let expected_attempt = u32::try_from(prior_attempts)
+                    .context("trial attempt count does not fit in u32")?
+                    .checked_add(1)
+                    .context("trial attempt count overflow")?;
+                if result.attempt != expected_attempt {
+                    bail!(
+                        "{} expected attempt {}, received {}",
+                        result.trial_id,
+                        expected_attempt,
+                        result.attempt
+                    );
+                }
+                transaction.append_event_if_unchanged(
+                    MEASUREMENT_TRIALS,
+                    self.measurement_set_id(),
+                    current.len(),
+                    &payload,
+                )?;
+                Ok(())
+            })
+            .with_context(|| {
+                format!(
+                    "measurement set {} changed while trial {} was running; reopen it before retrying",
+                    self.measurement_set_id(),
+                    result.trial_id
+                )
+            })
     }
 
     pub fn final_results(&self, engine: Engine) -> Vec<&TrialResult> {
@@ -1204,6 +1253,39 @@ mod tests {
     }
 
     #[test]
+    fn stale_measurement_handle_cannot_duplicate_a_trial_attempt() {
+        let directory = tempdir().unwrap();
+        let root = prepare(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            Some(20),
+            directory.path(),
+        )
+        .unwrap();
+        let first = MeasurementSet::open(&root).unwrap();
+        let stale = MeasurementSet::open(&root).unwrap();
+        let trial = first.pending_trials()[0];
+        let result = synthetic_result(&first, trial, 100.0);
+        first.append_result(&result).unwrap();
+
+        let error = stale.append_result(&result).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("changed while trial"),
+            "unexpected error: {error:#}"
+        );
+        let reopened = MeasurementSet::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .database
+                .read_events::<TrialResult>(MEASUREMENT_TRIALS, reopened.measurement_set_id())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(reopened.next_attempt(&trial.trial_id), 2);
+    }
+
+    #[test]
     fn adaptive_resume_activates_only_the_locked_final_prefixes() {
         let directory = tempdir().unwrap();
         let root = prepare_adaptive(
@@ -1419,35 +1501,42 @@ mod tests {
     ) {
         for trial in measurement.pending_trials() {
             let metric_value = metric_value(trial);
-            let artifacts = synthetic_artifacts(measurement.root(), &trial.trial_id, trial.engine);
             measurement
-                .append_result(&TrialResult {
-                    schema_version: MEASUREMENT_SCHEMA_VERSION,
-                    measurement_set_id: measurement.measurement_set_id().to_owned(),
-                    trial_id: trial.trial_id.clone(),
-                    attempt: 1,
-                    workload_id: trial.workload_id.clone(),
-                    engine: trial.engine,
-                    phase: trial.phase,
-                    sample_index: trial.sample_index,
-                    environment_fingerprint: "test-environment".into(),
-                    valid: true,
-                    success: true,
-                    failure_category: None,
-                    failure_detail: None,
-                    invalidation_reason: None,
-                    metrics: BTreeMap::from([
-                        ("workload.wall_ms".into(), metric_value),
-                        ("variant.call_wall_ms".into(), metric_value / 2.0),
-                        ("browser.cpu_profile.active_ms".into(), metric_value),
-                        ("browser.js_heap.live_bytes".into(), metric_value),
-                        (CAPTURE_ELAPSED_METRIC.into(), 30.0),
-                        (BATCH_SIZE_METRIC.into(), 1.0),
-                        (TRIAL_ELAPSED_METRIC.into(), 30.0),
-                    ]),
-                    artifacts,
-                })
+                .append_result(&synthetic_result(measurement, trial, metric_value))
                 .unwrap();
+        }
+    }
+
+    fn synthetic_result(
+        measurement: &MeasurementSet,
+        trial: &ScheduledTrial,
+        metric_value: f64,
+    ) -> TrialResult {
+        TrialResult {
+            schema_version: MEASUREMENT_SCHEMA_VERSION,
+            measurement_set_id: measurement.measurement_set_id().to_owned(),
+            trial_id: trial.trial_id.clone(),
+            attempt: measurement.next_attempt(&trial.trial_id),
+            workload_id: trial.workload_id.clone(),
+            engine: trial.engine,
+            phase: trial.phase,
+            sample_index: trial.sample_index,
+            environment_fingerprint: "test-environment".into(),
+            valid: true,
+            success: true,
+            failure_category: None,
+            failure_detail: None,
+            invalidation_reason: None,
+            metrics: BTreeMap::from([
+                ("workload.wall_ms".into(), metric_value),
+                ("variant.call_wall_ms".into(), metric_value / 2.0),
+                ("browser.cpu_profile.active_ms".into(), metric_value),
+                ("browser.js_heap.live_bytes".into(), metric_value),
+                (CAPTURE_ELAPSED_METRIC.into(), 30.0),
+                (BATCH_SIZE_METRIC.into(), 1.0),
+                (TRIAL_ELAPSED_METRIC.into(), 30.0),
+            ]),
+            artifacts: synthetic_artifacts(measurement.root(), &trial.trial_id, trial.engine),
         }
     }
 
