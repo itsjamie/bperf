@@ -24,24 +24,29 @@ use crate::{
     },
     browser_process::BrowserProcess,
     browser_workload::{
-        BENCHMARK_DESCRIPTION_EXPRESSION, BENCHMARK_READY_EXPRESSION, DOCTOR_PROBE_EXPRESSION,
-        RUNTIME_ANCHOR_EXPRESSION, SETTLE_EXPRESSION, VERSION as BROWSER_WORKLOAD_VERSION,
-        WORKLOAD_READY_EXPRESSION, WorkloadScript, bootstrap_source, decode_batch_size,
+        BENCHMARK_DESCRIPTION_EXPRESSION, BENCHMARK_READY_EXPRESSION,
+        DOCTOR_ALLOCATION_PROBE_EXPRESSION, DOCTOR_PROBE_EXPRESSION, RUNTIME_ANCHOR_EXPRESSION,
+        SETTLE_EXPRESSION, VERSION as BROWSER_WORKLOAD_VERSION, WORKLOAD_READY_EXPRESSION,
+        WorkloadScript, bootstrap_source, decode_allocation_probe, decode_batch_size,
         decode_runtime_anchor, decode_workload, default_browser_config, installed_expression,
         is_allowed_adapter_url, is_allowed_trial_url, is_benchmark_code_url,
     },
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
-        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, ProbeCapture,
-        TrialCapture,
+        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, MetricCapture,
+        ProbeCapture, SamplerOverheadCheck, SamplerOverheadEvidence, TrialCapture,
     },
 };
 
-pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 3;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+// 128 KB keeps the sampler inside run-to-run wall noise: 32 KB cost about 15%
+// wall on a real workload while 128 KB was inside noise, measured in hls.js
+// issues/8001-probes/sampling-overhead.mjs.
+const HEAP_SAMPLING_INTERVAL_BYTES: u32 = 131_072;
 
 #[derive(Clone)]
 pub(crate) struct ChromiumAdapter {
@@ -159,6 +164,16 @@ fn chromium_launch_arguments() -> Vec<String> {
     .collect()
 }
 
+/// Collected objects are included so the summed profile estimates every byte
+/// allocated while sampling was active, not just what survived the batch.
+fn heap_sampling_params() -> Value {
+    json!({
+        "samplingInterval": HEAP_SAMPLING_INTERVAL_BYTES,
+        "includeObjectsCollectedByMajorGC": true,
+        "includeObjectsCollectedByMinorGC": true,
+    })
+}
+
 pub(crate) struct ChromiumLane {
     connection: CdpConnection<BrowserProcess>,
     browser: BrowserEvidence,
@@ -230,8 +245,32 @@ impl ChromiumLane {
                 json!({}),
                 REQUEST_TIMEOUT,
             )?;
+            self.connection.send_session(
+                &page.session_id,
+                "HeapProfiler.enable",
+                json!({}),
+                REQUEST_TIMEOUT,
+            )?;
+            self.connection.send_session(
+                &page.session_id,
+                "HeapProfiler.startSampling",
+                heap_sampling_params(),
+                REQUEST_TIMEOUT,
+            )?;
             self.connection
                 .evaluate(&page.session_id, DOCTOR_PROBE_EXPRESSION)?;
+            let sampling = self.connection.send_session(
+                &page.session_id,
+                "HeapProfiler.stopSampling",
+                json!({}),
+                CAPTURE_TIMEOUT,
+            )?;
+            let heap_sampling = sampling
+                .get("profile")
+                .cloned()
+                .context("Chromium heap sampling capture returned no profile")?;
+            sampled_allocation_bytes(&heap_sampling)
+                .context("Chromium heap sampling capture was invalid")?;
             let stopped = self.connection.send_session(
                 &page.session_id,
                 "Profiler.stop",
@@ -252,7 +291,8 @@ impl ChromiumLane {
             self.connection
                 .capture_heap_snapshot(&page.session_id, &heap_path)?;
             parse_live_heap_bytes(&heap_path)?;
-            let artifacts = finish_capture_artifacts(artifacts, &profile, &parsed, None)?;
+            let artifacts =
+                finish_capture_artifacts(artifacts, &profile, &parsed, None, &heap_sampling)?;
             Ok(ProbeCapture {
                 adapter: self.adapter.clone(),
                 browser: self.browser.clone(),
@@ -298,11 +338,23 @@ impl ChromiumLane {
             if !cpu_active_ms.is_finite() || cpu_active_ms <= 0.0 {
                 bail!("Chromium CPU profiles have no positive benchmark sample duration");
             }
+            // A near-allocation-free batch can land under one sampling
+            // interval and legitimately record zero samples; report the
+            // resolution floor instead of failing the trial.
+            let js_heap_allocated_bytes = crate::lab::apply_allocated_floor(
+                profiles
+                    .iter()
+                    .map(|realm| realm.allocated_bytes)
+                    .sum::<f64>(),
+            ) / f64::from(batch_size);
+            if !js_heap_allocated_bytes.is_finite() {
+                bail!("Chromium heap sampling produced a non-finite allocation total");
+            }
 
             self.connection
                 .evaluate(&page.session_id, SETTLE_EXPRESSION)?;
             let mut heap_bytes = 0_u64;
-            let mut artifact_evidence = Vec::with_capacity(profiles.len() * 3);
+            let mut artifact_evidence = Vec::with_capacity(profiles.len() * 4);
             for realm in profiles {
                 let artifacts = CaptureArtifacts::prepare_scope(
                     Engine::Chromium,
@@ -320,6 +372,7 @@ impl ChromiumLane {
                     &realm.source,
                     &realm.profile,
                     Some(request.target_url),
+                    &realm.heap_sampling,
                 )?);
             }
             self.connection.finish_complete_capture()?;
@@ -327,8 +380,60 @@ impl ChromiumLane {
                 workload,
                 cpu_active_ms,
                 js_heap_live_bytes: heap_bytes,
+                js_heap_allocated_bytes: MetricCapture::Measured(js_heap_allocated_bytes),
                 artifacts: artifact_evidence,
             })
+        })();
+        combine_page_close(result, self.connection.close_page(page))
+    }
+
+    /// Runs the doctor allocation workload once with the sampler off and once
+    /// with it on, in the same page, so the doctor can report the sampler's
+    /// wall cost on this host.
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck> {
+        let page = self.connection.open_page(&default_browser_config())?;
+        let result = (|| {
+            let unsampled = decode_allocation_probe(
+                self.connection
+                    .evaluate(&page.session_id, DOCTOR_ALLOCATION_PROBE_EXPRESSION)?,
+            )
+            .context("Chromium unsampled allocation probe failed")?;
+            self.connection.send_session(
+                &page.session_id,
+                "HeapProfiler.enable",
+                json!({}),
+                REQUEST_TIMEOUT,
+            )?;
+            self.connection.send_session(
+                &page.session_id,
+                "HeapProfiler.startSampling",
+                heap_sampling_params(),
+                REQUEST_TIMEOUT,
+            )?;
+            let sampled = decode_allocation_probe(
+                self.connection
+                    .evaluate(&page.session_id, DOCTOR_ALLOCATION_PROBE_EXPRESSION)?,
+            )
+            .context("Chromium sampled allocation probe failed")?;
+            let sampling = self.connection.send_session(
+                &page.session_id,
+                "HeapProfiler.stopSampling",
+                json!({}),
+                CAPTURE_TIMEOUT,
+            )?;
+            let heap_sampling = sampling
+                .get("profile")
+                .cloned()
+                .context("Chromium heap sampling capture returned no profile")?;
+            sampled_allocation_bytes(&heap_sampling)
+                .context("Chromium heap sampling capture was invalid")?;
+            if unsampled.checksum() != sampled.checksum() {
+                bail!("Chromium allocation probe runs produced different checksums");
+            }
+            Ok(SamplerOverheadCheck::Measured(SamplerOverheadEvidence {
+                unsampled_wall_ms: unsampled.median_wall_ms(),
+                sampled_wall_ms: sampled.median_wall_ms(),
+            }))
         })();
         combine_page_close(result, self.connection.close_page(page))
     }
@@ -388,6 +493,10 @@ impl EngineLane for ChromiumLane {
 
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TrialCapture> {
         ChromiumLane::measure_trial(self, request)
+    }
+
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck> {
+        ChromiumLane::sampler_overhead(self)
     }
 
     fn inspect_benchmark(
@@ -498,6 +607,8 @@ struct ChromiumRealmProfile {
     capture_scope: String,
     source: Value,
     profile: ChromiumProfile,
+    heap_sampling: Value,
+    allocated_bytes: f64,
 }
 
 struct CdpConnection<Transport: CdpTransport> {
@@ -1123,6 +1234,18 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
     fn start_profiler(&mut self, session_id: &str) -> Result<()> {
         self.send_session(session_id, "Profiler.enable", json!({}), REQUEST_TIMEOUT)?;
         self.send_session(session_id, "Profiler.start", json!({}), REQUEST_TIMEOUT)?;
+        self.send_session(
+            session_id,
+            "HeapProfiler.enable",
+            json!({}),
+            REQUEST_TIMEOUT,
+        )?;
+        self.send_session(
+            session_id,
+            "HeapProfiler.startSampling",
+            heap_sampling_params(),
+            REQUEST_TIMEOUT,
+        )?;
         self.sessions
             .get_mut(session_id)
             .context("Chromium profiled target disappeared before capture began")?
@@ -1158,6 +1281,20 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
                     "Chromium {target_type} target {target_id} was not included from the start of profile capture"
                 );
             }
+            // Sampling stops before the CPU profiler so the sampled window
+            // stays inside the CPU profile window it started inside.
+            let sampling = self.send_session(
+                &session_id,
+                "HeapProfiler.stopSampling",
+                json!({}),
+                CAPTURE_TIMEOUT,
+            )?;
+            let heap_sampling = sampling.get("profile").cloned().with_context(|| {
+                format!("Chromium {capture_scope} heap sampling capture returned no profile")
+            })?;
+            let allocated_bytes = sampled_allocation_bytes(&heap_sampling).with_context(|| {
+                format!("Chromium {capture_scope} heap sampling capture was invalid")
+            })?;
             let stopped =
                 self.send_session(&session_id, "Profiler.stop", json!({}), CAPTURE_TIMEOUT)?;
             let source = stopped.get("profile").cloned().with_context(|| {
@@ -1174,6 +1311,8 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
                 capture_scope,
                 source,
                 profile,
+                heap_sampling,
+                allocated_bytes,
             });
         }
         Ok(profiles)
@@ -1410,16 +1549,33 @@ fn parse_live_heap_bytes(path: &Path) -> Result<u64> {
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
     ))
     .context("Chromium emitted invalid heap JSON")?;
-    let fields = snapshot
+    let meta = snapshot
         .get("snapshot")
         .and_then(|snapshot| snapshot.get("meta"))
-        .and_then(|meta| meta.get("node_fields"))
+        .context("Chromium emitted an invalid V8 heap snapshot")?;
+    let fields = meta
+        .get("node_fields")
         .and_then(Value::as_array)
         .context("Chromium emitted an invalid V8 heap snapshot")?;
-    let self_size = fields
-        .iter()
-        .position(|field| field.as_str() == Some("self_size"))
-        .context("Chromium heap snapshot has no self_size field")?;
+    let field_index = |name: &str| {
+        fields
+            .iter()
+            .position(|field| field.as_str() == Some(name))
+            .with_context(|| format!("Chromium heap snapshot has no {name} field"))
+    };
+    let self_size = field_index("self_size")?;
+    let type_index = field_index("type")?;
+    let name_index = field_index("name")?;
+    let node_types = meta
+        .get("node_types")
+        .and_then(Value::as_array)
+        .and_then(|types| types.get(type_index))
+        .and_then(Value::as_array)
+        .context("Chromium heap snapshot has no node type table")?;
+    let strings = snapshot
+        .get("strings")
+        .and_then(Value::as_array)
+        .context("Chromium heap snapshot has no string table")?;
     let nodes = snapshot
         .get("nodes")
         .and_then(Value::as_array)
@@ -1428,10 +1584,34 @@ fn parse_live_heap_bytes(path: &Path) -> Result<u64> {
         bail!("Chromium emitted an invalid V8 heap snapshot");
     }
     let mut total = 0_u64;
-    for index in (self_size..nodes.len()).step_by(fields.len()) {
-        let size = nodes[index]
+    for base in (0..nodes.len()).step_by(fields.len()) {
+        let size = nodes[base + self_size]
             .as_u64()
             .context("Chromium heap snapshot contains an invalid node size")?;
+        let type_id = nodes[base + type_index]
+            .as_u64()
+            .context("Chromium heap snapshot contains an invalid node type")?;
+        let node_type = node_types
+            .get(usize::try_from(type_id).unwrap_or(usize::MAX))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // The metric is retained data. JIT code and script source scale with
+        // the amount of source loaded, so a change that adds code would
+        // otherwise read as a heap regression proportional to the code added
+        // (bperf issue #6).
+        if node_type == "code" {
+            continue;
+        }
+        if node_type == "native" {
+            let name_id = nodes[base + name_index].as_u64().unwrap_or(u64::MAX);
+            let name = strings
+                .get(usize::try_from(name_id).unwrap_or(usize::MAX))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if name == "system / ExternalStringData" {
+                continue;
+            }
+        }
         total = total
             .checked_add(size)
             .context("Chromium heap snapshot size overflowed")?;
@@ -1442,15 +1622,45 @@ fn parse_live_heap_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Sums `selfSize` over every node of a V8 sampling heap profile. V8 scales
+/// each sample by its sampling probability, so the sum is an unbiased estimate
+/// of the bytes allocated while sampling was active.
+fn sampled_allocation_bytes(profile: &Value) -> Result<f64> {
+    let head = profile
+        .get("head")
+        .context("Chromium emitted a sampling heap profile with no head")?;
+    let mut total = 0.0_f64;
+    let mut pending = vec![head];
+    while let Some(node) = pending.pop() {
+        let self_size = node
+            .get("selfSize")
+            .and_then(Value::as_f64)
+            .context("Chromium sampling heap profile node has no selfSize")?;
+        if !self_size.is_finite() || self_size < 0.0 {
+            bail!("Chromium sampling heap profile contains an invalid selfSize");
+        }
+        total += self_size;
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            pending.extend(children);
+        }
+    }
+    if !total.is_finite() {
+        bail!("Chromium sampling heap profile size overflowed");
+    }
+    Ok(total)
+}
+
 fn finish_capture_artifacts(
     artifacts: CaptureArtifacts,
     profile_source: &Value,
     profile: &ChromiumProfile,
     target_url: Option<&str>,
+    heap_sampling: &Value,
 ) -> Result<Vec<ArtifactEvidence>> {
     artifacts.write_cpu_profile(serde_json::to_vec(profile_source)?)?;
     let speedscope = chromium_speedscope(profile, target_url)?;
     artifacts.write_flamegraph(&speedscope)?;
+    artifacts.write_heap_sampling_profile(serde_json::to_vec(heap_sampling)?)?;
     artifacts.finish()
 }
 
@@ -1602,6 +1812,9 @@ mod tests {
             3.0
         );
         assert_eq!(parse_live_heap_bytes(&fixture("heap.json")).unwrap(), 96);
+        let heap_sampling: Value =
+            serde_json::from_slice(&fs::read(fixture("heap-sampling.json")).unwrap()).unwrap();
+        assert_eq!(sampled_allocation_bytes(&heap_sampling).unwrap(), 96_256.0);
         let actual = serde_json::to_value(
             chromium_speedscope(&parsed, Some("http://127.0.0.1:4317/")).unwrap(),
         )
@@ -1624,6 +1837,11 @@ mod tests {
         )
         .unwrap();
         assert!(parse_live_heap_bytes(&path).is_err());
+        assert!(sampled_allocation_bytes(&json!({})).is_err());
+        assert!(
+            sampled_allocation_bytes(&json!({"head": {"selfSize": 0, "children": [{}]}})).is_err()
+        );
+        assert!(sampled_allocation_bytes(&json!({"head": {"selfSize": -1.0}})).is_err());
     }
 
     #[test]
@@ -1682,6 +1900,65 @@ mod tests {
         let mut connection = CdpConnection::new(transport, directory.path().join("downloads"));
         connection.capture_heap_snapshot("page", &path).unwrap();
         assert_eq!(parse_live_heap_bytes(&path).unwrap(), 96);
+    }
+
+    #[test]
+    fn heap_sampling_brackets_the_cpu_profile_and_sums_nested_self_sizes() {
+        let cpu: Value = serde_json::from_slice(&fs::read(fixture("cpu.json")).unwrap()).unwrap();
+        let transport = ScriptedTransport {
+            incoming: RefCell::new(VecDeque::from([
+                json!({"id": 1, "result": {}}),
+                json!({"id": 2, "result": {}}),
+                json!({"id": 3, "result": {}}),
+                json!({"id": 4, "result": {}}),
+                json!({"id": 5, "result": {"profile": {
+                    "head": {
+                        "selfSize": 0,
+                        "children": [
+                            {"selfSize": 65536, "children": [{"selfSize": 16384, "children": []}]},
+                            {"selfSize": 14336, "children": []},
+                        ],
+                    },
+                    "samples": [],
+                }}}),
+                json!({"id": 6, "result": {"profile": cpu}}),
+            ])),
+            ..ScriptedTransport::default()
+        };
+        let mut connection = CdpConnection::new(transport, PathBuf::from("downloads"));
+        connection
+            .sessions
+            .insert("page".to_owned(), SessionState::page("target".to_owned()));
+        connection.start_profile_capture().unwrap();
+        let profiles = connection.stop_profile_capture().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].allocated_bytes, 96_256.0);
+
+        let methods = connection
+            .process
+            .sent
+            .iter()
+            .map(|message| message["method"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            [
+                "Profiler.enable",
+                "Profiler.start",
+                "HeapProfiler.enable",
+                "HeapProfiler.startSampling",
+                "HeapProfiler.stopSampling",
+                "Profiler.stop",
+            ]
+        );
+        assert_eq!(
+            connection.process.sent[3]["params"],
+            json!({
+                "samplingInterval": 131072,
+                "includeObjectsCollectedByMajorGC": true,
+                "includeObjectsCollectedByMinorGC": true,
+            })
+        );
     }
 
     #[test]

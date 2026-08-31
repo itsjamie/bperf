@@ -369,6 +369,9 @@ fn pilot_estimates_are_stable(
     let confidence_multiplier = inverse_normal_cdf((1.0 + policy.confidence) / 2.0);
 
     for metric in &policy.primary_metrics {
+        if metric_unsupported(pilots, &metric.name) {
+            continue;
+        }
         let requirements = (first_prefix..=pilots.len())
             .map(|prefix| {
                 let values: Vec<_> = pilots[..prefix]
@@ -399,6 +402,12 @@ fn pilot_estimates_are_stable(
             estimates.len() == STABILITY_PREFIXES
                 && relative_spread(&estimates) <= MEDIAN_ESTIMATE_TOLERANCE
         })
+}
+
+fn metric_unsupported(pilots: &[&TrialResult], metric: &str) -> bool {
+    pilots
+        .iter()
+        .any(|result| result.unsupported_metrics.contains_key(metric))
 }
 
 fn sample_requirements_are_stable(requirements: &[u32]) -> bool {
@@ -511,6 +520,9 @@ pub fn decide(
             .clamp(1.0, f64::from(MAX_BATCH_SIZE)) as u32;
         let mut metrics = Vec::with_capacity(policy.primary_metrics.len());
         for metric in &policy.primary_metrics {
+            if metric_unsupported(pilots, &metric.name) {
+                continue;
+            }
             let values: Vec<_> = pilots
                 .iter()
                 .filter_map(|result| result.metrics.get(&metric.name).copied())
@@ -823,6 +835,34 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_primary_metric_does_not_inflate_the_sample_size() {
+        let schedule = schedule_with_pilots(10, 20, 100, 1_000_000);
+        let results = [99.0, 100.0, 100.5, 100.0, 99.5]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let mut result = pilot_result(Engine::Chromium, index as u32 + 1, value);
+                result.unsupported_metrics.insert(
+                    "browser.js_heap.allocated_bytes".to_owned(),
+                    "collector not implemented yet".to_owned(),
+                );
+                result
+            })
+            .collect::<Vec<_>>();
+        let pilots = results.iter().collect::<Vec<_>>();
+        let mut policy = policy();
+        policy.primary_metrics.push(MetricPolicy {
+            name: "browser.js_heap.allocated_bytes".into(),
+            minimum_effect_pct: 5.0,
+        });
+
+        assert_eq!(
+            pilot_stop_reason(&schedule, &policy, "case", Engine::Chromium, &pilots),
+            Some(PilotStopReason::Stable)
+        );
+    }
+
+    #[test]
     fn budget_allocation_preserves_each_stratum_minimum() {
         let mut strata = vec![
             stratum("case", Engine::Chromium, 100.0, 10),
@@ -1004,6 +1044,7 @@ mod tests {
                 (BATCH_SIZE_METRIC.into(), 1.0),
                 (TRIAL_ELAPSED_METRIC.into(), 60.0),
             ]),
+            unsupported_metrics: BTreeMap::new(),
             artifacts: Vec::new(),
         }
     }

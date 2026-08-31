@@ -150,6 +150,7 @@ impl ComparisonOutcome {
                                     guardrail_regressed: effect.guardrail_regressed,
                                     baseline_value: effect.baseline_value,
                                     candidate_value: effect.candidate_value,
+                                    unsupported_reason: effect.unsupported_reason.clone(),
                                 },
                             )
                         })
@@ -195,6 +196,10 @@ impl ComparisonSummary {
                 engine.engine, engine.verdict, engine.correctness,
             );
             for (metric, effect) in &engine.metrics {
+                if let Some(reason) = &effect.unsupported_reason {
+                    let _ = writeln!(output, "    {metric}: n/a (unsupported: {reason})");
+                    continue;
+                }
                 let improvement = effect
                     .improvement_pct
                     .map_or_else(|| "n/a".to_owned(), |value| format!("{value:+.2}%"));
@@ -257,6 +262,8 @@ pub struct MetricSummary {
     pub baseline_value: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
 }
 
 fn format_metric_values(metric: &str, baseline: f64, candidate: f64) -> String {
@@ -563,9 +570,13 @@ fn analyze_engine(
         .primary_metrics
         .iter()
         .map(|metric| {
-            (
-                metric.name.clone(),
-                metric_effect(
+            let effect = match unsupported_metric_reason(
+                &baseline.results,
+                &candidate.results,
+                &metric.name,
+            ) {
+                Some(reason) => MetricEffect::unsupported(reason, metric.minimum_effect_pct),
+                None => metric_effect(
                     workloads,
                     &baseline.results,
                     &candidate.results,
@@ -573,10 +584,17 @@ fn analyze_engine(
                     policy,
                     derived_seed(seed, &format!("{engine}:{}", metric.name)),
                 ),
-            )
+            };
+            (metric.name.clone(), effect)
         })
         .collect();
-    let metric_verdict = engine_verdict(complete, correctness.gate, effects.values());
+    let metric_verdict = engine_verdict(
+        complete,
+        correctness.gate,
+        effects
+            .values()
+            .filter(|effect| effect.unsupported_reason.is_none()),
+    );
     let verdict = if correctness.gate == Gate::Fail {
         Verdict::Negative
     } else if anchor.status != AnchorStatus::Stable {
@@ -725,7 +743,22 @@ fn metric_effect(
         classification,
         baseline_value: Some(baseline_log_value.exp()),
         candidate_value: Some(candidate_log_value.exp()),
+        unsupported_reason: None,
     }
+}
+
+/// The reason an engine cannot capture `metric`, from the first trial on
+/// either side that recorded one. Metric support is a property of the engine
+/// build, so one recording is enough.
+fn unsupported_metric_reason(
+    baseline_results: &[&TrialResult],
+    candidate_results: &[&TrialResult],
+    metric: &str,
+) -> Option<String> {
+    baseline_results
+        .iter()
+        .chain(candidate_results)
+        .find_map(|trial| trial.unsupported_metrics.get(metric).cloned())
 }
 
 fn grouped_values(
@@ -1165,6 +1198,7 @@ struct MetricEffect {
     classification: Classification,
     baseline_value: Option<f64>,
     candidate_value: Option<f64>,
+    unsupported_reason: Option<String>,
 }
 
 impl MetricEffect {
@@ -1181,6 +1215,14 @@ impl MetricEffect {
             classification: Classification::Inconclusive,
             baseline_value: None,
             candidate_value: None,
+            unsupported_reason: None,
+        }
+    }
+
+    fn unsupported(reason: String, minimum_effect_pct: f64) -> Self {
+        Self {
+            unsupported_reason: Some(reason),
+            ..Self::insufficient(minimum_effect_pct)
         }
     }
 }
@@ -1314,6 +1356,7 @@ mod tests {
             failure_detail: None,
             invalidation_reason: None,
             metrics: BTreeMap::from([("workload.wall_ms".to_owned(), value)]),
+            unsupported_metrics: BTreeMap::new(),
             artifacts: Vec::new(),
         }
     }
@@ -1363,6 +1406,101 @@ mod tests {
             7,
         );
         assert_eq!(effect.classification, Classification::Equivalent);
+    }
+
+    fn stable_anchor(engine: Engine) -> AnchorAnalysis {
+        AnchorAnalysis {
+            engine,
+            status: AnchorStatus::Stable,
+            baseline_samples: 15,
+            candidate_samples: 15,
+            baseline_median_ms: Some(10.0),
+            candidate_median_ms: Some(10.0),
+            drift_pct: Some(0.0),
+            ci_pct: Some([-1.0, 1.0]),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_primary_metric_is_reported_without_affecting_the_verdict() {
+        let allocated = "browser.js_heap.allocated_bytes";
+        let mut policy = policy();
+        policy.primary_metrics.push(MetricPolicy {
+            name: allocated.to_owned(),
+            minimum_effect_pct: 5.0,
+        });
+        let trial = |value: f64, sample_index: u32| {
+            let mut trial = result("workload", true, value, sample_index);
+            trial.unsupported_metrics.insert(
+                allocated.to_owned(),
+                "pinned WebKit protocol has no Heap.getStatistics".to_owned(),
+            );
+            trial
+        };
+        let baseline: Vec<_> = (1..=20).map(|index| trial(100.0, index)).collect();
+        let candidate: Vec<_> = (1..=20).map(|index| trial(90.0, index)).collect();
+
+        let analysis = analyze_engine(
+            Engine::Webkit,
+            &["workload"],
+            EngineInput {
+                expected: 20,
+                results: refs(&baseline),
+                invalid_attempts: 0,
+            },
+            EngineInput {
+                expected: 20,
+                results: refs(&candidate),
+                invalid_attempts: 0,
+            },
+            &policy,
+            7,
+            stable_anchor(Engine::Webkit),
+        );
+
+        assert_eq!(analysis.verdict, Verdict::Positive);
+        let effect = &analysis.effects[allocated];
+        assert_eq!(
+            effect.unsupported_reason.as_deref(),
+            Some("pinned WebKit protocol has no Heap.getStatistics")
+        );
+        assert_eq!(effect.improvement_pct, None);
+        assert_eq!(effect.classification, Classification::Inconclusive);
+    }
+
+    #[test]
+    fn decision_summary_renders_unsupported_metrics_as_not_available() {
+        let summary = ComparisonSummary {
+            comparison_id: "compare-unsupported".to_owned(),
+            report_path: None,
+            baseline_measurement_set: "baseline".to_owned(),
+            candidate_measurement_set: "candidate".to_owned(),
+            environment_fingerprint: None,
+            policy: "strict_all".to_owned(),
+            verdict: "positive".to_owned(),
+            engines: vec![EngineSummary {
+                engine: Engine::Webkit,
+                verdict: "positive".to_owned(),
+                correctness: "pass".to_owned(),
+                anchor: None,
+                metrics: BTreeMap::from([(
+                    "browser.js_heap.allocated_bytes".to_owned(),
+                    MetricSummary {
+                        improvement_pct: None,
+                        ci_pct: None,
+                        classification: "inconclusive".to_owned(),
+                        guardrail_regressed: false,
+                        baseline_value: None,
+                        candidate_value: None,
+                        unsupported_reason: Some("collector not implemented yet".to_owned()),
+                    },
+                )]),
+            }],
+            warnings: Vec::new(),
+        };
+        assert!(summary.render_decision_summary().contains(
+            "    browser.js_heap.allocated_bytes: n/a (unsupported: collector not implemented yet)\n"
+        ));
     }
 
     #[test]
@@ -1473,6 +1611,7 @@ mod tests {
                         guardrail_regressed: true,
                         baseline_value: Some(100.0),
                         candidate_value: Some(104.5),
+                        unsupported_reason: None,
                     },
                 )]),
             }],

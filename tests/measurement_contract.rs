@@ -81,6 +81,26 @@ fn variants_can_be_measured_and_compared_on_every_engine() {
             ] {
                 assert!(record.metrics.get(metric).copied().unwrap() > 0.0);
             }
+            // WebKit has no `Heap.getStatistics` in the pinned protocol yet
+            // (bperf issue #4); every other engine measures the metric.
+            if engine == Engine::Webkit {
+                assert!(
+                    !record
+                        .metrics
+                        .contains_key("browser.js_heap.allocated_bytes")
+                );
+                assert!(!record.unsupported_metrics["browser.js_heap.allocated_bytes"].is_empty());
+            } else {
+                assert!(
+                    record.metrics["browser.js_heap.allocated_bytes"] > 0.0,
+                    "expected {engine} to measure allocated bytes"
+                );
+                assert!(
+                    !record
+                        .unsupported_metrics
+                        .contains_key("browser.js_heap.allocated_bytes")
+                );
+            }
         }
     }
 

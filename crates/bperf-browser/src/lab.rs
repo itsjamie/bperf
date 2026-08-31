@@ -19,7 +19,40 @@ use crate::{
     webkit::WebKitAdapter,
 };
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
+/// Bytes allocated on the page's JS heap during the calibrated batch, divided
+/// by batch size. Engines that cannot capture it record an explicit reason in
+/// `TrialEvidence::unsupported_metrics` instead of a value.
+pub const JS_HEAP_ALLOCATED_BYTES_METRIC: &str = "browser.js_heap.allocated_bytes";
+/// Resolution floor for `browser.js_heap.allocated_bytes`, equal to one
+/// Chromium heap sampling interval. A batch whose captured allocation lands
+/// below the floor is reported as exactly the floor, before the batch-size
+/// division. A workload that allocates almost nothing would otherwise read
+/// zero on Chromium only when no allocation sample happened to land, which is
+/// a coin flip rather than a measurement, and zero is not a recordable metric
+/// value; the floor makes sub-resolution workloads read one deterministic
+/// value on every engine instead of failing their trials.
+pub const JS_HEAP_ALLOCATED_FLOOR_BYTES: f64 = 131_072.0;
+
+/// Applies the resolution floor to a batch's captured allocation total.
+pub(crate) fn apply_allocated_floor(batch_total_bytes: f64) -> f64 {
+    batch_total_bytes.max(JS_HEAP_ALLOCATED_FLOOR_BYTES)
+}
+
+#[cfg(test)]
+mod allocated_floor_tests {
+    use super::*;
+
+    #[test]
+    fn sub_resolution_batches_read_the_floor() {
+        assert_eq!(apply_allocated_floor(0.0), JS_HEAP_ALLOCATED_FLOOR_BYTES);
+        assert_eq!(
+            apply_allocated_floor(50_000.0),
+            JS_HEAP_ALLOCATED_FLOOR_BYTES
+        );
+        assert_eq!(apply_allocated_floor(500_000.0), 500_000.0);
+    }
+}
 const RUNTIME_ANCHOR_WORKLOAD: &str = "javascript_cpu_v1";
 const RUNTIME_ANCHOR_SAMPLES: usize = 31;
 const RUNTIME_ANCHOR_MAX_BATCH_SIZE: u32 = 64;
@@ -125,6 +158,15 @@ impl BrowserLab {
         Ok(evidence)
     }
 
+    /// Measures the wall cost of the engine's in-batch allocation sampler on
+    /// the doctor allocation workload. An engine whose allocation evidence
+    /// runs no sampler inside the timed batch reports the reason instead.
+    pub fn sampler_overhead(&mut self, engine: Engine) -> Result<SamplerOverheadCheck> {
+        let check = self.adapter(engine).sampler_overhead()?;
+        validate_sampler_overhead(engine, &check)?;
+        Ok(check)
+    }
+
     pub fn inspect_benchmark(
         &mut self,
         engine: Engine,
@@ -182,6 +224,7 @@ fn combine_operation_and_shutdown<Value>(
 trait BrowserAdapter {
     fn probe(&mut self, artifact_directory: &Path) -> Result<ProbeCapture>;
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TimedTrialCapture>;
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck>;
     fn inspect_benchmark(
         &mut self,
         target_url: &str,
@@ -201,6 +244,7 @@ pub(crate) trait EngineAdapter: Sized {
 pub(crate) trait EngineLane {
     fn probe(&mut self, artifact_directory: &Path) -> Result<ProbeCapture>;
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TrialCapture>;
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck>;
     fn inspect_benchmark(
         &mut self,
         target_url: &str,
@@ -283,6 +327,10 @@ impl<A: EngineAdapter> BrowserAdapter for RetainedAdapter<A> {
                 capture,
             })
         })
+    }
+
+    fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck> {
+        self.with_lane(|lane| lane.sampler_overhead())
     }
 
     fn inspect_benchmark(
@@ -391,6 +439,7 @@ pub enum ArtifactKind {
     CpuProfile,
     JsHeap,
     Flamegraph,
+    HeapSamplingProfile,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -488,13 +537,49 @@ pub struct TrialEvidence {
     pub capture_elapsed_ms: f64,
     pub workload: WorkloadEvidence,
     pub metrics: BTreeMap<String, f64>,
+    /// Metrics the engine cannot capture, keyed by metric name, each carrying
+    /// a non-empty reason. A metric never appears in both maps.
+    #[serde(default)]
+    pub unsupported_metrics: BTreeMap<String, String>,
     pub artifacts: Vec<ArtifactEvidence>,
+}
+
+/// One optional per-engine metric observation. A `Measured` value is already
+/// divided by batch size, the way `cpu_active_ms` is. `Unsupported` carries
+/// the reason the engine cannot capture the metric.
+pub(crate) enum MetricCapture {
+    Measured(f64),
+    Unsupported(String),
+}
+
+/// Doctor check for the wall cost of an engine's in-batch allocation sampler.
+/// A measured check ran the same fixed allocation workload in one page, once
+/// with the sampler off and once with it on.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SamplerOverheadCheck {
+    Measured(SamplerOverheadEvidence),
+    NotApplicable { reason: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SamplerOverheadEvidence {
+    pub unsampled_wall_ms: f64,
+    pub sampled_wall_ms: f64,
+}
+
+impl SamplerOverheadEvidence {
+    /// Wall added by the sampler as a percentage of the unsampled run.
+    pub fn overhead_pct(&self) -> f64 {
+        (self.sampled_wall_ms / self.unsampled_wall_ms - 1.0) * 100.0
+    }
 }
 
 pub(crate) struct TrialCapture {
     pub(crate) workload: WorkloadEvidence,
     pub(crate) cpu_active_ms: f64,
     pub(crate) js_heap_live_bytes: u64,
+    pub(crate) js_heap_allocated_bytes: MetricCapture,
     pub(crate) artifacts: Vec<ArtifactEvidence>,
 }
 
@@ -512,10 +597,11 @@ impl TimedTrialCapture {
                     workload,
                     cpu_active_ms,
                     js_heap_live_bytes,
+                    js_heap_allocated_bytes,
                     artifacts,
                 },
         } = self;
-        let metrics = BTreeMap::from([
+        let mut metrics = BTreeMap::from([
             ("workload.wall_ms".to_owned(), workload.workload_wall_ms),
             (
                 "variant.call_wall_ms".to_owned(),
@@ -532,10 +618,20 @@ impl TimedTrialCapture {
                 f64::from(workload.batch_size),
             ),
         ]);
+        let mut unsupported_metrics = BTreeMap::new();
+        match js_heap_allocated_bytes {
+            MetricCapture::Measured(value) => {
+                metrics.insert(JS_HEAP_ALLOCATED_BYTES_METRIC.to_owned(), value);
+            }
+            MetricCapture::Unsupported(reason) => {
+                unsupported_metrics.insert(JS_HEAP_ALLOCATED_BYTES_METRIC.to_owned(), reason);
+            }
+        }
         TrialEvidence {
             capture_elapsed_ms: elapsed_ms,
             workload,
             metrics,
+            unsupported_metrics,
             artifacts,
         }
     }
@@ -724,7 +820,7 @@ fn validate_trial_evidence(
         bail!("{engine} trial did not honor its batch plan");
     }
 
-    let required_metrics = HashSet::from([
+    let mut required_metrics = HashSet::from([
         "workload.wall_ms",
         "variant.call_wall_ms",
         "browser.cpu_profile.active_ms",
@@ -732,6 +828,20 @@ fn validate_trial_evidence(
         "bperf.capture.elapsed_ms",
         "bperf.batch_size",
     ]);
+    for (metric, reason) in &evidence.unsupported_metrics {
+        if metric != JS_HEAP_ALLOCATED_BYTES_METRIC {
+            bail!("{engine} trial marked unknown metric {metric:?} as unsupported");
+        }
+        if reason.trim().is_empty() {
+            bail!("{engine} trial marked metric {metric:?} as unsupported without a reason");
+        }
+    }
+    if !evidence
+        .unsupported_metrics
+        .contains_key(JS_HEAP_ALLOCATED_BYTES_METRIC)
+    {
+        required_metrics.insert(JS_HEAP_ALLOCATED_BYTES_METRIC);
+    }
     let actual_metrics: HashSet<_> = evidence.metrics.keys().map(String::as_str).collect();
     if actual_metrics != required_metrics {
         bail!("{engine} trial returned invalid metrics: {actual_metrics:?}");
@@ -754,6 +864,31 @@ fn validate_trial_evidence(
         bail!("{engine} trial metrics do not match their capture evidence");
     }
     validate_artifacts(engine, root, &evidence.artifacts)
+}
+
+fn validate_sampler_overhead(engine: Engine, check: &SamplerOverheadCheck) -> Result<()> {
+    match check {
+        SamplerOverheadCheck::Measured(evidence) => {
+            if !evidence.unsampled_wall_ms.is_finite()
+                || evidence.unsampled_wall_ms <= 0.0
+                || !evidence.sampled_wall_ms.is_finite()
+                || evidence.sampled_wall_ms <= 0.0
+            {
+                bail!(
+                    "{engine} sampler overhead check returned invalid timing \
+                     (unsampled_wall_ms={}, sampled_wall_ms={})",
+                    evidence.unsampled_wall_ms,
+                    evidence.sampled_wall_ms,
+                );
+            }
+        }
+        SamplerOverheadCheck::NotApplicable { reason } => {
+            if reason.trim().is_empty() {
+                bail!("{engine} sampler overhead check reported not applicable without a reason");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -809,6 +944,10 @@ mod tests {
             unreachable!("trial capture is outside this lifecycle test")
         }
 
+        fn sampler_overhead(&mut self) -> Result<SamplerOverheadCheck> {
+            unreachable!("sampler overhead is outside this lifecycle test")
+        }
+
         fn inspect_benchmark(
             &mut self,
             target_url: &str,
@@ -853,11 +992,15 @@ mod tests {
 
     fn valid_evidence(root: &Path, engine: Engine) -> CaptureEvidence {
         let mut artifacts = Vec::new();
-        for (kind, name) in [
+        let mut layout = vec![
             (ArtifactKind::CpuProfile, "cpu.json"),
             (ArtifactKind::JsHeap, "heap.json"),
             (ArtifactKind::Flamegraph, "flamegraph.json"),
-        ] {
+        ];
+        if engine == Engine::Chromium {
+            layout.push((ArtifactKind::HeapSamplingProfile, "heap-sampling.json"));
+        }
+        for (kind, name) in layout {
             let bytes = format!("artifact-{name}").into_bytes();
             fs::write(root.join(name), &bytes).unwrap();
             artifacts.push(ArtifactEvidence {
@@ -918,6 +1061,15 @@ mod tests {
     }
 
     fn valid_trial_evidence(root: &Path, engine: Engine, batch_size: u32) -> TrialEvidence {
+        trial_evidence_with_allocation(root, engine, batch_size, MetricCapture::Measured(2_048.0))
+    }
+
+    fn trial_evidence_with_allocation(
+        root: &Path,
+        engine: Engine,
+        batch_size: u32,
+        js_heap_allocated_bytes: MetricCapture,
+    ) -> TrialEvidence {
         let capture = valid_evidence(root, engine);
         let workload = WorkloadEvidence {
             workload_wall_ms: 1.0,
@@ -933,6 +1085,7 @@ mod tests {
                 workload,
                 cpu_active_ms: 2.0,
                 js_heap_live_bytes: 4_096,
+                js_heap_allocated_bytes,
                 artifacts: capture.artifacts,
             },
         }
@@ -1054,6 +1207,157 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn a_measured_allocation_metric_is_required() {
+        let directory = tempdir().unwrap();
+        let mut evidence = valid_trial_evidence(directory.path(), Engine::Chromium, 3);
+        assert_eq!(evidence.metrics[JS_HEAP_ALLOCATED_BYTES_METRIC], 2_048.0);
+        assert!(evidence.unsupported_metrics.is_empty());
+
+        evidence.metrics.remove(JS_HEAP_ALLOCATED_BYTES_METRIC);
+        let error = validate_trial_evidence(
+            Engine::Chromium,
+            directory.path(),
+            1,
+            TrialBatchConfig::fixed(3),
+            &evidence,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid metrics"));
+    }
+
+    #[test]
+    fn an_unsupported_allocation_metric_is_recorded_with_its_reason() {
+        let directory = tempdir().unwrap();
+        let evidence = trial_evidence_with_allocation(
+            directory.path(),
+            Engine::Webkit,
+            3,
+            MetricCapture::Unsupported("pinned WebKit protocol has no Heap.getStatistics".into()),
+        );
+        assert!(
+            !evidence
+                .metrics
+                .contains_key(JS_HEAP_ALLOCATED_BYTES_METRIC)
+        );
+        assert_eq!(
+            evidence.unsupported_metrics[JS_HEAP_ALLOCATED_BYTES_METRIC],
+            "pinned WebKit protocol has no Heap.getStatistics"
+        );
+        validate_trial_evidence(
+            Engine::Webkit,
+            directory.path(),
+            1,
+            TrialBatchConfig::fixed(3),
+            &evidence,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_an_unsupported_metric_without_a_reason() {
+        let directory = tempdir().unwrap();
+        let evidence = trial_evidence_with_allocation(
+            directory.path(),
+            Engine::Webkit,
+            3,
+            MetricCapture::Unsupported(" ".into()),
+        );
+        let error = validate_trial_evidence(
+            Engine::Webkit,
+            directory.path(),
+            1,
+            TrialBatchConfig::fixed(3),
+            &evidence,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("without a reason"));
+    }
+
+    #[test]
+    fn rejects_a_metric_reported_as_both_measured_and_unsupported() {
+        let directory = tempdir().unwrap();
+        let mut evidence = valid_trial_evidence(directory.path(), Engine::Chromium, 3);
+        evidence.unsupported_metrics.insert(
+            JS_HEAP_ALLOCATED_BYTES_METRIC.to_owned(),
+            "collector not implemented yet".to_owned(),
+        );
+        let error = validate_trial_evidence(
+            Engine::Chromium,
+            directory.path(),
+            1,
+            TrialBatchConfig::fixed(3),
+            &evidence,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid metrics"));
+    }
+
+    #[test]
+    fn rejects_an_unknown_unsupported_metric() {
+        let directory = tempdir().unwrap();
+        let mut evidence = valid_trial_evidence(directory.path(), Engine::Chromium, 3);
+        evidence
+            .unsupported_metrics
+            .insert("browser.gpu.time_ms".to_owned(), "no collector".to_owned());
+        let error = validate_trial_evidence(
+            Engine::Chromium,
+            directory.path(),
+            1,
+            TrialBatchConfig::fixed(3),
+            &evidence,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown metric"));
+    }
+
+    #[test]
+    fn sampler_overhead_evidence_reports_wall_cost_as_a_percentage() {
+        let evidence = SamplerOverheadEvidence {
+            unsampled_wall_ms: 2.0,
+            sampled_wall_ms: 2.1,
+        };
+        assert!((evidence.overhead_pct() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sampler_overhead_validation_requires_positive_timing_and_a_reason() {
+        validate_sampler_overhead(
+            Engine::Chromium,
+            &SamplerOverheadCheck::Measured(SamplerOverheadEvidence {
+                unsampled_wall_ms: 1.5,
+                sampled_wall_ms: 1.6,
+            }),
+        )
+        .unwrap();
+        validate_sampler_overhead(
+            Engine::Firefox,
+            &SamplerOverheadCheck::NotApplicable {
+                reason: "no separate sampler runs".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let invalid_timing = validate_sampler_overhead(
+            Engine::Chromium,
+            &SamplerOverheadCheck::Measured(SamplerOverheadEvidence {
+                unsampled_wall_ms: 0.0,
+                sampled_wall_ms: 1.6,
+            }),
+        )
+        .unwrap_err();
+        assert!(invalid_timing.to_string().contains("invalid timing"));
+
+        let missing_reason = validate_sampler_overhead(
+            Engine::Webkit,
+            &SamplerOverheadCheck::NotApplicable {
+                reason: " ".to_owned(),
+            },
+        )
+        .unwrap_err();
+        assert!(missing_reason.to_string().contains("without a reason"));
     }
 
     #[test]

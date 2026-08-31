@@ -14,8 +14,8 @@
       "capture_scope": "page",
       "kind": "js_heap",
       "path": "heap.json",
-      "size_bytes": 30,
-      "sha256": "a45a7c602c9ac53ae8a367c7311b5c6c50b568a7b60efcbed511385f5c0d60dc",
+      "size_bytes": 88,
+      "sha256": "ee5525f9c3d6751c88c571b49697ab65443943f95a80d2b6a5f82a3a394412d7",
       "format": "WebKit Heap snapshot JSON"
     },
     {

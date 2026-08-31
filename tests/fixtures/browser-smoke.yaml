@@ -47,10 +47,12 @@ statistics:
     - workload.wall_ms
     - browser.cpu_profile.active_ms
     - browser.js_heap.live_bytes
+    - browser.js_heap.allocated_bytes
   minimum_effect_pct:
     workload.wall_ms: 5.0
     browser.cpu_profile.active_ms: 5.0
     browser.js_heap.live_bytes: 5.0
+    browser.js_heap.allocated_bytes: 5.0
   correctness:
     minimum_success_rate: 0.0
     max_regression_percentage_points: 100.0

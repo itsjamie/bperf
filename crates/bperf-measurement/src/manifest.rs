@@ -341,6 +341,7 @@ impl BenchmarkManifest {
                 "variant.call_wall_ms",
                 "browser.cpu_profile.active_ms",
                 "browser.js_heap.live_bytes",
+                "browser.js_heap.allocated_bytes",
             ]
             .contains(&metric.as_str())
             {
@@ -949,6 +950,18 @@ mod tests {
         let changed = BENCHMARK.replace("    workload.wall_ms: 5.0\n", "");
         let error = parse_benchmark(&changed).unwrap_err();
         assert!(error.to_string().contains("has no minimum_effect_pct"));
+    }
+
+    #[test]
+    fn accepts_the_allocated_bytes_primary_metric() {
+        let benchmark = parse_benchmark(BENCHMARK).unwrap();
+        assert!(
+            benchmark
+                .analysis_policy()
+                .primary_metrics
+                .iter()
+                .any(|metric| metric.name == "browser.js_heap.allocated_bytes")
+        );
     }
 
     #[test]

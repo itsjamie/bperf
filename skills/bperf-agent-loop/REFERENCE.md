@@ -63,7 +63,17 @@ Evaluate each benchmark case, browser engine, and primary metric separately:
 
 - `workload.wall_ms` measures normalized subject wall time;
 - `browser.cpu_profile.active_ms` comes from the native CPU profile;
-- `browser.js_heap.live_bytes` describes the settled live JavaScript heap.
+- `browser.js_heap.live_bytes` describes the settled live JavaScript heap;
+- `browser.js_heap.allocated_bytes` is bytes allocated on the page's JS heap
+  during the batch, divided by batch size, so it sees garbage the collector
+  reclaimed before the live-heap snapshot was taken. WebKit reports it as
+  unsupported (no `Heap.getStatistics` in the pinned protocol yet, tracked in
+  [bperf issue #4](https://github.com/itsjamie/bperf/issues/4)); Chromium and
+  Firefox measure it. A `show --json` engine that marks the metric
+  unsupported carries a reason instead of a value, and `run`/`confirm` print
+  `n/a (unsupported: reason)` for it rather than a number. Batches that
+  allocate less than the metric's resolution (one 128 KB sampling interval)
+  are reported at exactly that floor on every engine.
 
 The CPU profile and Speedscope flamegraph share a representative trial. The
 heap snapshot may come from another trial because it represents another metric
@@ -121,18 +131,21 @@ copy, and scan work for every caption screen.
 Chromium:
   CPU improvement: +53.28% (<before> -> <after>)
   Live heap improvement: +17.27% (<before> -> <after>)
+  Allocated improvement: +21.94% (<before> -> <after>)
   Wall-time improvement: +52.45% (<before> -> <after>)
   Anchor drift: +0.51%
 
 Firefox:
   CPU improvement: +60.83% (<before> -> <after>)
   Live heap improvement: +34.06% (<before> -> <after>)
+  Allocated improvement: +38.71% (<before> -> <after>)
   Wall-time improvement: +60.58% (<before> -> <after>)
   Anchor drift: +0.00%
 
 WebKit:
   CPU improvement: +46.10% (<before> -> <after>)
   Live heap improvement: +33.09% (<before> -> <after>)
+  Allocated improvement: n/a (unsupported)
   Wall-time improvement: +45.63% (<before> -> <after>)
   Anchor drift: -1.36%
 

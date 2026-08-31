@@ -1398,7 +1398,7 @@ fn case_line(case: &CasePreview, width: usize) -> Line<'static> {
 fn median_lines(comparison: &ComparisonSummary, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(fit_sides(
         "",
-        "wall       cpu       heap",
+        "wall       cpu       heap      alloc",
         width,
     ))];
     for engine in Engine::ALL {
@@ -1420,9 +1420,15 @@ fn median_lines(comparison: &ComparisonSummary, width: usize) -> Vec<Line<'stati
             .and_then(|summary| candidate_metric(summary.metrics.get("browser.js_heap.live_bytes")))
             .map(format_bytes)
             .unwrap_or_else(|| "n/a".to_owned());
+        let alloc = summary
+            .and_then(|summary| {
+                candidate_metric(summary.metrics.get("browser.js_heap.allocated_bytes"))
+            })
+            .map(format_bytes)
+            .unwrap_or_else(|| "n/a".to_owned());
         lines.push(Line::from(fit_sides(
             &engine.to_string(),
-            &format!("{wall:>9} {cpu:>9} {heap:>9}"),
+            &format!("{wall:>9} {cpu:>9} {heap:>9} {alloc:>9}"),
             width,
         )));
     }
@@ -1878,6 +1884,7 @@ export default defineBrowserBenchmark({
             guardrail_regressed: false,
             baseline_value: Some(baseline),
             candidate_value: Some(candidate),
+            unsupported_reason: None,
         }
     }
 

@@ -2,16 +2,19 @@
 
 use std::net::IpAddr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::lab::{
     BrowserTrialConfig, RuntimeAnchorEvidence, TrialBatchConfig, Viewport, WorkloadEvidence,
 };
 
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 pub(crate) const RUNTIME_ANCHOR_EXPRESSION: &str = "globalThis.__bperfHarness.runtimeAnchor()";
 pub(crate) const DOCTOR_PROBE_EXPRESSION: &str = "globalThis.__bperfHarness.doctorProbe()";
+pub(crate) const DOCTOR_ALLOCATION_PROBE_EXPRESSION: &str =
+    "globalThis.__bperfHarness.doctorAllocationProbe()";
 pub(crate) const SETTLE_EXPRESSION: &str =
     "(async () => await globalThis.__bperfHarness.settle())()";
 pub(crate) const WORKLOAD_READY_EXPRESSION: &str =
@@ -111,6 +114,45 @@ impl WorkloadScript {
 
 pub(crate) fn decode_runtime_anchor(value: Value) -> Result<RuntimeAnchorEvidence> {
     serde_json::from_value(value).context("browser runtime anchor returned invalid evidence")
+}
+
+const DOCTOR_ALLOCATION_WORKLOAD: &str = "javascript_allocation_v1";
+const DOCTOR_ALLOCATION_SAMPLES: usize = 25;
+
+/// Timed samples from one fixed-allocation doctor probe call. The checksum
+/// proves both calls of a paired sampler comparison executed the same work.
+#[derive(Deserialize)]
+pub(crate) struct AllocationProbeEvidence {
+    workload: String,
+    wall_ms: Vec<f64>,
+    checksum: u32,
+}
+
+impl AllocationProbeEvidence {
+    pub(crate) fn median_wall_ms(&self) -> f64 {
+        let mut samples = self.wall_ms.clone();
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    }
+
+    pub(crate) const fn checksum(&self) -> u32 {
+        self.checksum
+    }
+}
+
+pub(crate) fn decode_allocation_probe(value: Value) -> Result<AllocationProbeEvidence> {
+    let evidence: AllocationProbeEvidence = serde_json::from_value(value)
+        .context("browser allocation probe returned invalid evidence")?;
+    if evidence.workload != DOCTOR_ALLOCATION_WORKLOAD
+        || evidence.wall_ms.len() != DOCTOR_ALLOCATION_SAMPLES
+        || evidence
+            .wall_ms
+            .iter()
+            .any(|sample| !sample.is_finite() || *sample <= 0.0)
+    {
+        bail!("browser allocation probe returned invalid evidence");
+    }
+    Ok(evidence)
 }
 
 pub(crate) fn decode_batch_size(value: Value) -> Result<u32> {
@@ -291,6 +333,29 @@ mod tests {
             script.execute(8),
             r#"(async () => await globalThis.__bperfHarness.execute([{"case_id":"quotes-are-\"encoded\"","value":42}], 8))()"#
         );
+    }
+
+    #[test]
+    fn allocation_probe_decoding_validates_shape_and_reports_the_median() {
+        let wall_ms: Vec<f64> = (1..=25).map(f64::from).collect();
+        let evidence = decode_allocation_probe(json!({
+            "workload": "javascript_allocation_v1",
+            "wall_ms": wall_ms.clone(),
+            "checksum": 7,
+        }))
+        .unwrap();
+        assert_eq!(evidence.median_wall_ms(), 13.0);
+        assert_eq!(evidence.checksum(), 7);
+
+        let mut zeroed = wall_ms.clone();
+        zeroed[0] = 0.0;
+        for invalid in [
+            json!({"workload": "javascript_cpu_v1", "wall_ms": wall_ms.clone(), "checksum": 7}),
+            json!({"workload": "javascript_allocation_v1", "wall_ms": [1.0], "checksum": 7}),
+            json!({"workload": "javascript_allocation_v1", "wall_ms": zeroed, "checksum": 7}),
+        ] {
+            assert!(decode_allocation_probe(invalid).is_err());
+        }
     }
 
     #[test]

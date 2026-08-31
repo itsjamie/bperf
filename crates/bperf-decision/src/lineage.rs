@@ -403,6 +403,7 @@ pub enum HistoryArtifactKind {
     CpuProfile,
     Flamegraph,
     HeapSnapshot,
+    HeapSampling,
     Comparison,
     Sampling,
 }
@@ -413,6 +414,7 @@ impl HistoryArtifactKind {
             Self::CpuProfile => "cpu_profile",
             Self::Flamegraph => "flamegraph",
             Self::HeapSnapshot => "heap_snapshot",
+            Self::HeapSampling => "heap_sampling",
             Self::Comparison => "comparison",
             Self::Sampling => "sampling",
         }
@@ -2060,6 +2062,7 @@ fn retained_history_artifacts(measurement: &MeasurementSet) -> Vec<HistoryArtifa
             ArtifactKind::CpuProfile => HistoryArtifactKind::CpuProfile,
             ArtifactKind::JsHeap => HistoryArtifactKind::HeapSnapshot,
             ArtifactKind::Flamegraph => HistoryArtifactKind::Flamegraph,
+            ArtifactKind::HeapSamplingProfile => HistoryArtifactKind::HeapSampling,
         };
         artifacts.push(HistoryArtifact {
             kind,
@@ -2766,6 +2769,7 @@ mod tests {
                             guardrail_regressed: false,
                             baseline_value: Some(100.0 + index as f64),
                             candidate_value: Some(95.0 + index as f64),
+                            unsupported_reason: None,
                         },
                     )]),
                 })
