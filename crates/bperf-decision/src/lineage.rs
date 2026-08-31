@@ -2143,7 +2143,7 @@ fn validate_events(
     let mut cycles = BTreeMap::new();
     let mut confirmations = HashSet::new();
     let mut promotions = HashSet::new();
-    for event in &events {
+    for (event_index, event) in events.iter().enumerate() {
         match event {
             LineageEvent::Cycle(cycle) => {
                 if cycle.schema_version != SCHEMA_VERSION || cycle.benchmark_id != benchmark_id {
@@ -2303,6 +2303,12 @@ fn validate_events(
                 if candidate.candidate_measurement_set != promotion.baseline_measurement_set {
                     bail!(
                         "optimization history {} promotes a measurement outside its cycle",
+                        path.display()
+                    );
+                }
+                if !promotion_readiness(candidate, &events[..event_index]).ready {
+                    bail!(
+                        "optimization history {} promotes an ineligible cycle",
                         path.display()
                     );
                 }
@@ -3317,6 +3323,50 @@ mod tests {
 
         let error = store.read_events("parser").unwrap_err();
         assert!(error.to_string().contains("promotes an unknown cycle"));
+    }
+
+    #[test]
+    fn stored_promotions_must_be_eligible_when_recorded() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let negative = store
+            .append_cycle(NewCycle {
+                comparison: Some(comparison("measure-1", "negative")),
+                ..cycle(state, "measure-1")
+            })
+            .unwrap();
+        let promotion_id = promotion_id(
+            &negative.cycle_id,
+            &negative.candidate_measurement_set,
+            None,
+        );
+        store
+            .append_event(
+                "parser",
+                &LineageEvent::Promotion(PromotionRecord {
+                    schema_version: SCHEMA_VERSION,
+                    promotion_id,
+                    recorded_at_unix_ms: negative.recorded_at_unix_ms + 1,
+                    benchmark_id: "parser".to_owned(),
+                    cycle_id: negative.cycle_id,
+                    baseline_measurement_set: negative.candidate_measurement_set,
+                    previous_baseline_measurement_set: None,
+                }),
+            )
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error.to_string().contains("promotes an ineligible cycle"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
