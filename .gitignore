@@ -2,6 +2,7 @@
 /prototype/engine-capture-spike/artifacts/
 /prototype-*.json
 /target/
+/examples/advanced-adapter/target/
 /dist/
 /.bperf/
 /sidecar/node_modules/

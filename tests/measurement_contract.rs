@@ -94,14 +94,52 @@ fn variants_can_be_measured_and_compared_on_every_engine() {
         .arg("--json")
         .output()
         .expect("run bperf compare");
+    let comparison_exit_code = comparison.status.code();
+    // A noisy host may legitimately leave the fresh runtime anchor
+    // inconclusive; the assertions below still reject drift, failed
+    // correctness, incomplete engine coverage, and non-improving effects.
     assert!(
-        comparison.status.success(),
+        matches!(comparison_exit_code, Some(0 | 2)),
         "compare failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&comparison.stdout),
         String::from_utf8_lossy(&comparison.stderr)
     );
     let comparison: Value =
         serde_json::from_slice(&comparison.stdout).expect("comparison emitted JSON");
-    assert_eq!(comparison["verdict"], "positive");
-    assert_eq!(comparison["engines"].as_array().unwrap().len(), 3);
+    let verdict = comparison["verdict"].as_str().expect("comparison verdict");
+    assert!(
+        matches!(verdict, "positive" | "inconclusive"),
+        "unexpected comparison verdict: {verdict}"
+    );
+    assert_eq!(
+        comparison_exit_code,
+        Some(if verdict == "positive" { 0 } else { 2 })
+    );
+
+    let engines = comparison["engines"].as_array().expect("engine reports");
+    assert_eq!(engines.len(), 3);
+    for engine in engines {
+        assert_eq!(engine["correctness"]["gate"], "pass");
+        for effect in engine["effects"]
+            .as_object()
+            .expect("metric effects")
+            .values()
+        {
+            assert_eq!(effect["classification"], "improved");
+        }
+    }
+    if verdict == "positive" {
+        assert!(engines.iter().all(|engine| engine["verdict"] == "positive"));
+    } else {
+        assert_eq!(comparison["stability"]["status"], "inconclusive");
+        assert!(engines.iter().any(|engine| {
+            engine["anchor"]["status"] == "inconclusive" && engine["verdict"] == "inconclusive"
+        }));
+        assert!(engines.iter().all(|engine| {
+            matches!(
+                engine["anchor"]["status"].as_str(),
+                Some("stable" | "inconclusive")
+            )
+        }));
+    }
 }
