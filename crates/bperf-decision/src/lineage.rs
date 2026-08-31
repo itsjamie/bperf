@@ -235,19 +235,12 @@ fn complete_environment(measurement: &MeasurementSet) -> Result<&str> {
 }
 
 fn validate_comparison(measurement: &MeasurementSet, comparison: &ComparisonSummary) -> Result<()> {
+    comparison.validate_contract()?;
     if comparison.candidate_measurement_set != measurement.measurement_set_id() {
         bail!("comparison candidate does not match the measured source checkpoint");
     }
     if comparison.environment_fingerprint.as_deref() != measurement.environment_fingerprint() {
         bail!("comparison environment does not match the measured source checkpoint");
-    }
-    let engines: HashSet<_> = comparison
-        .engines
-        .iter()
-        .map(|result| result.engine)
-        .collect();
-    if comparison.engines.len() != Engine::ALL.len() || engines != HashSet::from(Engine::ALL) {
-        bail!("comparison summary does not contain every required browser engine");
     }
     Ok(())
 }
@@ -2149,6 +2142,7 @@ fn validate_events(
     let mut last_source: Option<String> = None;
     let mut cycles = BTreeMap::new();
     let mut confirmations = HashSet::new();
+    let mut promotions = HashSet::new();
     for event in &events {
         match event {
             LineageEvent::Cycle(cycle) => {
@@ -2181,6 +2175,37 @@ fn validate_events(
                         "optimization history {} has a broken source chain",
                         path.display()
                     );
+                }
+                match &cycle.comparison {
+                    Some(comparison) => {
+                        comparison.validate_contract().with_context(|| {
+                            format!(
+                                "optimization history {} contains invalid comparison evidence",
+                                path.display()
+                            )
+                        })?;
+                        if cycle.baseline_measurement_set.as_deref()
+                            != Some(comparison.baseline_measurement_set.as_str())
+                            || cycle.candidate_measurement_set
+                                != comparison.candidate_measurement_set
+                            || comparison.environment_fingerprint.as_deref()
+                                != Some(cycle.environment_fingerprint.as_str())
+                            || cycle.outcome != comparison.verdict
+                        {
+                            bail!(
+                                "optimization history {} contains an inconsistent cycle comparison",
+                                path.display()
+                            );
+                        }
+                    }
+                    None => {
+                        if cycle.baseline_measurement_set.is_some() || cycle.outcome != "measured" {
+                            bail!(
+                                "optimization history {} contains an inconsistent measured cycle",
+                                path.display()
+                            );
+                        }
+                    }
                 }
                 if cycles
                     .insert(cycle.cycle_id.clone(), cycle.as_ref().clone())
@@ -2216,6 +2241,15 @@ fn validate_events(
                         path.display()
                     )
                 })?;
+                confirmation
+                    .comparison
+                    .validate_contract()
+                    .with_context(|| {
+                        format!(
+                            "optimization history {} contains invalid confirmation evidence",
+                            path.display()
+                        )
+                    })?;
                 if confirmation.source_state != cycle.source_after
                     || confirmation.original_candidate_measurement_set
                         != cycle.candidate_measurement_set
@@ -2269,6 +2303,19 @@ fn validate_events(
                 if candidate.candidate_measurement_set != promotion.baseline_measurement_set {
                     bail!(
                         "optimization history {} promotes a measurement outside its cycle",
+                        path.display()
+                    );
+                }
+                let expected_id = promotion_id(
+                    &promotion.cycle_id,
+                    &promotion.baseline_measurement_set,
+                    promotion.previous_baseline_measurement_set.as_deref(),
+                );
+                if promotion.promotion_id != expected_id
+                    || !promotions.insert(promotion.promotion_id.clone())
+                {
+                    bail!(
+                        "optimization history {} contains an invalid promotion identity",
                         path.display()
                     );
                 }
@@ -2771,6 +2818,13 @@ mod tests {
     }
 
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {
+        let classification = match verdict {
+            "positive" => "improved",
+            "negative" => "regressed",
+            "equivalent" => "equivalent",
+            "inconclusive" => "inconclusive",
+            _ => panic!("unsupported test verdict {verdict:?}"),
+        };
         ComparisonSummary {
             comparison_id: format!("compare-{candidate}"),
             report_path: None,
@@ -2792,7 +2846,7 @@ mod tests {
                         MetricSummary {
                             improvement_pct: Some(5.0),
                             ci_pct: Some([3.0, 7.0]),
-                            classification: "improved".to_owned(),
+                            classification: classification.to_owned(),
                             guardrail_regressed: false,
                             baseline_value: Some(100.0 + index as f64),
                             candidate_value: Some(95.0 + index as f64),
@@ -3573,6 +3627,52 @@ mod tests {
         assert!(
             error.to_string().contains("non-relative component"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn stored_cycle_outcome_must_match_its_comparison_evidence() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let negative = store
+            .append_cycle(NewCycle {
+                comparison: Some(comparison("measure-1", "negative")),
+                ..cycle(state, "measure-1")
+            })
+            .unwrap();
+
+        let mut false_positive = negative.clone();
+        false_positive.previous_cycle_id = Some(negative.cycle_id.clone());
+        false_positive.source_before = Some(negative.source_after.clone());
+        false_positive.change_id = change_id(
+            false_positive.source_before.as_deref(),
+            &false_positive.source_after,
+        );
+        false_positive.cycle_id = cycle_id(
+            false_positive.previous_cycle_id.as_deref(),
+            &false_positive.source_after,
+            &false_positive.candidate_measurement_set,
+            false_positive
+                .comparison
+                .as_ref()
+                .map(|comparison| comparison.comparison_id.as_str()),
+        );
+        false_positive.outcome = "positive".to_owned();
+        store
+            .append_event("parser", &LineageEvent::Cycle(Box::new(false_positive)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error.to_string().contains("inconsistent cycle comparison"),
+            "unexpected error: {error:#}"
         );
     }
 

@@ -1,6 +1,10 @@
 //! Comparative analysis over two immutable measurement sets.
 
-use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Write as _,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::Engine;
@@ -177,6 +181,49 @@ pub struct ComparisonSummary {
 }
 
 impl ComparisonSummary {
+    pub(crate) fn validate_contract(&self) -> Result<()> {
+        if self.baseline_measurement_set.trim().is_empty()
+            || self.candidate_measurement_set.trim().is_empty()
+        {
+            bail!("comparison summary has an empty measurement-set identity");
+        }
+        if self.policy != "strict_all" {
+            bail!(
+                "comparison summary uses unsupported policy {:?}",
+                self.policy
+            );
+        }
+        let engines = self
+            .engines
+            .iter()
+            .map(|summary| summary.engine)
+            .collect::<HashSet<_>>();
+        if self.engines.len() != Engine::ALL.len() || engines != HashSet::from(Engine::ALL) {
+            bail!("comparison summary does not contain every required browser engine");
+        }
+
+        let mut engine_verdicts = Vec::with_capacity(self.engines.len());
+        for engine in &self.engines {
+            let derived = engine.derived_verdict()?;
+            if engine.verdict != derived {
+                bail!(
+                    "{} comparison verdict {:?} contradicts its decision evidence ({derived:?})",
+                    engine.engine,
+                    engine.verdict
+                );
+            }
+            engine_verdicts.push(derived);
+        }
+        let derived = rollup_summary(&engine_verdicts);
+        if self.verdict != derived {
+            bail!(
+                "comparison verdict {:?} contradicts its engine evidence ({derived:?})",
+                self.verdict
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn render_decision_summary(&self) -> String {
         let mut output = String::new();
         for engine in &self.engines {
@@ -224,6 +271,94 @@ impl ComparisonSummary {
             let _ = writeln!(output, "  warning: {warning}");
         }
         output
+    }
+}
+
+impl EngineSummary {
+    fn derived_verdict(&self) -> Result<&'static str> {
+        if !matches!(self.correctness.as_str(), "pass" | "fail" | "inconclusive") {
+            bail!(
+                "{} comparison has invalid correctness gate {:?}",
+                self.engine,
+                self.correctness
+            );
+        }
+        if let Some(anchor) = &self.anchor
+            && !matches!(
+                anchor.status.as_str(),
+                "stable" | "drifted" | "inconclusive" | "unproven"
+            )
+        {
+            bail!(
+                "{} comparison has invalid runtime-anchor status {:?}",
+                self.engine,
+                anchor.status
+            );
+        }
+        for metric in self.metrics.values() {
+            if !matches!(
+                metric.classification.as_str(),
+                "improved" | "regressed" | "equivalent" | "inconclusive"
+            ) {
+                bail!(
+                    "{} comparison has invalid metric classification {:?}",
+                    self.engine,
+                    metric.classification
+                );
+            }
+        }
+
+        if self.correctness == "fail" {
+            return Ok("negative");
+        }
+        if self.correctness == "inconclusive"
+            || self
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.status != "stable")
+        {
+            return Ok("inconclusive");
+        }
+        if self
+            .metrics
+            .values()
+            .any(|metric| metric.classification == "regressed" || metric.guardrail_regressed)
+        {
+            Ok("negative")
+        } else if self
+            .metrics
+            .values()
+            .all(|metric| metric.classification == "equivalent")
+        {
+            Ok("equivalent")
+        } else if self
+            .metrics
+            .values()
+            .any(|metric| metric.classification == "improved")
+            && self
+                .metrics
+                .values()
+                .all(|metric| matches!(metric.classification.as_str(), "improved" | "equivalent"))
+        {
+            Ok("positive")
+        } else {
+            Ok("inconclusive")
+        }
+    }
+}
+
+fn rollup_summary(engine_verdicts: &[&str]) -> &'static str {
+    if engine_verdicts.contains(&"negative") {
+        "negative"
+    } else if engine_verdicts.iter().all(|verdict| *verdict == "positive") {
+        "positive"
+    } else if engine_verdicts
+        .iter()
+        .all(|verdict| *verdict == "equivalent")
+    {
+        "equivalent"
+    } else {
+        "inconclusive"
     }
 }
 
@@ -1484,6 +1619,52 @@ mod tests {
             "  webkit: negative correctness=pass anchor=stable (+0.25%)\n\
              \x20   workload.wall_ms: regressed effect=-4.50% (100ms -> 104.5ms) ci=[-6.00%, -3.00%] guardrail=regressed\n\
              \x20 warning: baseline is old\n"
+        );
+    }
+
+    #[test]
+    fn comparison_summary_verdicts_must_match_their_evidence() {
+        let mut summary = ComparisonSummary {
+            comparison_id: "compare-candidate".to_owned(),
+            report_path: None,
+            baseline_measurement_set: "baseline".to_owned(),
+            candidate_measurement_set: "candidate".to_owned(),
+            environment_fingerprint: Some("environment".to_owned()),
+            policy: "strict_all".to_owned(),
+            verdict: "equivalent".to_owned(),
+            engines: Engine::ALL
+                .into_iter()
+                .map(|engine| EngineSummary {
+                    engine,
+                    verdict: "equivalent".to_owned(),
+                    correctness: "pass".to_owned(),
+                    anchor: Some(AnchorSummary {
+                        status: "stable".to_owned(),
+                        drift_pct: Some(0.0),
+                        ci_pct: Some([-1.0, 1.0]),
+                    }),
+                    metrics: BTreeMap::new(),
+                })
+                .collect(),
+            warnings: Vec::new(),
+        };
+        summary.validate_contract().unwrap();
+
+        summary.verdict = "positive".to_owned();
+        let error = summary.validate_contract().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its engine evidence")
+        );
+
+        summary.verdict = "equivalent".to_owned();
+        summary.engines[0].verdict = "negative".to_owned();
+        let error = summary.validate_contract().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its decision evidence")
         );
     }
 }
