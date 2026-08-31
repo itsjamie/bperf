@@ -771,13 +771,11 @@ impl CycleRecord {
     /// Records without a stored module path fall back to a
     /// `<benchmark.bench.ts>` placeholder the caller must substitute.
     pub fn confirm_command(&self) -> String {
-        format!(
-            "bperf confirm {} {}",
-            self.benchmark_module
-                .as_deref()
-                .unwrap_or("<benchmark.bench.ts>"),
-            self.selector()
-        )
+        let benchmark_module = self
+            .benchmark_module
+            .as_deref()
+            .map_or_else(|| "<benchmark.bench.ts>".to_owned(), command_path_argument);
+        format!("bperf confirm {} {}", benchmark_module, self.selector())
     }
 
     /// The command that advances this cycle toward promotion, or `None` when
@@ -2383,6 +2381,25 @@ fn normalize_message(message: Option<String>) -> Result<Option<String>> {
     Ok(message)
 }
 
+fn command_path_argument(path: &str) -> String {
+    let path = if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.to_owned()
+    };
+    if path.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+    }) {
+        return path;
+    }
+
+    #[cfg(windows)]
+    return format!("'{}'", path.replace('\'', "''"));
+
+    #[cfg(not(windows))]
+    format!("'{}'", path.replace('\'', "'\"'\"'"))
+}
+
 fn portable_path(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -3474,6 +3491,32 @@ mod tests {
                 selected.selector()
             )),
             "unexpected error: {error}"
+        );
+
+        let mut special_path = selected.clone();
+        special_path.benchmark_module =
+            Some("benchmarks/parser suite's $draft.bench.ts".to_owned());
+        #[cfg(not(windows))]
+        assert_eq!(
+            special_path.confirm_command(),
+            format!(
+                r#"bperf confirm 'benchmarks/parser suite'"'"'s $draft.bench.ts' {}"#,
+                selected.selector()
+            )
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            special_path.confirm_command(),
+            format!(
+                "bperf confirm 'benchmarks/parser suite''s $draft.bench.ts' {}",
+                selected.selector()
+            )
+        );
+
+        special_path.benchmark_module = Some("-draft.bench.ts".to_owned());
+        assert_eq!(
+            special_path.confirm_command(),
+            format!("bperf confirm ./-draft.bench.ts {}", selected.selector())
         );
     }
 
