@@ -1244,13 +1244,18 @@ mod tests {
         .unwrap();
         let cycle = recorded.cycle;
         assert_eq!(cycle.outcome(), expected_outcome);
+        assert!(
+            matches!(cycle.outcome(), "equivalent" | "inconclusive"),
+            "a measurement compared with itself had outcome {}",
+            cycle.outcome()
+        );
         assert_eq!(
             cycle.benchmark_module(),
             Some(expected_module.as_str()),
             "recorded cycles must carry the workspace-relative benchmark module"
         );
         assert_eq!(recorded.readiness.searched_candidates, 1);
-        assert!(recorded.readiness.ready);
+        assert_eq!(recorded.readiness.ready, cycle.promotable());
         assert!(!recorded.readiness.confirmation_required);
         assert!(
             database
@@ -1259,44 +1264,67 @@ mod tests {
                 .is_some()
         );
 
-        let confirmation = confirm_with_policy(
-            ConfirmOptions {
-                benchmark,
-                cycle_id: cycle.cycle_id().to_owned(),
-                execution: ExecutionOptions {
-                    artifact_root: measurement_root,
-                    state_root: temporary.path().join("managed"),
-                    object_root: temporary.path().join("objects"),
-                    registry_root,
-                    comparison_root: temporary.path().join("comparisons"),
-                    lineage_root: temporary.path().join("lineages"),
-                    budget: "2m".parse().unwrap(),
+        if cycle.promotable() {
+            let confirmation = confirm_with_policy(
+                ConfirmOptions {
+                    benchmark,
+                    cycle_id: cycle.cycle_id().to_owned(),
+                    execution: ExecutionOptions {
+                        artifact_root: measurement_root,
+                        state_root: temporary.path().join("managed"),
+                        object_root: temporary.path().join("objects"),
+                        registry_root,
+                        comparison_root: temporary.path().join("comparisons"),
+                        lineage_root: temporary.path().join("lineages"),
+                        budget: "2m".parse().unwrap(),
+                    },
                 },
-            },
-            TrialPolicy {
-                warmup_samples: 0,
-                pilot_samples: 2,
-                min_final_samples: 1,
-                max_final_samples: 2,
-            },
-            &host_executable,
-        )
-        .unwrap();
-        assert!(
-            confirmation
-                .confirmation
-                .confirmation_id()
-                .starts_with("confirmation-")
-        );
-        let confirmation_summary = confirmation.comparison.summary();
-        assert!(
-            confirmation_summary.engines.iter().all(|engine| engine
-                .anchor
-                .as_ref()
-                .is_some_and(|anchor| anchor.status == "stable")),
-            "confirmation anchors were not stable: {:#?}",
-            confirmation_summary.engines
-        );
+                TrialPolicy {
+                    warmup_samples: 0,
+                    pilot_samples: 2,
+                    min_final_samples: 1,
+                    max_final_samples: 2,
+                },
+                &host_executable,
+            )
+            .unwrap();
+            assert!(
+                confirmation
+                    .confirmation
+                    .confirmation_id()
+                    .starts_with("confirmation-")
+            );
+            let confirmation_summary = confirmation.comparison.summary();
+            for engine in &confirmation_summary.engines {
+                assert_eq!(engine.correctness, "pass");
+                let anchor = engine.anchor.as_ref().expect("confirmation anchor");
+                assert!(
+                    matches!(
+                        anchor.status.as_str(),
+                        "stable" | "inconclusive" | "drifted"
+                    ),
+                    "unexpected confirmation anchor: {anchor:#?}"
+                );
+                if anchor.status != "stable" {
+                    assert_eq!(engine.verdict, "inconclusive");
+                }
+            }
+        } else {
+            assert_eq!(cycle.outcome(), "inconclusive");
+            let error = lineage::confirmation_target(
+                &temporary.path().join("lineages"),
+                cycle.cycle_id(),
+                Some("fragment-parser"),
+            )
+            .err()
+            .expect("an inconclusive cycle must not start confirmation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot advance toward promotion"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     fn build_bperf_executable() -> PathBuf {

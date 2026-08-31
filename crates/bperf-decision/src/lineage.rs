@@ -145,6 +145,7 @@ pub fn confirmation_target(
 ) -> Result<ConfirmationTarget> {
     let store = LineageStore::load(root)?;
     let (cycle, _, _) = store.find_cycle(cycle_id, benchmark_id)?;
+    require_promotable(&cycle)?;
     let baseline_measurement_set = cycle
         .baseline_measurement_set
         .clone()
@@ -182,6 +183,7 @@ pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<Recorde
 
     let store = LineageStore::open(&options.root)?;
     let (cycle, _, _) = store.find_cycle(&options.cycle_id, None)?;
+    require_promotable(&cycle)?;
     let original = MeasurementSet::open(Path::new(&cycle.candidate_measurement_path))?;
     if original.benchmark_sha256() != measurement.benchmark_sha256()
         || original.variant_sha256() != measurement.variant_sha256()
@@ -2269,13 +2271,7 @@ fn validate_events(
 }
 
 fn require_promotion_ready(cycle: &CycleRecord, events: &[LineageEvent]) -> Result<()> {
-    if !cycle.promotable() {
-        bail!(
-            "cycle {} has outcome {} and cannot be promoted; select a measured, positive, or equivalent cycle",
-            cycle.selector(),
-            cycle.outcome()
-        );
-    }
+    require_promotable(cycle)?;
     let readiness = promotion_readiness(cycle, events);
     if readiness.ready {
         return Ok(());
@@ -2291,6 +2287,18 @@ fn require_promotion_ready(cycle: &CycleRecord, events: &[LineageEvent]) -> Resu
         baseline_measurement_set,
         cycle.confirm_command()
     );
+}
+
+fn require_promotable(cycle: &CycleRecord) -> Result<()> {
+    if cycle.promotable() {
+        Ok(())
+    } else {
+        bail!(
+            "cycle {} has outcome {} and cannot advance toward promotion; select a measured, positive, or equivalent cycle",
+            cycle.selector(),
+            cycle.outcome()
+        )
+    }
 }
 
 fn promotion_readiness(cycle: &CycleRecord, events: &[LineageEvent]) -> PromotionReadiness {
@@ -3570,7 +3578,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_rejects_negative_cycles_before_opening_the_measurement() {
+    fn promotion_actions_reject_negative_cycles_before_opening_the_measurement() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         let lineage_root = temporary.path().join("lineages");
@@ -3597,10 +3605,26 @@ mod tests {
         .err()
         .expect("a negative cycle must not be accepted");
         assert!(
-            error.to_string().contains("cannot be promoted"),
+            error
+                .to_string()
+                .contains("cannot advance toward promotion"),
             "unexpected error: {error}"
         );
         assert!(!temporary.path().join("baselines").exists());
+
+        let error = confirmation_target(
+            &temporary.path().join("lineages"),
+            negative.selector(),
+            Some("parser"),
+        )
+        .err()
+        .expect("a negative cycle must not be confirmed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot advance toward promotion"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
