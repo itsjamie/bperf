@@ -210,10 +210,31 @@ fn lineage_cycle_id(
         measurement,
         comparison.unwrap_or(""),
     ] {
-        digest.update((field.len() as u64).to_le_bytes());
-        digest.update(field.as_bytes());
+        lineage_hash_field(&mut digest, field);
     }
     format!("cycle-{:x}", digest.finalize())
+}
+
+fn lineage_source_state_id(path: &str, file_digest: &str, size: usize) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bperf-source-state-v1\0");
+    lineage_hash_field(&mut digest, path);
+    lineage_hash_field(&mut digest, file_digest);
+    digest.update((size as u64).to_le_bytes());
+    format!("state-{:x}", digest.finalize())
+}
+
+fn lineage_change_id(before: Option<&str>, after: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bperf-source-change-v1\0");
+    lineage_hash_field(&mut digest, before.unwrap_or(""));
+    lineage_hash_field(&mut digest, after);
+    format!("change-{:x}", digest.finalize())
+}
+
+fn lineage_hash_field(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value.as_bytes());
 }
 
 fn write_lineage_fixture(
@@ -233,10 +254,10 @@ fn write_lineage_fixture(
     fs::write(objects.join(&before_hash), before).unwrap();
     fs::write(objects.join(&after_hash), after).unwrap();
 
-    let first_state = format!("state-{}", "1".repeat(64));
-    let second_state = format!("state-{}", "2".repeat(64));
-    let first_change = format!("change-{}", "1".repeat(64));
-    let second_change = format!("change-{}", "2".repeat(64));
+    let first_state = lineage_source_state_id("src/implementation.js", &before_hash, before.len());
+    let second_state = lineage_source_state_id("src/implementation.js", &after_hash, after.len());
+    let first_change = lineage_change_id(None, &first_state);
+    let second_change = lineage_change_id(Some(&first_state), &second_state);
     for (state_id, digest, size) in [
         (&first_state, &before_hash, before.len()),
         (&second_state, &after_hash, after.len()),

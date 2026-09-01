@@ -881,7 +881,7 @@ struct SourceChange {
     files: Vec<FileChange>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FileChange {
     path: String,
@@ -890,7 +890,7 @@ struct FileChange {
     after_sha256: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangeKind {
     Added,
@@ -1245,46 +1245,6 @@ impl LineageStore {
         before: Option<&SourceState>,
         after: &SourceState,
     ) -> Result<SourceChange> {
-        let before_files: BTreeMap<_, _> = before
-            .map(|state| {
-                state
-                    .files
-                    .iter()
-                    .map(|file| (file.path.as_str(), file))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let after_files: BTreeMap<_, _> = after
-            .files
-            .iter()
-            .map(|file| (file.path.as_str(), file))
-            .collect();
-        let paths: std::collections::BTreeSet<_> = before_files
-            .keys()
-            .chain(after_files.keys())
-            .copied()
-            .collect();
-        let files = paths
-            .into_iter()
-            .filter_map(|path| {
-                let before = before_files.get(path);
-                let after = after_files.get(path);
-                if before.map(|file| &file.sha256) == after.map(|file| &file.sha256) {
-                    return None;
-                }
-                Some(FileChange {
-                    path: path.to_owned(),
-                    kind: match (before, after) {
-                        (None, Some(_)) => ChangeKind::Added,
-                        (Some(_), None) => ChangeKind::Deleted,
-                        (Some(_), Some(_)) => ChangeKind::Modified,
-                        (None, None) => unreachable!(),
-                    },
-                    before_sha256: before.map(|file| file.sha256.clone()),
-                    after_sha256: after.map(|file| file.sha256.clone()),
-                })
-            })
-            .collect();
         let source_before = before.map(|state| state.state_id.clone());
         let change_id = change_id(source_before.as_deref(), &after.state_id);
         let change = SourceChange {
@@ -1292,7 +1252,7 @@ impl LineageStore {
             change_id,
             source_before,
             source_after: after.state_id.clone(),
-            files,
+            files: file_changes(before, after),
         };
         self.database
             .publish_document(SOURCE_CHANGES, &change.change_id, &change)?;
@@ -1916,9 +1876,20 @@ impl LineageStore {
         if state.schema_version != SCHEMA_VERSION || state.state_id != state_id {
             bail!("source state {state_id} has incompatible identity");
         }
+        if state.files.is_empty() {
+            bail!("source state {state_id} contains no project modules");
+        }
+        let mut previous_path: Option<&str> = None;
         for file in &state.files {
             require_digest(&file.sha256)?;
             require_portable_file_path(&file.path)?;
+            if previous_path.is_some_and(|previous| previous >= file.path.as_str()) {
+                bail!("source state {state_id} has non-canonical file paths");
+            }
+            previous_path = Some(&file.path);
+        }
+        if source_state_id(&state.files) != state_id {
+            bail!("source state {state_id} has an invalid content address");
         }
         Ok(state)
     }
@@ -1936,6 +1907,9 @@ impl LineageStore {
             require_hash_id("source state", source_before, "state-")?;
         }
         require_hash_id("source state", &change.source_after, "state-")?;
+        if self::change_id(change.source_before.as_deref(), &change.source_after) != change_id {
+            bail!("source change {change_id} has an invalid content address");
+        }
         for file in &change.files {
             require_portable_file_path(&file.path)?;
             if let Some(digest) = &file.before_sha256 {
@@ -1944,6 +1918,15 @@ impl LineageStore {
             if let Some(digest) = &file.after_sha256 {
                 require_digest(digest)?;
             }
+        }
+        let before = change
+            .source_before
+            .as_deref()
+            .map(|state_id| self.load_state(state_id))
+            .transpose()?;
+        let after = self.load_state(&change.source_after)?;
+        if change.files != file_changes(before.as_ref(), &after) {
+            bail!("source change {change_id} does not match its source states");
         }
         Ok(change)
     }
@@ -2189,6 +2172,13 @@ fn validate_events(
                 if cycle.source_before.as_deref() != last_source.as_deref() {
                     bail!(
                         "optimization history {} has a broken source chain",
+                        path.display()
+                    );
+                }
+                if cycle.change_id != change_id(cycle.source_before.as_deref(), &cycle.source_after)
+                {
+                    bail!(
+                        "optimization history {} contains an invalid source transition",
                         path.display()
                     );
                 }
@@ -2512,6 +2502,49 @@ fn source_state_id(files: &[SourceFile]) -> String {
         digest.update(file.size_bytes.to_le_bytes());
     }
     format!("state-{:x}", digest.finalize())
+}
+
+fn file_changes(before: Option<&SourceState>, after: &SourceState) -> Vec<FileChange> {
+    let before_files: BTreeMap<_, _> = before
+        .map(|state| {
+            state
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file))
+                .collect()
+        })
+        .unwrap_or_default();
+    let after_files: BTreeMap<_, _> = after
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let paths: std::collections::BTreeSet<_> = before_files
+        .keys()
+        .chain(after_files.keys())
+        .copied()
+        .collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before = before_files.get(path);
+            let after = after_files.get(path);
+            if before.map(|file| &file.sha256) == after.map(|file| &file.sha256) {
+                return None;
+            }
+            Some(FileChange {
+                path: path.to_owned(),
+                kind: match (before, after) {
+                    (None, Some(_)) => ChangeKind::Added,
+                    (Some(_), None) => ChangeKind::Deleted,
+                    (Some(_), Some(_)) => ChangeKind::Modified,
+                    (None, None) => unreachable!(),
+                },
+                before_sha256: before.map(|file| file.sha256.clone()),
+                after_sha256: after.map(|file| file.sha256.clone()),
+            })
+        })
+        .collect()
 }
 
 fn change_id(before: Option<&str>, after: &str) -> String {
@@ -3309,6 +3342,108 @@ mod tests {
     }
 
     #[test]
+    fn stored_source_states_must_match_their_content_address() {
+        let temporary = tempdir().unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let file = SourceFile {
+            path: "parser.ts".to_owned(),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+        };
+        let state_id = source_state_id(std::slice::from_ref(&file));
+        let state = SourceState {
+            schema_version: SCHEMA_VERSION,
+            state_id: state_id.clone(),
+            files: vec![SourceFile {
+                size_bytes: 2,
+                ..file
+            }],
+        };
+        store
+            .database
+            .publish_document(SOURCE_STATES, &state_id, &state)
+            .unwrap();
+
+        let error = store.load_state(&state_id).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid content address"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_source_changes_must_match_their_content_address() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let before = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let after = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let change_id = change_id(Some(&before.state_id), &after.state_id);
+        let change = SourceChange {
+            schema_version: SCHEMA_VERSION,
+            change_id: change_id.clone(),
+            source_before: None,
+            source_after: after.state_id,
+            files: Vec::new(),
+        };
+        store
+            .database
+            .publish_document(SOURCE_CHANGES, &change_id, &change)
+            .unwrap();
+
+        let error = store.load_change(&change_id).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid content address"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_source_changes_must_match_their_source_states() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let before = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        fs::write(&source, "export const value = 2;\n").unwrap();
+        let after = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let change_id = change_id(Some(&before.state_id), &after.state_id);
+        let change = SourceChange {
+            schema_version: SCHEMA_VERSION,
+            change_id: change_id.clone(),
+            source_before: Some(before.state_id),
+            source_after: after.state_id,
+            files: Vec::new(),
+        };
+        store
+            .database
+            .publish_document(SOURCE_CHANGES, &change_id, &change)
+            .unwrap();
+
+        let error = store.load_change(&change_id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its source states"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn lineage_history_uses_atomic_database_events() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -3791,6 +3926,40 @@ mod tests {
         let error = store.read_events("parser").unwrap_err();
         assert!(
             error.to_string().contains("invalid cycle identity"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_cycles_must_reference_their_source_transition() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let valid = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let mut wrong_transition = valid.clone();
+        wrong_transition.previous_cycle_id = Some(valid.cycle_id.clone());
+        wrong_transition.source_before = Some(valid.source_after.clone());
+        wrong_transition.candidate_measurement_set = "measure-2".to_owned();
+        wrong_transition.cycle_id = cycle_id(
+            wrong_transition.previous_cycle_id.as_deref(),
+            &wrong_transition.source_after,
+            &wrong_transition.candidate_measurement_set,
+            None,
+        );
+        store
+            .append_event("parser", &LineageEvent::Cycle(Box::new(wrong_transition)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid source transition"),
             "unexpected error: {error:#}"
         );
     }
