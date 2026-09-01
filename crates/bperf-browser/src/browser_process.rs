@@ -225,7 +225,7 @@ mod platform {
     use std::{
         fs::File,
         os::{
-            fd::{FromRawFd, OwnedFd, RawFd},
+            fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::process::CommandExt,
         },
         path::Path,
@@ -334,6 +334,8 @@ mod platform {
         let (parent_read, child_write) = pipe()?;
         let child_read = duplicate_high(child_read)?;
         let child_write = duplicate_high(child_write)?;
+        let child_read_descriptor = child_read.as_raw_fd();
+        let child_write_descriptor = child_write.as_raw_fd();
 
         let mut command = Command::new(executable);
         command
@@ -348,19 +350,19 @@ mod platform {
         }
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(child_read, 3) == -1 || libc::dup2(child_write, 4) == -1 {
+                if libc::dup2(child_read_descriptor, 3) == -1
+                    || libc::dup2(child_write_descriptor, 4) == -1
+                {
                     return Err(std::io::Error::last_os_error());
                 }
-                libc::close(child_read);
-                libc::close(child_write);
+                libc::close(child_read_descriptor);
+                libc::close(child_write_descriptor);
                 Ok(())
             });
         }
         let spawn = command.spawn();
-        unsafe {
-            libc::close(child_read);
-            libc::close(child_write);
-        }
+        drop(child_read);
+        drop(child_write);
         let mut child = spawn.with_context(|| {
             format!(
                 "failed to launch browser executable {}",
@@ -383,8 +385,8 @@ mod platform {
                 process_group: pid,
                 process_group_terminated: false,
             },
-            writer: unsafe { File::from_raw_fd(parent_write) },
-            reader: unsafe { File::from_raw_fd(parent_read) },
+            writer: File::from(parent_write),
+            reader: File::from(parent_read),
             logs: vec![
                 ("stdout", File::from(OwnedFd::from(stdout))),
                 ("stderr", File::from(OwnedFd::from(stderr))),
@@ -392,7 +394,7 @@ mod platform {
         })
     }
 
-    fn pipe() -> Result<(RawFd, RawFd)> {
+    fn pipe() -> Result<(OwnedFd, OwnedFd)> {
         let mut descriptors = [-1; 2];
         if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
             return Err(std::io::Error::last_os_error())
@@ -413,19 +415,21 @@ mod platform {
                 );
             }
         }
-        Ok((descriptors[0], descriptors[1]))
+        Ok(unsafe {
+            (
+                OwnedFd::from_raw_fd(descriptors[0]),
+                OwnedFd::from_raw_fd(descriptors[1]),
+            )
+        })
     }
 
-    fn duplicate_high(descriptor: RawFd) -> Result<RawFd> {
-        let duplicated = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 10) };
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(descriptor);
-        }
+    fn duplicate_high(descriptor: OwnedFd) -> Result<OwnedFd> {
+        let duplicated = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
         if duplicated == -1 {
-            return Err(error).context("failed to reserve a browser child descriptor");
+            return Err(std::io::Error::last_os_error())
+                .context("failed to reserve a browser child descriptor");
         }
-        Ok(duplicated)
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
     }
 }
 
@@ -906,6 +910,42 @@ mod tests {
         spawned.child.stop_contained_processes().unwrap();
 
         assert_eq!(response, b"{\"id\":1}\0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_unix_spawns_do_not_leak_parent_pipes() {
+        use std::{path::Path, process::Command};
+
+        const CHILD: &str = "BPERF_TEST_FAILED_SPAWN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .args([
+                    "--exact",
+                    "browser_process::tests::failed_unix_spawns_do_not_leak_parent_pipes",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let open_descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = open_descriptors();
+        for _ in 0..32 {
+            assert!(
+                super::platform::spawn(
+                    Path::new("/bperf-nonexistent-browser"),
+                    &[],
+                    Path::new("."),
+                    &[],
+                )
+                .is_err()
+            );
+        }
+
+        assert_eq!(open_descriptors(), before);
     }
 
     #[cfg(unix)]
