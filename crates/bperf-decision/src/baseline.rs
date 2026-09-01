@@ -64,16 +64,24 @@ pub(crate) fn promote_prepared(
     transaction: &mut WriteTransaction<'_>,
     pending: &PendingBaseline,
 ) -> Result<BaselineRecord> {
-    let previous: Option<BaselineRecord> =
-        transaction.read_last_event(BASELINE_EVENTS, &pending.benchmark_id)?;
-    let previous = previous
-        .map(|record| validate_current(record, &pending.benchmark_id))
-        .transpose()?;
-    if previous.as_ref().is_some_and(|record| {
+    let history: Vec<BaselineRecord> =
+        transaction.read_events(BASELINE_EVENTS, &pending.benchmark_id)?;
+    validate_history(&history, &pending.benchmark_id)?;
+    let previous = history.last().cloned();
+    if let Some(previous) = previous.as_ref().filter(|record| {
         record.measurement_set_id == pending.measurement_set_id
             && record.measurement_set_path == pending.measurement_set_path
     }) {
-        return Ok(previous.unwrap());
+        if previous.subject_id != pending.subject_id
+            || previous.benchmark_sha256 != pending.benchmark_sha256
+            || previous.variant_id != pending.variant_id
+            || previous.variant_sha256 != pending.variant_sha256
+            || previous.environment_fingerprint != pending.environment_fingerprint
+            || previous.measured_at_unix_ms != pending.measured_at_unix_ms
+        {
+            bail!("existing baseline reference does not match the immutable measurement");
+        }
+        return Ok(previous.clone());
     }
 
     let record = BaselineRecord {
@@ -162,22 +170,49 @@ fn current_if_present(registry_root: &Path, benchmark_id: &str) -> Result<Option
 
 fn current(registry_root: &Path, benchmark_id: &str) -> Result<BaselineRecord> {
     let database = baseline_database(registry_root)?;
-    let record = read_current(&database, benchmark_id)?
-        .with_context(|| format!("no promoted baseline for benchmark {benchmark_id:?}"))?;
-    validate_current(record, benchmark_id)
+    read_current(&database, benchmark_id)?
+        .with_context(|| format!("no promoted baseline for benchmark {benchmark_id:?}"))
 }
 
 fn read_current(database: &Database, benchmark_id: &str) -> Result<Option<BaselineRecord>> {
-    database.read_last_event(BASELINE_EVENTS, benchmark_id)
+    let mut history: Vec<BaselineRecord> = database.read_events(BASELINE_EVENTS, benchmark_id)?;
+    validate_history(&history, benchmark_id)?;
+    Ok(history.pop())
 }
 
-fn validate_current(record: BaselineRecord, benchmark_id: &str) -> Result<BaselineRecord> {
-    if record.schema_version != 2 || record.benchmark_id != benchmark_id {
-        bail!(
-            "baseline history for {benchmark_id:?} has incompatible identity; promote a measurement made with the current runtime-anchor protocol"
-        );
+fn validate_history(history: &[BaselineRecord], benchmark_id: &str) -> Result<()> {
+    let mut previous = None;
+    for record in history {
+        if record.schema_version != 2 || record.benchmark_id != benchmark_id {
+            bail!(
+                "baseline history for {benchmark_id:?} has incompatible identity; promote a measurement made with the current runtime-anchor protocol"
+            );
+        }
+        if [
+            &record.subject_id,
+            &record.benchmark_sha256,
+            &record.measurement_set_id,
+            &record.measurement_set_path,
+            &record.variant_id,
+            &record.variant_sha256,
+            &record.environment_fingerprint,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+            || record.measured_at_unix_ms == 0
+            || record.promoted_at_unix_ms == 0
+        {
+            bail!("baseline history for {benchmark_id:?} contains an incomplete reference");
+        }
+        if record.previous_measurement_set_id.as_deref() != previous {
+            bail!(
+                "baseline history for {benchmark_id:?} has a broken predecessor before {:?}",
+                record.measurement_set_id
+            );
+        }
+        previous = Some(record.measurement_set_id.as_str());
     }
-    Ok(record)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -208,7 +243,7 @@ fn baseline_database(registry_root: &Path) -> Result<Database> {
     Database::for_collection(registry_root, "baselines")
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BaselineRecord {
     schema_version: u32,
@@ -296,6 +331,19 @@ mod tests {
                 .unwrap()
                 .measurement_set_id,
             "second"
+        );
+    }
+
+    #[test]
+    fn baseline_reads_reject_a_broken_history_chain() {
+        let directory = tempdir().unwrap();
+        append(directory.path(), &record("first", None)).unwrap();
+        append(directory.path(), &record("second", Some("unrelated"))).unwrap();
+
+        let error = current_path_if_present(directory.path(), "benchmark").unwrap_err();
+        assert!(
+            error.to_string().contains("broken predecessor"),
+            "unexpected error: {error:#}"
         );
     }
 }

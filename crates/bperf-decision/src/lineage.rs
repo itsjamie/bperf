@@ -223,7 +223,7 @@ pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<Recorde
 }
 
 fn complete_environment(measurement: &MeasurementSet) -> Result<&str> {
-    if !measurement.final_is_complete() {
+    if !measurement.is_finalized() {
         bail!(
             "measurement set {} is incomplete and cannot enter optimization history",
             measurement.measurement_set_id()

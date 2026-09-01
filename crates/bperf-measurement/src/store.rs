@@ -529,6 +529,14 @@ impl MeasurementSet {
             .all(|trial| self.results.completed.contains_key(&trial.trial_id))
     }
 
+    /// Reports whether every active trial and the representative artifact
+    /// selection are durable, so the set no longer needs resume state.
+    pub fn is_finalized(&self) -> bool {
+        !self.needs_sampling_decision()
+            && self.pending_trials().is_empty()
+            && self.retention.is_some()
+    }
+
     pub fn pending_trials(&self) -> Vec<&ScheduledTrial> {
         if self.needs_sampling_decision() {
             let warmups = self
@@ -1658,8 +1666,10 @@ mod tests {
 
         append_pending(&measurement);
         let completed = MeasurementSet::open(&root).unwrap();
+        assert!(!completed.is_finalized());
         let retention = artifact_retention::finalize(&completed).unwrap().unwrap();
         let retained = MeasurementSet::open(&root).unwrap();
+        assert!(retained.is_finalized());
         assert_eq!(
             retained.retained_artifacts().len(),
             retention.retained_artifacts
