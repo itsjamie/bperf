@@ -154,10 +154,9 @@ impl PlaywrightInstallation {
             );
         }
         ensure_executable(&staged_executable)?;
-        fs::write(staged.join(INSTALLATION_MARKER), b"")?;
-        fs::write(
-            staged.join(INSTALLATION_METADATA),
-            format!(
+        write_installation_receipt(
+            &staged,
+            &format!(
                 "provider=playwright\nprovider_version={}\nbrowser={}\nbrowser_version={}\nrevision={}\nhost={}\nsource={source_url}\n",
                 self.version(),
                 artifact.name.registry_name(),
@@ -220,6 +219,15 @@ impl PlaywrightInstallation {
         );
         Ok(())
     }
+}
+
+fn write_installation_receipt(directory: &Path, metadata: &str) -> Result<()> {
+    File::create_new(directory.join(INSTALLATION_MARKER))
+        .context("browser archive contains the reserved installation marker")?;
+    File::create_new(directory.join(INSTALLATION_METADATA))
+        .context("browser archive contains the reserved installation metadata")?
+        .write_all(metadata.as_bytes())?;
+    Ok(())
 }
 
 fn download_urls(name: BrowserName, path: &str, default_mirrors: &[String]) -> Result<Vec<String>> {
@@ -839,5 +847,41 @@ mod tests {
         assert!(validate_relative_target(Path::new("one/two"), Path::new("../target")).is_ok());
         assert!(validate_relative_target(Path::new("one"), Path::new("../../target")).is_err());
         assert!(validate_relative_target(Path::new("one"), Path::new("/target")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_archives_cannot_alias_installation_bookkeeping_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        for reserved in [INSTALLATION_MARKER, INSTALLATION_METADATA] {
+            let archive_path = directory.path().join(format!("{reserved}.zip"));
+            let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+            archive
+                .start_file("browser", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"executable").unwrap();
+            archive
+                .add_symlink("alias", ".", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive
+                .add_symlink(
+                    format!("alias/{reserved}"),
+                    "browser",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+            let destination = directory.path().join(format!("{reserved}.out"));
+            fs::create_dir(&destination).unwrap();
+
+            extract_zip(&archive_path, &destination).unwrap();
+
+            assert!(write_installation_receipt(&destination, "receipt").is_err());
+
+            assert_eq!(
+                fs::read(destination.join("browser")).unwrap(),
+                b"executable"
+            );
+        }
     }
 }
