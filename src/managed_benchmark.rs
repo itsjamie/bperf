@@ -14,7 +14,7 @@ use bperf_decision::{
     lineage::{self, CycleRecord},
 };
 use bperf_measurement::{
-    manifest::{BenchmarkManifest, VariantDescriptor},
+    manifest::{BenchmarkManifest, VariantDescriptor, validate_workload_id},
     sampling::RunBudget,
     store::MeasurementSet,
 };
@@ -750,6 +750,9 @@ fn validate_description(description: &ManagedDescription) -> Result<()> {
     if description.cases.is_empty() {
         bail!("managed benchmark contains no cases");
     }
+    for case in &description.cases {
+        validate_workload_id(&case.id)?;
+    }
     if description.source_files.is_empty() {
         bail!("managed benchmark resolved no source files");
     }
@@ -1020,6 +1023,24 @@ mod tests {
             },
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn managed_case_ids_cannot_escape_the_workload_directory() {
+        let description = ManagedDescription {
+            schema_version: 1,
+            benchmark_id: "benchmark".to_owned(),
+            cases: vec![ManagedCase {
+                id: "../../escaped".to_owned(),
+                expectation: ManagedExpectation::Exact { value: json!(42) },
+            }],
+            source_files: vec![PathBuf::from("unreached")],
+            fixture_files: Vec::new(),
+            fixture_lock: PathBuf::from("unreached"),
+        };
+
+        let error = validate_description(&description).unwrap_err();
+        assert!(error.to_string().contains("workload id"));
     }
 
     #[test]

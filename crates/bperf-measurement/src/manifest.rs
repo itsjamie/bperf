@@ -273,7 +273,7 @@ impl BenchmarkManifest {
         }
         let mut workload_ids = HashSet::new();
         for workload in &self.workloads {
-            require_identifier("workload id", &workload.id)?;
+            validate_workload_id(&workload.id)?;
             if !workload_ids.insert(workload.id.as_str()) {
                 bail!("duplicate workload id {:?}", workload.id);
             }
@@ -551,6 +551,10 @@ fn require_identifier(label: &str, value: &str) -> Result<()> {
         bail!("{label} {value:?} may contain only ASCII letters, numbers, `-`, `_`, and `.`");
     }
     Ok(())
+}
+
+pub fn validate_workload_id(value: &str) -> Result<()> {
+    require_identifier("workload id", value)
 }
 
 fn require_nonempty(label: &str, value: &str) -> Result<()> {
