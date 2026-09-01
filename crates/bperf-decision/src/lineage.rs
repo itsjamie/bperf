@@ -2840,13 +2840,6 @@ mod tests {
     }
 
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {
-        let classification = match verdict {
-            "positive" => "improved",
-            "negative" => "regressed",
-            "equivalent" => "equivalent",
-            "inconclusive" => "inconclusive",
-            _ => panic!("unsupported test verdict {verdict:?}"),
-        };
         ComparisonSummary {
             comparison_id: format!("compare-{candidate}"),
             report_path: None,
@@ -2858,26 +2851,36 @@ mod tests {
             engines: Engine::ALL
                 .into_iter()
                 .enumerate()
-                .map(|(index, engine)| EngineSummary {
-                    engine,
-                    verdict: verdict.to_owned(),
-                    correctness: "pass".to_owned(),
-                    anchor: Some(crate::comparison::AnchorSummary {
-                        status: "stable".to_owned(),
-                        drift_pct: Some(0.0),
-                        ci_pct: Some([-1.0, 1.0]),
-                    }),
-                    metrics: BTreeMap::from([(
-                        "workload.wall_ms".to_owned(),
-                        MetricSummary {
-                            improvement_pct: Some(5.0),
-                            ci_pct: Some([3.0, 7.0]),
-                            classification: classification.to_owned(),
-                            guardrail_regressed: false,
-                            baseline_value: Some(100.0 + index as f64),
-                            candidate_value: Some(95.0 + index as f64),
-                        },
-                    )]),
+                .map(|(index, engine)| {
+                    let baseline = 100.0 + index as f64;
+                    let (candidate_value, improvement_pct, ci_pct, classification) = match verdict {
+                        "positive" => (baseline * 0.95, 5.0, [3.0, 7.0], "improved"),
+                        "negative" => (baseline * 1.05, -5.0, [-7.0, -3.0], "regressed"),
+                        "equivalent" => (baseline, 0.0, [-1.0, 1.0], "equivalent"),
+                        "inconclusive" => (baseline * 0.98, 2.0, [-1.0, 5.0], "inconclusive"),
+                        _ => panic!("unsupported test verdict {verdict:?}"),
+                    };
+                    EngineSummary {
+                        engine,
+                        verdict: verdict.to_owned(),
+                        correctness: "pass".to_owned(),
+                        anchor: Some(crate::comparison::AnchorSummary {
+                            status: "stable".to_owned(),
+                            drift_pct: Some(0.0),
+                            ci_pct: Some([-1.0, 1.0]),
+                        }),
+                        metrics: BTreeMap::from([(
+                            "workload.wall_ms".to_owned(),
+                            MetricSummary {
+                                improvement_pct: Some(improvement_pct),
+                                ci_pct: Some(ci_pct),
+                                classification: classification.to_owned(),
+                                guardrail_regressed: false,
+                                baseline_value: Some(baseline),
+                                candidate_value: Some(candidate_value),
+                            },
+                        )]),
+                    }
                 })
                 .collect(),
             warnings: Vec::new(),

@@ -293,17 +293,8 @@ impl EngineSummary {
                 self.correctness
             );
         }
-        if let Some(anchor) = &self.anchor
-            && !matches!(
-                anchor.status.as_str(),
-                "stable" | "drifted" | "inconclusive" | "unproven"
-            )
-        {
-            bail!(
-                "{} comparison has invalid runtime-anchor status {:?}",
-                self.engine,
-                anchor.status
-            );
+        if let Some(anchor) = &self.anchor {
+            anchor.validate(self.engine)?;
         }
         if self.metrics.is_empty() {
             bail!("{} comparison has no primary metric evidence", self.engine);
@@ -312,16 +303,7 @@ impl EngineSummary {
             if name.trim().is_empty() {
                 bail!("{} comparison has an empty metric identity", self.engine);
             }
-            if !matches!(
-                metric.classification.as_str(),
-                "improved" | "regressed" | "equivalent" | "inconclusive"
-            ) {
-                bail!(
-                    "{} comparison has invalid metric classification {:?}",
-                    self.engine,
-                    metric.classification
-                );
-            }
+            metric.validate(self.engine, name)?;
         }
 
         if self.correctness == "fail" {
@@ -397,6 +379,43 @@ pub struct AnchorSummary {
     pub ci_pct: Option<[f64; 2]>,
 }
 
+impl AnchorSummary {
+    fn validate(&self, engine: Engine) -> Result<()> {
+        if !matches!(
+            self.status.as_str(),
+            "stable" | "drifted" | "inconclusive" | "unproven"
+        ) {
+            bail!(
+                "{engine} comparison has invalid runtime-anchor status {:?}",
+                self.status
+            );
+        }
+        let (Some(drift), Some([low, high])) = (self.drift_pct, self.ci_pct) else {
+            if self.status == "unproven" && self.drift_pct.is_none() && self.ci_pct.is_none() {
+                return Ok(());
+            }
+            bail!("{engine} comparison has incomplete runtime-anchor evidence");
+        };
+        if !drift.is_finite() || !low.is_finite() || !high.is_finite() || low > high {
+            bail!("{engine} comparison has invalid runtime-anchor values");
+        }
+        let derived = if low >= -ANCHOR_MAX_DRIFT_PCT && high <= ANCHOR_MAX_DRIFT_PCT {
+            "stable"
+        } else if low > ANCHOR_MAX_DRIFT_PCT || high < -ANCHOR_MAX_DRIFT_PCT {
+            "drifted"
+        } else {
+            "inconclusive"
+        };
+        if self.status != derived {
+            bail!(
+                "{engine} runtime-anchor status {:?} contradicts its confidence interval ({derived:?})",
+                self.status
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricSummary {
@@ -408,6 +427,67 @@ pub struct MetricSummary {
     pub baseline_value: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_value: Option<f64>,
+}
+
+impl MetricSummary {
+    fn validate(&self, engine: Engine, name: &str) -> Result<()> {
+        if !matches!(
+            self.classification.as_str(),
+            "improved" | "regressed" | "equivalent" | "inconclusive"
+        ) {
+            bail!(
+                "{engine} comparison has invalid metric classification {:?}",
+                self.classification
+            );
+        }
+        let (point, [low, high]) = match (self.improvement_pct, self.ci_pct) {
+            (None, None) if self.classification == "inconclusive" && !self.guardrail_regressed => {
+                if self.baseline_value.is_some() || self.candidate_value.is_some() {
+                    bail!("{engine} metric {name:?} has incomplete decision evidence");
+                }
+                return Ok(());
+            }
+            (Some(point), Some(interval)) => (point, interval),
+            _ => bail!("{engine} metric {name:?} has incomplete decision evidence"),
+        };
+        if !point.is_finite() || !low.is_finite() || !high.is_finite() || low > high {
+            bail!("{engine} metric {name:?} has invalid decision values");
+        }
+        match (self.baseline_value, self.candidate_value) {
+            (Some(baseline), Some(candidate)) => {
+                if !baseline.is_finite()
+                    || baseline <= 0.0
+                    || !candidate.is_finite()
+                    || candidate <= 0.0
+                {
+                    bail!("{engine} metric {name:?} has invalid measured values");
+                }
+                let expected_point = 100.0 * (1.0 - candidate / baseline);
+                if !nearly_equal(point, expected_point) {
+                    bail!("{engine} metric {name:?} effect contradicts its measured values");
+                }
+            }
+            (None, None) => {}
+            _ => bail!("{engine} metric {name:?} has incomplete measured values"),
+        }
+        if (self.classification == "improved" && (point < 0.0 || low <= 0.0))
+            || (self.classification == "regressed" && (point > 0.0 || high >= 0.0))
+        {
+            bail!(
+                "{engine} metric {name:?} classification {:?} contradicts its effect interval",
+                self.classification
+            );
+        }
+        if self.guardrail_regressed && high >= 0.0 {
+            bail!("{engine} metric {name:?} guardrail contradicts its effect interval");
+        }
+        Ok(())
+    }
+}
+
+fn nearly_equal(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= scale * 1e-9
 }
 
 fn format_metric_values(metric: &str, baseline: f64, candidate: f64) -> String {
@@ -1707,6 +1787,66 @@ mod tests {
             error
                 .to_string()
                 .contains("contradicts its decision evidence")
+        );
+    }
+
+    #[test]
+    fn persisted_numeric_evidence_must_be_self_consistent() {
+        let mut metric = MetricSummary {
+            improvement_pct: Some(5.0),
+            ci_pct: Some([3.0, 7.0]),
+            classification: "improved".to_owned(),
+            guardrail_regressed: false,
+            baseline_value: Some(100.0),
+            candidate_value: Some(95.0),
+        };
+        metric
+            .validate(Engine::Chromium, "workload.wall_ms")
+            .unwrap();
+
+        metric.classification = "regressed".to_owned();
+        let error = metric
+            .validate(Engine::Chromium, "workload.wall_ms")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its effect interval")
+        );
+
+        metric.classification = "improved".to_owned();
+        metric.improvement_pct = Some(10.0);
+        let error = metric
+            .validate(Engine::Chromium, "workload.wall_ms")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its measured values")
+        );
+
+        let mut anchor = AnchorSummary {
+            status: "stable".to_owned(),
+            drift_pct: Some(0.5),
+            ci_pct: Some([-1.0, 2.0]),
+        };
+        anchor.validate(Engine::Chromium).unwrap();
+
+        anchor.status = "drifted".to_owned();
+        let error = anchor.validate(Engine::Chromium).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its confidence interval")
+        );
+
+        anchor.status = "stable".to_owned();
+        anchor.ci_pct = None;
+        let error = anchor.validate(Engine::Chromium).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete runtime-anchor evidence")
         );
     }
 }
