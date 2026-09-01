@@ -196,12 +196,32 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
     }
 }
 
+fn lineage_cycle_id(
+    previous: Option<&str>,
+    state: &str,
+    measurement: &str,
+    comparison: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bperf-cycle-v1\0");
+    for field in [
+        previous.unwrap_or(""),
+        state,
+        measurement,
+        comparison.unwrap_or(""),
+    ] {
+        digest.update((field.len() as u64).to_le_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("cycle-{:x}", digest.finalize())
+}
+
 fn write_lineage_fixture(
     root: &Path,
     baseline_root: &Path,
     candidate_root: &Path,
     comparison: &Value,
-) -> String {
+) -> (String, String) {
     let objects = root.join("objects");
     fs::create_dir_all(&objects).unwrap();
     let database = Database::for_collection(root, "lineages").unwrap();
@@ -308,8 +328,22 @@ fn write_lineage_fixture(
             })
         })
         .collect();
-    let first_cycle = format!("cycle-{}", "1".repeat(64));
-    let second_cycle = format!("cycle-{}", "2".repeat(64));
+    let first_cycle = lineage_cycle_id(
+        None,
+        &first_state,
+        comparison["baseline"]["measurement_set_id"]
+            .as_str()
+            .unwrap(),
+        None,
+    );
+    let second_cycle = lineage_cycle_id(
+        Some(&first_cycle),
+        &second_state,
+        comparison["candidate"]["measurement_set_id"]
+            .as_str()
+            .unwrap(),
+        comparison["comparison_id"].as_str(),
+    );
     let first = serde_json::json!({
         "event": "cycle",
         "record": {
@@ -415,7 +449,7 @@ fn write_lineage_fixture(
             )
             .unwrap();
     }
-    second_cycle
+    (first_cycle, second_cycle)
 }
 
 #[test]
@@ -578,7 +612,8 @@ fn independent_measurements_can_be_promoted_and_compared() {
 
     let lineages = directory.path().join("lineages");
     fs::create_dir_all(&lineages).unwrap();
-    let cycle_id = write_lineage_fixture(&lineages, &baseline_root, &candidate_root, &comparison);
+    let (first_cycle_id, cycle_id) =
+        write_lineage_fixture(&lineages, &baseline_root, &candidate_root, &comparison);
     let simple_history = bperf()
         .arg("history")
         .arg("--lineage-dir")
@@ -596,9 +631,9 @@ fn independent_measurements_can_be_promoted_and_compared() {
         "case: checkout-flow",
         "cycle",
         "message",
-        "cycle-11111111111111",
+        &first_cycle_id[..20],
         "establish baseline",
-        "cycle-22222222222222",
+        &cycle_id[..20],
         "reuse parsed boxes",
     ] {
         assert!(

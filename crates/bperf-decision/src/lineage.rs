@@ -2223,6 +2223,21 @@ fn validate_events(
                         }
                     }
                 }
+                let expected_cycle_id = cycle_id(
+                    cycle.previous_cycle_id.as_deref(),
+                    &cycle.source_after,
+                    &cycle.candidate_measurement_set,
+                    cycle
+                        .comparison
+                        .as_ref()
+                        .map(|comparison| comparison.comparison_id.as_str()),
+                );
+                if cycle.cycle_id != expected_cycle_id {
+                    bail!(
+                        "optimization history {} contains an invalid cycle identity",
+                        path.display()
+                    );
+                }
                 if cycles
                     .insert(cycle.cycle_id.clone(), cycle.as_ref().clone())
                     .is_some()
@@ -3745,6 +3760,37 @@ mod tests {
         let error = store.read_events("parser").unwrap_err();
         assert!(
             error.to_string().contains("inconsistent cycle comparison"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_cycle_identity_must_match_its_content() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let valid = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let mut copied_identity = valid.clone();
+        copied_identity.previous_cycle_id = Some(valid.cycle_id.clone());
+        copied_identity.source_before = Some(valid.source_after.clone());
+        copied_identity.change_id = change_id(
+            copied_identity.source_before.as_deref(),
+            &copied_identity.source_after,
+        );
+        store
+            .append_event("parser", &LineageEvent::Cycle(Box::new(copied_identity)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid cycle identity"),
             "unexpected error: {error:#}"
         );
     }
