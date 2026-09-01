@@ -235,6 +235,9 @@ fn verify_with_process(
     timeout: Duration,
     working_directory: &Path,
 ) -> Result<VerifierVerdict> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("workload verifier timeout is too large for this platform")?;
     let (program, arguments) = command
         .split_first()
         .context("workload verifier has no command")?;
@@ -269,7 +272,6 @@ fn verify_with_process(
             .context("failed to terminate verifier payload")?;
     }
 
-    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().context("failed waiting for verifier")? {
             break status;
