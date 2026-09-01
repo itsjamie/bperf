@@ -2,10 +2,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::Read,
+    fs::{self, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -75,7 +74,7 @@ pub(crate) struct LockedFixtures {
 
 pub(crate) struct LockedFixture {
     entry: FixtureLockEntry,
-    body: Arc<[u8]>,
+    body: tempfile::NamedTempFile,
 }
 
 #[derive(Clone, Copy)]
@@ -90,13 +89,7 @@ impl LockedFixtures {
         for entry in read_lock(path)? {
             let (entry, body) = validate_body(entry, "pinned benchmark fixture")?;
             let key = fixture_key(&entry.descriptor)?;
-            entries.insert(
-                key,
-                LockedFixture {
-                    entry,
-                    body: body.into(),
-                },
-            );
+            entries.insert(key, LockedFixture { entry, body });
         }
         Ok(Self { entries })
     }
@@ -109,8 +102,17 @@ impl LockedFixtures {
 }
 
 impl LockedFixture {
-    pub(crate) fn body(&self) -> Arc<[u8]> {
-        Arc::clone(&self.body)
+    pub(crate) fn body(&self) -> Result<File> {
+        self.body.reopen().with_context(|| {
+            format!(
+                "failed to open locked benchmark fixture {}",
+                self.entry.descriptor.source
+            )
+        })
+    }
+
+    pub(crate) fn size(&self) -> Result<usize> {
+        usize::try_from(self.entry.size_bytes).context("benchmark fixture is too large to serve")
     }
 
     pub(crate) fn content_type(&self) -> &str {
@@ -326,12 +328,34 @@ fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
     Ok(lock.fixtures)
 }
 
-fn validate_body(mut entry: FixtureLockEntry, label: &str) -> Result<(FixtureLockEntry, Vec<u8>)> {
-    let body = fs::read(&entry.body_path)
+fn validate_body(
+    mut entry: FixtureLockEntry,
+    label: &str,
+) -> Result<(FixtureLockEntry, tempfile::NamedTempFile)> {
+    let mut source = File::open(&entry.body_path)
         .with_context(|| format!("{label} is missing: {}", entry.descriptor.source))?;
-    if body.len() as u64 != entry.size_bytes
-        || format!("{:x}", Sha256::digest(&body)) != entry.sha256
-    {
+    let mut body =
+        tempfile::NamedTempFile::new().context("failed to stage a locked benchmark fixture")?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let count = source
+            .read(&mut chunk)
+            .with_context(|| format!("failed to read {label}: {}", entry.descriptor.source))?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .context("benchmark fixture size overflowed")?;
+        digest.update(&chunk[..count]);
+        body.write_all(&chunk[..count])
+            .context("failed to stage a locked benchmark fixture")?;
+    }
+    body.flush()
+        .context("failed to flush a locked benchmark fixture")?;
+    if size != entry.size_bytes || format!("{:x}", digest.finalize()) != entry.sha256 {
         bail!("{label} is corrupt: {}", entry.descriptor.source);
     }
     entry.body_path = fs::canonicalize(&entry.body_path).with_context(|| {
@@ -489,6 +513,49 @@ mod tests {
 
         let error = read_lock(&lock).err().expect("duplicate lock was accepted");
         assert!(error.to_string().contains("duplicate descriptors"));
+    }
+
+    #[test]
+    fn locked_fixture_bodies_are_independent_disk_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let body_path = directory.path().join("body");
+        let lock_path = directory.path().join("fixture-lock.json");
+        let body = b"012345";
+        let descriptor = json!({"source": "fixture.txt"});
+        fs::write(&body_path, body).unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_vec(&json!({
+                "schema_version": LOCK_SCHEMA_VERSION,
+                "fixtures": [{
+                    "descriptor": descriptor,
+                    "body_path": body_path,
+                    "sha256": format!("{:x}", Sha256::digest(body)),
+                    "size_bytes": body.len(),
+                    "content_type": "text/plain",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let fixtures = LockedFixtures::load(&lock_path).unwrap();
+        let key = serde_json::to_string(&descriptor).unwrap();
+        let fixture = fixtures.find(&key).unwrap();
+        fs::write(&body_path, b"mutated").unwrap();
+        let mut first = fixture.body().unwrap();
+        let mut second = fixture.body().unwrap();
+        let mut prefix = [0_u8; 2];
+        first.read_exact(&mut prefix).unwrap();
+        let mut complete = Vec::new();
+        second.read_to_end(&mut complete).unwrap();
+        let mut remainder = Vec::new();
+        first.read_to_end(&mut remainder).unwrap();
+
+        assert_eq!(fixture.size().unwrap(), body.len());
+        assert_eq!(&prefix, b"01");
+        assert_eq!(complete, body);
+        assert_eq!(remainder, b"2345");
     }
 
     #[cfg(unix)]

@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -253,30 +253,30 @@ impl HostedBenchmark {
             );
         };
 
-        let complete_body = entry.body();
+        let complete_size = entry.size()?;
 
         let range_header = request
             .headers()
             .iter()
             .find(|header| header.field.equiv("Range"))
             .map(|header| header.value.as_str());
-        let range = match range_header.map(|value| byte_range(value, complete_body.len())) {
+        let range = match range_header.map(|value| byte_range(value, complete_size)) {
             Some(Ok(range)) => Some(range),
             Some(Err(())) => {
                 return response(
                     StatusCode(416),
-                    Arc::from(&b""[..]),
-                    0..0,
+                    Cursor::new(Vec::<u8>::new()),
+                    0,
                     vec![header(
                         "Content-Range",
-                        &format!("bytes */{}", complete_body.len()),
+                        &format!("bytes */{complete_size}"),
                     )?],
                     None,
                 );
             }
             None => None,
         };
-        let selected = range.clone().unwrap_or(0..complete_body.len());
+        let selected = range.clone().unwrap_or(0..complete_size);
         let mut headers = vec![
             header("Accept-Ranges", "bytes")?,
             header("Cache-Control", "no-store")?,
@@ -285,22 +285,22 @@ impl HostedBenchmark {
         if let Some(range) = &range {
             headers.push(header(
                 "Content-Range",
-                &format!(
-                    "bytes {}-{}/{}",
-                    range.start,
-                    range.end - 1,
-                    complete_body.len()
-                ),
+                &format!("bytes {}-{}/{}", range.start, range.end - 1, complete_size),
             )?);
         }
+        let mut body = entry.body()?;
+        body.seek(SeekFrom::Start(
+            u64::try_from(selected.start).context("benchmark fixture range offset overflowed")?,
+        ))
+        .context("failed to seek locked benchmark fixture")?;
         response(
             if range.is_some() {
                 StatusCode(206)
             } else {
                 StatusCode(200)
             },
-            complete_body,
-            selected,
+            body,
+            selected.len(),
             headers,
             entry.stream(),
         )
@@ -311,8 +311,8 @@ fn static_response(status: StatusCode, body: Arc<[u8]>, content_type: &str) -> R
     let length = body.len();
     response(
         status,
-        body,
-        0..length,
+        Cursor::new(body),
+        length,
         vec![
             header("Cache-Control", "no-store")?,
             header("Content-Type", content_type)?,
@@ -321,19 +321,17 @@ fn static_response(status: StatusCode, body: Arc<[u8]>, content_type: &str) -> R
     )
 }
 
-fn response(
+fn response<Reader: Read + Send + 'static>(
     status: StatusCode,
-    body: Arc<[u8]>,
-    selected: std::ops::Range<usize>,
+    reader: Reader,
+    length: usize,
     headers: Vec<Header>,
     stream: Option<StreamDelivery>,
 ) -> Result<ResponseBox> {
-    let length = selected.len();
     let reader = BodyReader {
-        body,
-        start: selected.start,
-        position: selected.start,
-        end: selected.end,
+        reader,
+        position: 0,
+        length,
         chunk_size: stream.map_or(usize::MAX, |stream| stream.chunk_size),
         interval: Duration::from_millis(stream.map_or(0, |stream| stream.interval_ms)),
     };
@@ -345,31 +343,30 @@ fn header(name: &str, value: &str) -> Result<Header> {
         .map_err(|()| anyhow!("invalid HTTP response header {name}: {value:?}"))
 }
 
-struct BodyReader {
-    body: Arc<[u8]>,
-    start: usize,
+struct BodyReader<Reader> {
+    reader: Reader,
     position: usize,
-    end: usize,
+    length: usize,
     chunk_size: usize,
     interval: Duration,
 }
 
-impl Read for BodyReader {
+impl<Reader: Read> Read for BodyReader<Reader> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if self.position >= self.end || output.is_empty() {
+        if self.position >= self.length || output.is_empty() {
             return Ok(0);
         }
-        let chunk_offset = (self.position - self.start) % self.chunk_size;
-        if self.position > self.start && chunk_offset == 0 && !self.interval.is_zero() {
+        let chunk_offset = self.position % self.chunk_size;
+        if self.position > 0 && chunk_offset == 0 && !self.interval.is_zero() {
             thread::sleep(self.interval);
         }
         let length = output
             .len()
-            .min(self.end - self.position)
+            .min(self.length - self.position)
             .min(self.chunk_size - chunk_offset);
-        output[..length].copy_from_slice(&self.body[self.position..self.position + length]);
-        self.position += length;
-        Ok(length)
+        let count = self.reader.read(&mut output[..length])?;
+        self.position += count;
+        Ok(count)
     }
 }
 
