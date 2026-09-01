@@ -334,8 +334,12 @@ impl BenchmarkManifest {
         if self.statistics.primary_metrics.is_empty() {
             bail!("statistics.primary_metrics must not be empty");
         }
+        let mut primary_metrics = HashSet::new();
         for metric in &self.statistics.primary_metrics {
             require_nonempty("primary metric", metric)?;
+            if !primary_metrics.insert(metric.as_str()) {
+                bail!("statistics.primary_metrics contains duplicate metric {metric:?}");
+            }
             if ![
                 "workload.wall_ms",
                 "variant.call_wall_ms",
@@ -949,6 +953,16 @@ mod tests {
         let changed = BENCHMARK.replace("    workload.wall_ms: 5.0\n", "");
         let error = parse_benchmark(&changed).unwrap_err();
         assert!(error.to_string().contains("has no minimum_effect_pct"));
+    }
+
+    #[test]
+    fn rejects_a_duplicate_primary_metric() {
+        let changed = BENCHMARK.replace(
+            "    - workload.wall_ms\n",
+            "    - workload.wall_ms\n    - workload.wall_ms\n",
+        );
+        let error = parse_benchmark(&changed).unwrap_err();
+        assert!(error.to_string().contains("duplicate metric"));
     }
 
     #[test]
