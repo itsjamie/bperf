@@ -447,7 +447,7 @@ fn cpu_model() -> Result<String> {
             &mut byte_count,
         )
     };
-    if status != ERROR_SUCCESS || byte_count < 2 {
+    if status != ERROR_SUCCESS || byte_count < 2 || !byte_count.is_multiple_of(2) {
         return std::env::var("PROCESSOR_IDENTIFIER")
             .context("Windows CPU model is unavailable for host identity");
     }
