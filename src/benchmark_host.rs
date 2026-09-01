@@ -408,10 +408,7 @@ fn byte_range(value: &str, size: usize) -> std::result::Result<std::ops::Range<u
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read as _, Write as _},
-        net::TcpStream,
-    };
+    use std::net::TcpStream;
 
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;

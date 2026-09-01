@@ -326,7 +326,9 @@ mod tests {
 
         assert_eq!(
             trials
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|round| {
                     round
                         .iter()
