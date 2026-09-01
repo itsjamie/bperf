@@ -3455,9 +3455,15 @@ mod tests {
             .database
             .write(|transaction| {
                 for index in 1_u64..=400 {
-                    let cycle_id = format!("cycle-{index:064x}");
                     let source_after = format!("state-{index:064x}");
-                    let change_id = format!("change-{index:064x}");
+                    let measurement_set = format!("measure-{index}");
+                    let change_id = change_id(previous_state.as_deref(), &source_after);
+                    let cycle_id = cycle_id(
+                        previous_cycle.as_deref(),
+                        &source_after,
+                        &measurement_set,
+                        None,
+                    );
                     let record = CycleRecord {
                         schema_version: SCHEMA_VERSION,
                         cycle_id: cycle_id.clone(),
@@ -3471,7 +3477,7 @@ mod tests {
                         source_after: source_after.clone(),
                         change_id,
                         baseline_measurement_set: None,
-                        candidate_measurement_set: format!("measure-{index}"),
+                        candidate_measurement_set: measurement_set,
                         candidate_measurement_path: format!("C:/missing/measure-{index}"),
                         environment_fingerprint: "environment".to_owned(),
                         outcome: "measured".to_owned(),
