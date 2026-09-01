@@ -23,7 +23,7 @@ use ratatui::{
 
 use crate::terminal_ui::{
     self, AMBER, BG, BLUE, CYAN, ControlFlow, FAINT, FOCUS, GREEN, MUTED, RED, SELECTED, SURFACE,
-    TEXT, chrome_block, clip, fit_sides, pad_right, relative_age,
+    TEXT, chrome_block, clip, display_width, fit_sides, pad_right, relative_age,
 };
 
 const MIN_WIDTH: u16 = 100;
@@ -1087,7 +1087,7 @@ fn module_item(module: &BenchmarkModule, width: u16) -> ListItem<'static> {
         },
     );
     let path_space =
-        available.saturating_sub(module.id.chars().count() + run_summary.chars().count() + 3);
+        available.saturating_sub(display_width(&module.id) + display_width(&run_summary) + 3);
     let mut first = vec![
         Span::styled(
             module.id.clone(),
@@ -1277,18 +1277,15 @@ fn render_module_summary(frame: &mut Frame<'_>, area: Rect, module: &BenchmarkMo
     let right = outcome
         .map(str::to_ascii_uppercase)
         .unwrap_or_else(|| "NEVER RUN".to_owned());
-    let left_width = usize::from(inner.width).saturating_sub(right.chars().count() + 1);
-    let left = format!(
-        "{:<left_width$}",
-        clip(
-            &format!(
-                "{}  {}  {}",
-                module.id,
-                module.relative_path,
-                human_bytes(module.file_size)
-            ),
-            left_width
-        )
+    let left_width = usize::from(inner.width).saturating_sub(display_width(&right) + 1);
+    let left = pad_right(
+        &format!(
+            "{}  {}  {}",
+            module.id,
+            module.relative_path,
+            human_bytes(module.file_size)
+        ),
+        left_width,
     );
     let detail = history.map_or_else(
         || "no runs · no promoted baseline".to_owned(),
@@ -1384,11 +1381,7 @@ fn case_line(case: &CasePreview, width: usize) -> Line<'static> {
     }
     Line::from(vec![
         Span::styled(
-            format!(
-                "{:<id_width$}",
-                clip(&case.id, width.saturating_sub(contract.len() + 1)),
-                id_width = width.saturating_sub(contract.len() + 1)
-            ),
+            pad_right(&case.id, width.saturating_sub(contract.len() + 1)),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(contract, Style::default().fg(MUTED)),
@@ -2010,6 +2003,21 @@ export default defineBrowserBenchmark({
                 "run picker omitted {expected:?}:\n{screen}"
             );
         }
+    }
+
+    #[test]
+    fn case_rows_measure_wide_identifiers_in_terminal_columns() {
+        let width = 40;
+        let line = case_line(
+            &CasePreview {
+                id: "wide-界".to_owned(),
+                setup: false,
+                exact: true,
+            },
+            width,
+        );
+
+        assert_eq!(line.width(), width - 1);
     }
 
     #[test]

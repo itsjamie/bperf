@@ -27,7 +27,7 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 
 use crate::terminal_ui::{
     self, AMBER, BG, BLUE, CYAN, ControlFlow, FAINT, GREEN, MUTED, RED, SELECTED, SURFACE, TEXT,
-    centered_rect, chrome_block, clip, fit_sides,
+    centered_rect, chrome_block, clip, fit_sides, pad_right,
 };
 
 const MIN_WIDTH: u16 = 92;
@@ -914,7 +914,7 @@ fn cycle_item(cycle: &HistoryCycleSummary, width: u16, graph_scale: f64) -> List
         ]),
         Line::from(vec![
             Span::styled(
-                format!("{message:<message_width$} "),
+                format!("{} ", pad_right(&message, message_width)),
                 Style::default().fg(MUTED),
             ),
             Span::styled(graph, Style::default().fg(outcome_color(&cycle.outcome))),
@@ -1354,11 +1354,7 @@ fn render_artifacts(frame: &mut Frame<'_>, area: Rect, cycle: &HistoryCycle, dis
                     Style::default().fg(artifact_color(artifact.kind)),
                 ),
                 Span::styled(
-                    format!(
-                        "{:<width$}",
-                        clip(&display_path(&artifact.path, display_root), path_width),
-                        width = path_width
-                    ),
+                    pad_right(&display_path(&artifact.path, display_root), path_width),
                     Style::default().fg(TEXT),
                 ),
                 Span::raw(" "),

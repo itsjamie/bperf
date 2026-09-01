@@ -148,7 +148,7 @@ pub(crate) fn pad_right(value: &str, width: usize) -> String {
     format!("{value}{}", " ".repeat(width - display_width(&value)))
 }
 
-fn display_width(value: &str) -> usize {
+pub(crate) fn display_width(value: &str) -> usize {
     Line::from(value).width()
 }
 
