@@ -2175,11 +2175,12 @@ fn parse_live_heap_bytes(snapshot_data: &str) -> Result<u64> {
         .get("nodes")
         .and_then(Value::as_array)
         .context("WebKit emitted an invalid heap snapshot")?;
-    if nodes.is_empty() || nodes.len() % 4 != 0 {
+    let (nodes, remainder) = nodes.as_chunks::<4>();
+    if nodes.is_empty() || !remainder.is_empty() {
         bail!("WebKit emitted an invalid heap snapshot");
     }
     let mut total = 0_u64;
-    for node in nodes.chunks_exact(4) {
+    for node in nodes {
         let size = node[1]
             .as_u64()
             .context("WebKit heap snapshot contains an invalid node size")?;
