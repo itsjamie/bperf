@@ -68,11 +68,12 @@ pub(crate) fn promote_prepared(
         transaction.read_events(BASELINE_EVENTS, &pending.benchmark_id)?;
     validate_history(&history, &pending.benchmark_id)?;
     let previous = history.last().cloned();
-    if let Some(previous) = previous.as_ref().filter(|record| {
-        record.measurement_set_id == pending.measurement_set_id
-            && record.measurement_set_path == pending.measurement_set_path
-    }) {
-        if previous.subject_id != pending.subject_id
+    if let Some(previous) = previous
+        .as_ref()
+        .filter(|record| record.measurement_set_id == pending.measurement_set_id)
+    {
+        if previous.measurement_set_path != pending.measurement_set_path
+            || previous.subject_id != pending.subject_id
             || previous.benchmark_sha256 != pending.benchmark_sha256
             || previous.variant_id != pending.variant_id
             || previous.variant_sha256 != pending.variant_sha256
@@ -219,6 +220,13 @@ fn validate_history(history: &[BaselineRecord], benchmark_id: &str) -> Result<()
                 record.measurement_set_id
             );
         }
+        if record.previous_measurement_set_id.as_deref() == Some(record.measurement_set_id.as_str())
+        {
+            bail!(
+                "baseline history for {benchmark_id:?} repeats the current measurement {:?}",
+                record.measurement_set_id
+            );
+        }
         previous = Some(record.measurement_set_id.as_str());
     }
     Ok(())
@@ -357,6 +365,56 @@ mod tests {
         let error = current_path_if_present(directory.path(), "benchmark").unwrap_err();
         assert!(
             error.to_string().contains("broken predecessor"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn one_measurement_identity_cannot_move_between_paths() {
+        let directory = tempdir().unwrap();
+        let existing = record("first", None);
+        append(directory.path(), &existing).unwrap();
+        let pending = PendingBaseline {
+            benchmark_id: existing.benchmark_id.clone(),
+            subject_id: existing.subject_id.clone(),
+            benchmark_sha256: existing.benchmark_sha256.clone(),
+            measurement_set_id: existing.measurement_set_id.clone(),
+            measurement_set_path: "C:/elsewhere/first".to_owned(),
+            variant_id: existing.variant_id.clone(),
+            variant_sha256: existing.variant_sha256.clone(),
+            environment_fingerprint: existing.environment_fingerprint.clone(),
+            measured_at_unix_ms: existing.measured_at_unix_ms,
+        };
+        let database = promotion_database(directory.path()).unwrap();
+
+        let error = database
+            .write(|transaction| promote_prepared(transaction, &pending))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the immutable measurement"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            current(directory.path(), "benchmark")
+                .unwrap()
+                .measurement_set_path,
+            existing.measurement_set_path
+        );
+    }
+
+    #[test]
+    fn baseline_reads_reject_a_redundant_self_transition() {
+        let directory = tempdir().unwrap();
+        append(directory.path(), &record("first", None)).unwrap();
+        append(directory.path(), &record("first", Some("first"))).unwrap();
+
+        let error = current_path_if_present(directory.path(), "benchmark").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repeats the current measurement"),
             "unexpected error: {error:#}"
         );
     }
