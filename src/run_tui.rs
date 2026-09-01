@@ -23,7 +23,7 @@ use ratatui::{
 
 use crate::terminal_ui::{
     self, AMBER, BG, BLUE, CYAN, ControlFlow, FAINT, FOCUS, GREEN, MUTED, RED, SELECTED, SURFACE,
-    TEXT, chrome_block, clip, fit_sides, relative_age,
+    TEXT, chrome_block, clip, fit_sides, pad_right, relative_age,
 };
 
 const MIN_WIDTH: u16 = 100;
@@ -1095,7 +1095,7 @@ fn module_item(module: &BenchmarkModule, width: u16) -> ListItem<'static> {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{:<path_space$}", clip(&module.relative_path, path_space)),
+            pad_right(&module.relative_path, path_space),
             Style::default().fg(MUTED),
         ),
     ];
@@ -1152,7 +1152,7 @@ fn module_item(module: &BenchmarkModule, width: u16) -> ListItem<'static> {
     let second_width = available.saturating_sub(graph_width + usize::from(!graph.is_empty()));
     let second = Line::from(vec![
         Span::styled(
-            format!("{:<second_width$}", clip(&summary, second_width)),
+            pad_right(&summary, second_width),
             Style::default().fg(MUTED),
         ),
         Span::styled(graph, Style::default().fg(CYAN)),

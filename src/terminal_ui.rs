@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
+    text::Line,
     widgets::{Block, Borders},
 };
 
@@ -104,21 +105,21 @@ pub(crate) fn fit_sides(left: &str, right: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let right_width = right.chars().count().min(width);
-    if right_width + 1 >= width {
+    let right_width = display_width(right).min(width);
+    if right_width >= width - 1 {
         return clip(right, width);
     }
     let left_width = width - right_width - 1;
     format!(
-        "{:<left_width$} {}",
-        clip(left, left_width),
+        "{} {}",
+        pad_right(left, left_width),
         clip(right, right_width)
     )
 }
 
 pub(crate) fn clip(value: &str, width: usize) -> String {
-    let count = value.chars().count();
-    if count <= width {
+    let line = Line::from(value);
+    if line.width() <= width {
         return value.to_owned();
     }
     if width == 0 {
@@ -127,9 +128,28 @@ pub(crate) fn clip(value: &str, width: usize) -> String {
     if width == 1 {
         return "…".to_owned();
     }
-    let mut clipped = value.chars().take(width - 1).collect::<String>();
+    let content_width = width - 1;
+    let mut clipped = String::new();
+    let mut clipped_width = 0;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let grapheme_width = display_width(grapheme.symbol);
+        if clipped_width + grapheme_width > content_width {
+            break;
+        }
+        clipped.push_str(grapheme.symbol);
+        clipped_width += grapheme_width;
+    }
     clipped.push('…');
     clipped
+}
+
+pub(crate) fn pad_right(value: &str, width: usize) -> String {
+    let value = clip(value, width);
+    format!("{value}{}", " ".repeat(width - display_width(&value)))
+}
+
+fn display_width(value: &str) -> usize {
+    Line::from(value).width()
 }
 
 pub(crate) fn now_unix_ms() -> u64 {
@@ -149,5 +169,18 @@ pub(crate) fn relative_age(timestamp_ms: u64) -> String {
             format!("{}d ago", value / (24 * 60 * 60_000))
         }
         _ => format!("{}d ago", elapsed / (24 * 60 * 60_000)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_layout_uses_terminal_columns() {
+        assert_eq!(clip("界界", 3), "界…");
+        assert_eq!(display_width(&clip("界界", 3)), 3);
+        assert_eq!(display_width(&pad_right("界", 4)), 4);
+        assert_eq!(display_width(&fit_sides("界", "ok", 6)), 6);
     }
 }
