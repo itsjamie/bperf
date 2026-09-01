@@ -402,6 +402,7 @@ fn linux_os_release(release: &str, kernel: &str) -> Result<String> {
         .filter(|value| !value.is_empty())
         .context("/etc/os-release has no distribution ID")?;
     let version = field("VERSION_ID")
+        .filter(|value| !value.is_empty())
         .or_else(|| field("BUILD_ID"))
         .filter(|value| !value.is_empty());
     Ok(format!(
@@ -588,6 +589,10 @@ mod tests {
         assert_eq!(ubuntu, "ubuntu 24.04 (kernel 6.8.0-test)");
         assert_eq!(debian, "debian 13 (kernel 6.8.0-test)");
         assert_ne!(ubuntu, debian);
+        assert_eq!(
+            linux_os_release("ID=arch\nVERSION_ID=\nBUILD_ID=rolling\n", kernel).unwrap(),
+            "arch rolling (kernel 6.8.0-test)"
+        );
     }
 
     #[test]
