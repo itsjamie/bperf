@@ -4,7 +4,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::Path,
 };
 
@@ -35,6 +35,20 @@ pub fn publish_immutable(path: &Path, content: &[u8]) -> Result<()> {
     staged
         .write_all(content)
         .with_context(|| format!("failed to stage immutable file {}", path.display()))?;
+
+    publish_staged_immutable(path, staged)
+}
+
+/// Publishes a complete tempfile staged in the final path's directory. A
+/// concurrent publisher of identical content is accepted.
+pub fn publish_staged_immutable(path: &Path, staged: tempfile::NamedTempFile) -> Result<()> {
+    let parent = parent_directory(path)?;
+    if staged.path().parent() != Some(parent) {
+        bail!(
+            "immutable file {} was staged outside its storage directory",
+            path.display()
+        );
+    }
     staged
         .as_file()
         .sync_all()
@@ -43,9 +57,14 @@ pub fn publish_immutable(path: &Path, content: &[u8]) -> Result<()> {
     match staged.persist_noclobber(path) {
         Ok(_) => sync_directory(parent),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing =
-                fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-            if existing == content {
+            let staged = error.file.reopen().with_context(|| {
+                format!("failed to reopen staged immutable file {}", path.display())
+            })?;
+            let existing = fs::File::open(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if files_equal(staged, existing)
+                .with_context(|| format!("failed to compare immutable file {}", path.display()))?
+            {
                 Ok(())
             } else {
                 bail!("immutable file collision at {}", path.display())
@@ -53,6 +72,24 @@ pub fn publish_immutable(path: &Path, content: &[u8]) -> Result<()> {
         }
         Err(error) => Err(error.error)
             .with_context(|| format!("failed to publish immutable file {}", path.display())),
+    }
+}
+
+fn files_equal(first: fs::File, second: fs::File) -> std::io::Result<bool> {
+    let mut first = BufReader::new(first);
+    let mut second = BufReader::new(second);
+    loop {
+        let first_buffer = first.fill_buf()?;
+        let second_buffer = second.fill_buf()?;
+        if first_buffer.is_empty() || second_buffer.is_empty() {
+            return Ok(first_buffer.is_empty() && second_buffer.is_empty());
+        }
+        let compared = first_buffer.len().min(second_buffer.len());
+        if first_buffer[..compared] != second_buffer[..compared] {
+            return Ok(false);
+        }
+        first.consume(compared);
+        second.consume(compared);
     }
 }
 

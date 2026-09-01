@@ -15,6 +15,7 @@ use ureq::{Agent, ResponseExt, http::Uri};
 use crate::project_modules::project_file;
 
 const LOCK_SCHEMA_VERSION: u32 = 1;
+const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +67,13 @@ struct FixtureLock {
 pub(crate) struct ResolvedFixtures {
     pub(crate) fixture_files: Vec<PathBuf>,
     pub(crate) fixture_lock: PathBuf,
+}
+
+#[derive(Debug)]
+struct CachedBody {
+    path: PathBuf,
+    sha256: String,
+    size_bytes: u64,
 }
 
 pub(crate) struct LockedFixtures {
@@ -229,7 +237,7 @@ fn acquire(
     agent: &Agent,
 ) -> Result<FixtureLockEntry> {
     let fallback_content_type = inferred_content_type(&descriptor.source);
-    let (body, source_url, final_url, content_type) = if let Some(source_uri) =
+    let (cached, source_url, final_url, content_type) = if let Some(source_uri) =
         remote_uri(&descriptor.source)
     {
         let source_url = source_uri.to_string();
@@ -249,58 +257,58 @@ fn acquire(
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .map_or_else(|| fallback_content_type.clone(), str::to_owned);
-        let mut body = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .read_to_end(&mut body)
-            .with_context(|| format!("failed to read remote fixture {source_url}"))?;
-        (body, Some(source_url), Some(final_url), content_type)
+        let cached = cache_body(
+            cache_root,
+            response.body_mut().as_reader(),
+            &format!("remote fixture {source_url}"),
+        )?;
+        (cached, Some(source_url), Some(final_url), content_type)
     } else {
         let source = benchmark_directory.join(&descriptor.source);
         let source = project_file(root, &source, "fixture")?;
-        let body = fs::read(&source)
+        let body = File::open(&source)
             .with_context(|| format!("failed to read benchmark fixture {}", source.display()))?;
-        (body, None, None, fallback_content_type)
+        let cached = cache_body(
+            cache_root,
+            body,
+            &format!("benchmark fixture {}", source.display()),
+        )?;
+        (cached, None, None, fallback_content_type)
     };
 
-    let digest = format!("{:x}", Sha256::digest(&body));
-    let body_path = cache_body(cache_root, &digest, &body)?;
     Ok(FixtureLockEntry {
         descriptor: descriptor.clone(),
         source_url,
         final_url,
-        body_path,
-        sha256: digest,
-        size_bytes: body.len() as u64,
+        body_path: cached.path,
+        sha256: cached.sha256,
+        size_bytes: cached.size_bytes,
         content_type,
     })
 }
 
-fn cache_body(cache_root: &Path, digest: &str, body: &[u8]) -> Result<PathBuf> {
-    let body_path = cache_root.join(digest);
-    if !body_path.exists() {
-        bperf_storage::publish_immutable(&body_path, body).with_context(|| {
-            format!(
-                "failed to persist benchmark fixture {}",
-                body_path.display()
-            )
-        })?;
-    }
-    let cached = fs::read(&body_path)
-        .with_context(|| format!("failed to read benchmark fixture {}", body_path.display()))?;
-    if cached != body {
-        bail!(
-            "content-addressed fixture object is corrupt: {}",
+fn cache_body(cache_root: &Path, mut source: impl Read, label: &str) -> Result<CachedBody> {
+    let mut staged = tempfile::NamedTempFile::new_in(cache_root)
+        .context("failed to stage a benchmark fixture")?;
+    let (sha256, size_bytes) = copy_body(&mut source, &mut staged, label)?;
+    let body_path = cache_root.join(&sha256);
+    bperf_storage::publish_staged_immutable(&body_path, staged).with_context(|| {
+        format!(
+            "failed to persist benchmark fixture {}",
             body_path.display()
-        );
-    }
-    cached_object_path(
+        )
+    })?;
+    let path = cached_object_path(
         cache_root,
-        digest,
+        &sha256,
         &body_path,
         "content-addressed fixture object",
-    )
+    )?;
+    Ok(CachedBody {
+        path,
+        sha256,
+        size_bytes,
+    })
 }
 
 fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
@@ -336,26 +344,14 @@ fn validate_body(
         .with_context(|| format!("{label} is missing: {}", entry.descriptor.source))?;
     let mut body =
         tempfile::NamedTempFile::new().context("failed to stage a locked benchmark fixture")?;
-    let mut digest = Sha256::new();
-    let mut size = 0_u64;
-    let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let count = source
-            .read(&mut chunk)
-            .with_context(|| format!("failed to read {label}: {}", entry.descriptor.source))?;
-        if count == 0 {
-            break;
-        }
-        size = size
-            .checked_add(count as u64)
-            .context("benchmark fixture size overflowed")?;
-        digest.update(&chunk[..count]);
-        body.write_all(&chunk[..count])
-            .context("failed to stage a locked benchmark fixture")?;
-    }
+    let (digest, size) = copy_body(
+        &mut source,
+        &mut body,
+        &format!("{label}: {}", entry.descriptor.source),
+    )?;
     body.flush()
         .context("failed to flush a locked benchmark fixture")?;
-    if size != entry.size_bytes || format!("{:x}", digest.finalize()) != entry.sha256 {
+    if size != entry.size_bytes || digest != entry.sha256 {
         bail!("{label} is corrupt: {}", entry.descriptor.source);
     }
     entry.body_path = fs::canonicalize(&entry.body_path).with_context(|| {
@@ -365,6 +361,32 @@ fn validate_body(
         )
     })?;
     Ok((entry, body))
+}
+
+fn copy_body(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    label: &str,
+) -> Result<(String, u64)> {
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut chunk = [0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let count = source
+            .read(&mut chunk)
+            .with_context(|| format!("failed to read {label}"))?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .context("benchmark fixture size overflowed")?;
+        digest.update(&chunk[..count]);
+        destination
+            .write_all(&chunk[..count])
+            .with_context(|| format!("failed to stage {label}"))?;
+    }
+    Ok((format!("{:x}", digest.finalize()), size))
 }
 
 fn cached_object_path(
@@ -558,6 +580,41 @@ mod tests {
         assert_eq!(remainder, b"2345");
     }
 
+    #[test]
+    fn fixture_cache_streams_source_with_bounded_reads() {
+        struct GuardedReader {
+            remaining: usize,
+            largest_request: usize,
+        }
+
+        impl Read for GuardedReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                self.largest_request = self.largest_request.max(output.len());
+                let count = output.len().min(self.remaining);
+                output[..count].fill(b'x');
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let size = 2 * COPY_BUFFER_BYTES + 17;
+        let mut source = GuardedReader {
+            remaining: size,
+            largest_request: 0,
+        };
+
+        let cached = cache_body(cache.path(), &mut source, "generated fixture").unwrap();
+
+        assert_eq!(source.largest_request, COPY_BUFFER_BYTES);
+        assert_eq!(cached.size_bytes, size as u64);
+        assert_eq!(fs::metadata(cached.path).unwrap().len(), size as u64);
+        assert_eq!(
+            cached.sha256,
+            format!("{:x}", Sha256::digest(vec![b'x'; size]))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn content_addressed_cache_objects_cannot_be_symlinks() {
@@ -571,7 +628,7 @@ mod tests {
         fs::write(&outside_path, body).unwrap();
         symlink(&outside_path, cache.path().join(&digest)).unwrap();
 
-        let error = cache_body(cache.path(), &digest, body).unwrap_err();
+        let error = cache_body(cache.path(), &body[..], "fixture").unwrap_err();
         assert!(
             error
                 .to_string()
