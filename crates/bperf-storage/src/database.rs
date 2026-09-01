@@ -447,7 +447,7 @@ impl WriteTransaction<'_> {
             )
             .optional()?;
         match existing {
-            Some((_immutable, existing)) if existing == payload => Ok(()),
+            Some((true, existing)) if existing == payload => Ok(()),
             Some(_) => bail!("immutable {namespace} document collision at {key:?}"),
             None => {
                 self.transaction.execute(
@@ -625,6 +625,11 @@ mod tests {
         database
             .replace_document("test", "current", &Record { value: 2 })
             .unwrap();
+        assert!(
+            database
+                .publish_document("test", "current", &Record { value: 2 })
+                .is_err()
+        );
         assert_eq!(
             database.read_document::<Record>("test", "current").unwrap(),
             Some(Record { value: 2 })
