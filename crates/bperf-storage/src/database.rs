@@ -580,6 +580,28 @@ mod tests {
         value: u32,
     }
 
+    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    struct FloatRecord {
+        value: f64,
+    }
+
+    #[test]
+    fn json_documents_preserve_float_bits() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        let value = "0.009594652082970447".parse::<f64>().unwrap();
+
+        database
+            .publish_document("test", "float", &FloatRecord { value })
+            .unwrap();
+        let stored = database
+            .read_document::<FloatRecord>("test", "float")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored.value.to_bits(), value.to_bits());
+    }
+
     #[test]
     fn immutable_documents_and_mutable_documents_have_distinct_contracts() {
         let directory = tempdir().unwrap();
