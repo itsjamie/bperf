@@ -34,6 +34,14 @@ pub(crate) struct ArtifactRetention {
     summary: RetentionSummary,
 }
 
+impl ArtifactRetention {
+    pub(crate) fn artifacts(&self) -> impl Iterator<Item = (Engine, &ArtifactEvidence)> {
+        self.selections
+            .iter()
+            .map(|selection| (selection.engine, &selection.artifact))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RetainedArtifact {

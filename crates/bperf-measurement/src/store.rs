@@ -811,23 +811,9 @@ impl MeasurementSet {
     /// selection. Descriptors for discarded trial payloads never cross this
     /// boundary even though they remain in immutable trial evidence.
     pub fn retained_artifacts(&self) -> Vec<(Engine, &ArtifactEvidence)> {
-        if self.retention.is_none() {
-            return Vec::new();
-        }
-        Engine::ALL
-            .into_iter()
-            .flat_map(|engine| {
-                self.final_results(engine)
-                    .into_iter()
-                    .flat_map(move |result| {
-                        result.artifacts.iter().filter_map(move |artifact| {
-                            self.root
-                                .join(&artifact.path)
-                                .is_file()
-                                .then_some((engine, artifact))
-                        })
-                    })
-            })
+        self.retention
+            .iter()
+            .flat_map(ArtifactRetention::artifacts)
             .collect()
     }
 
@@ -1607,8 +1593,12 @@ mod tests {
 
         append_pending(&measurement);
         let completed = MeasurementSet::open(&root).unwrap();
-        artifact_retention::finalize(&completed).unwrap().unwrap();
+        let retention = artifact_retention::finalize(&completed).unwrap().unwrap();
         let retained = MeasurementSet::open(&root).unwrap();
+        assert_eq!(
+            retained.retained_artifacts().len(),
+            retention.retained_artifacts
+        );
         let summary = serde_json::json!({"status": "complete"});
         retained.commit_outcome(&summary).unwrap();
         retained.commit_outcome(&summary).unwrap();
