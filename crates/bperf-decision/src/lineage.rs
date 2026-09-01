@@ -384,6 +384,7 @@ impl HistoryCycle {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryChangeSummary {
     pub files_changed: usize,
     pub additions: usize,
@@ -423,6 +424,7 @@ impl HistoryArtifactKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryArtifact {
     pub kind: HistoryArtifactKind,
     pub engine: Option<Engine>,
@@ -456,9 +458,27 @@ impl HistoryReader {
         self.store.build_history_overview(&benchmark_id, &events)
     }
 
-    pub fn cycle(&self, summary: &HistoryCycleSummary) -> Result<HistoryCycle> {
-        require_cycle_id(&summary.cycle_id)?;
-        self.store.load_history_cycle(&self.reader, summary.clone())
+    pub fn cycle(&self, benchmark_id: &str, cycle_id: &str) -> Result<HistoryCycle> {
+        require_identifier("benchmark", benchmark_id)?;
+        require_cycle_id(cycle_id)?;
+        let events = self.store.read_events_with(&self.reader, benchmark_id)?;
+        let overview = self.store.build_history_overview(benchmark_id, &events)?;
+        let summary = overview
+            .cycles
+            .into_iter()
+            .find(|cycle| cycle.cycle_id == cycle_id)
+            .with_context(|| format!("benchmark {benchmark_id:?} has no cycle {cycle_id}"))?;
+        let cycle = events
+            .iter()
+            .find_map(|event| match event {
+                LineageEvent::Cycle(cycle) if cycle.cycle_id == cycle_id => Some(cycle.as_ref()),
+                LineageEvent::Cycle(_)
+                | LineageEvent::Confirmation(_)
+                | LineageEvent::Promotion(_) => None,
+            })
+            .context("selected history cycle is missing from its validated event stream")?;
+        self.store
+            .load_history_cycle(&self.reader, summary, &cycle.evidence_contract())
     }
 
     pub fn view(&self, benchmark_id: Option<&str>) -> Result<HistoryView> {
@@ -500,16 +520,8 @@ pub fn history_overview(root: &Path, benchmark_id: Option<&str>) -> Result<Histo
 /// Loads one cycle's compact persisted evidence without opening native payloads.
 /// The cycle ID must be the full immutable ID, not a human selector prefix.
 pub fn history_cycle(root: &Path, benchmark_id: &str, cycle_id: &str) -> Result<HistoryCycle> {
-    require_identifier("benchmark", benchmark_id)?;
-    require_cycle_id(cycle_id)?;
     let reader = HistoryReader::open(root)?;
-    let overview = reader.overview(Some(benchmark_id))?;
-    let summary = overview
-        .cycles
-        .into_iter()
-        .find(|cycle| cycle.cycle_id == cycle_id)
-        .with_context(|| format!("benchmark {benchmark_id:?} has no cycle {cycle_id}"))?;
-    reader.cycle(&summary)
+    reader.cycle(benchmark_id, cycle_id)
 }
 
 pub fn history_view(root: &Path, benchmark_id: Option<&str>) -> Result<HistoryView> {
@@ -566,8 +578,9 @@ pub fn show(options: ShowOptions) -> Result<()> {
     let events = store.read_events(&cycle.benchmark_id)?;
     let promotion_readiness = promotion_readiness(&cycle, &events);
     let reader = store.database.reader()?;
+    let evidence_contract = cycle.evidence_contract();
     let artifacts = store
-        .read_cycle_evidence(&reader, &cycle.cycle_id)?
+        .read_cycle_evidence(&reader, &cycle.cycle_id, &evidence_contract)?
         .map(|evidence| evidence.artifacts);
     let diff = options
         .diff
@@ -788,6 +801,13 @@ impl CycleRecord {
             }
         })
     }
+
+    fn evidence_contract(&self) -> CycleEvidenceContract {
+        CycleEvidenceContract {
+            environment_fingerprint: self.environment_fingerprint.clone(),
+            measurement_root: PathBuf::from(&self.candidate_measurement_path),
+        }
+    }
 }
 
 fn render_accept_command(selector: &str) -> String {
@@ -928,6 +948,12 @@ struct StoredCycleEvidence {
     environment: EnvironmentSummary,
     change: HistoryChangeSummary,
     artifacts: Vec<HistoryArtifact>,
+}
+
+#[derive(Clone, Debug)]
+struct CycleEvidenceContract {
+    environment_fingerprint: String,
+    measurement_root: PathBuf,
 }
 
 struct LineageStore {
@@ -1575,9 +1601,21 @@ impl LineageStore {
             baselines,
             current_baseline_label,
         } = self.build_history_overview(benchmark_id, events)?;
+        let cycle_by_id = events
+            .iter()
+            .filter_map(|event| match event {
+                LineageEvent::Cycle(cycle) => Some((cycle.cycle_id.as_str(), cycle.as_ref())),
+                LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
+            })
+            .collect::<BTreeMap<_, _>>();
         let cycles = summaries
             .into_iter()
-            .map(|summary| self.load_history_cycle(reader, summary))
+            .map(|summary| {
+                let cycle = cycle_by_id
+                    .get(summary.cycle_id.as_str())
+                    .context("history summary refers to an unknown cycle")?;
+                self.load_history_cycle(reader, summary, &cycle.evidence_contract())
+            })
             .collect::<Result<_>>()?;
         Ok(HistoryView {
             benchmark_id,
@@ -1595,6 +1633,7 @@ impl LineageStore {
         &self,
         reader: &DatabaseReader,
         cycle_id: &str,
+        contract: &CycleEvidenceContract,
     ) -> Result<Option<StoredCycleEvidence>> {
         let Some(stored) =
             reader.read_document::<StoredCycleEvidence>(HISTORY_EVIDENCE, cycle_id)?
@@ -1607,6 +1646,8 @@ impl LineageStore {
                 short_id(cycle_id)
             );
         }
+        validate_cycle_evidence(&stored, contract)
+            .with_context(|| format!("history evidence for {} is invalid", short_id(cycle_id)))?;
         Ok(Some(stored))
     }
 
@@ -1614,9 +1655,10 @@ impl LineageStore {
         &self,
         reader: &DatabaseReader,
         summary: HistoryCycleSummary,
+        contract: &CycleEvidenceContract,
     ) -> Result<HistoryCycle> {
         let stored = self
-            .read_cycle_evidence(reader, &summary.cycle_id)?
+            .read_cycle_evidence(reader, &summary.cycle_id, contract)?
             .with_context(|| {
                 format!(
                     "cycle {} has no persisted history evidence",
@@ -2071,21 +2113,103 @@ fn retained_history_artifacts(measurement: &MeasurementSet) -> Vec<HistoryArtifa
             path,
         });
     }
-    artifacts.sort_by(|left, right| {
-        (
-            left.engine.map(engine_rank).unwrap_or(Engine::ALL.len()),
-            left.kind,
-            left.capture_scope.as_deref(),
-            &left.path,
-        )
-            .cmp(&(
-                right.engine.map(engine_rank).unwrap_or(Engine::ALL.len()),
-                right.kind,
-                right.capture_scope.as_deref(),
-                &right.path,
-            ))
-    });
+    artifacts.sort_by(compare_history_artifacts);
     artifacts
+}
+
+fn validate_cycle_evidence(
+    evidence: &StoredCycleEvidence,
+    contract: &CycleEvidenceContract,
+) -> Result<()> {
+    require_identifier("history evidence variant", &evidence.variant_id)?;
+    if evidence.case_ids.is_empty() {
+        bail!("history evidence contains no benchmark cases");
+    }
+    let mut case_ids = HashSet::new();
+    for case_id in &evidence.case_ids {
+        require_identifier("history evidence case", case_id)?;
+        if !case_ids.insert(case_id) {
+            bail!("history evidence contains duplicate benchmark case {case_id:?}");
+        }
+    }
+    evidence
+        .environment
+        .validate(&contract.environment_fingerprint)?;
+    if evidence.change.binary_files > evidence.change.files_changed {
+        bail!("history evidence change totals are inconsistent");
+    }
+    let mut previous = None;
+    for artifact in &evidence.artifacts {
+        if previous.is_some_and(|previous| {
+            compare_history_artifacts(previous, artifact) != std::cmp::Ordering::Less
+        }) {
+            bail!("history evidence artifacts are not canonical");
+        }
+        validate_history_artifact(artifact, &contract.measurement_root)?;
+        previous = Some(artifact);
+    }
+    Ok(())
+}
+
+fn validate_history_artifact(artifact: &HistoryArtifact, measurement_root: &Path) -> Result<()> {
+    match artifact.kind {
+        HistoryArtifactKind::CpuProfile
+        | HistoryArtifactKind::Flamegraph
+        | HistoryArtifactKind::HeapSnapshot => {
+            if artifact.engine.is_none()
+                || artifact
+                    .capture_scope
+                    .as_deref()
+                    .is_none_or(|scope| scope.trim().is_empty())
+            {
+                bail!("native history artifact has incomplete capture identity");
+            }
+        }
+        HistoryArtifactKind::Comparison | HistoryArtifactKind::Sampling => {
+            if artifact.engine.is_some() || artifact.capture_scope.is_some() {
+                bail!("shared history artifact has an engine capture identity");
+            }
+        }
+    }
+    let relative = artifact
+        .path
+        .strip_prefix(measurement_root)
+        .with_context(|| {
+            format!(
+                "retained artifact {} is outside measurement set {}",
+                artifact.path.display(),
+                measurement_root.display()
+            )
+        })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!(
+            "retained artifact {} is not a contained file path",
+            artifact.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn compare_history_artifacts(
+    left: &HistoryArtifact,
+    right: &HistoryArtifact,
+) -> std::cmp::Ordering {
+    (
+        left.engine.map(engine_rank).unwrap_or(Engine::ALL.len()),
+        left.kind,
+        left.capture_scope.as_deref(),
+        &left.path,
+    )
+        .cmp(&(
+            right.engine.map(engine_rank).unwrap_or(Engine::ALL.len()),
+            right.kind,
+            right.capture_scope.as_deref(),
+            &right.path,
+        ))
 }
 
 fn engine_rank(engine: Engine) -> usize {
@@ -2887,6 +3011,33 @@ mod tests {
         }
     }
 
+    fn stored_evidence(cycle: &CycleRecord) -> StoredCycleEvidence {
+        StoredCycleEvidence {
+            schema_version: SCHEMA_VERSION,
+            cycle_id: cycle.cycle_id.clone(),
+            variant_id: "worktree".to_owned(),
+            case_ids: vec!["parse".to_owned()],
+            environment: EnvironmentSummary {
+                recorded_at_unix_ms: 1,
+                fingerprint: cycle.environment_fingerprint.clone(),
+                platform: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                os_release: "test".to_owned(),
+                browser_versions: Engine::ALL
+                    .into_iter()
+                    .map(|engine| (engine, "test".to_owned()))
+                    .collect(),
+            },
+            change: HistoryChangeSummary {
+                files_changed: 1,
+                additions: 1,
+                deletions: 0,
+                binary_files: 0,
+            },
+            artifacts: Vec::new(),
+        }
+    }
+
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {
         ComparisonSummary {
             comparison_id: format!("compare-{candidate}"),
@@ -3066,7 +3217,8 @@ mod tests {
         let state = store
             .capture_state(&workspace, std::slice::from_ref(&source))
             .unwrap();
-        let missing_artifact = temporary.path().join("deleted-cpu-profile.json");
+        let missing_artifact =
+            PathBuf::from("C:/measurements/measure-1/artifacts/deleted-cpu-profile.json");
         let cycle = store
             .append_cycle_with_evidence(
                 cycle(state, "measure-1"),
@@ -3099,6 +3251,69 @@ mod tests {
         assert_eq!(detail.variant_id, "worktree");
         assert_eq!(detail.case_ids, ["parse"]);
         assert_eq!(detail.artifacts[0].path, missing_artifact);
+    }
+
+    #[test]
+    fn stored_cycle_evidence_must_match_the_cycle_environment() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let lineage_root = temporary.path().join("lineages");
+        let store = LineageStore::open(&lineage_root).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let cycle = store.append_cycle(cycle(state, "measure-1")).unwrap();
+        let mut evidence = stored_evidence(&cycle);
+        evidence.environment.fingerprint = "another-environment".to_owned();
+        store
+            .database
+            .publish_document(HISTORY_EVIDENCE, cycle.cycle_id(), &evidence)
+            .unwrap();
+
+        let error = history_cycle(&lineage_root, "parser", cycle.cycle_id()).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("persisted environment summary is incomplete or inconsistent"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_cycle_evidence_artifacts_must_stay_in_the_measurement_set() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let lineage_root = temporary.path().join("lineages");
+        let store = LineageStore::open(&lineage_root).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let cycle = store.append_cycle(cycle(state, "measure-1")).unwrap();
+        let mut evidence = stored_evidence(&cycle);
+        evidence.artifacts.push(HistoryArtifact {
+            kind: HistoryArtifactKind::CpuProfile,
+            engine: Some(Engine::Chromium),
+            capture_scope: Some("parse/final/0".to_owned()),
+            path: cycle
+                .evidence_contract()
+                .measurement_root
+                .join("../unrelated.json"),
+        });
+        store
+            .database
+            .publish_document(HISTORY_EVIDENCE, cycle.cycle_id(), &evidence)
+            .unwrap();
+
+        let error = history_cycle(&lineage_root, "parser", cycle.cycle_id()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is not a contained file path"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -3195,7 +3410,7 @@ mod tests {
             .find(|cycle| cycle.cycle_id == selected_cycle)
             .unwrap();
         let started = std::time::Instant::now();
-        let cycle = reader.cycle(selected_summary).unwrap();
+        let cycle = reader.cycle("parser", &selected_summary.cycle_id).unwrap();
         let cycle_elapsed = started.elapsed();
 
         assert_eq!(index.benchmarks[0].cycle_count, 400);
@@ -4087,7 +4302,7 @@ mod tests {
         let reader = store.database.reader().unwrap();
         assert!(
             store
-                .read_cycle_evidence(&reader, bare.cycle_id())
+                .read_cycle_evidence(&reader, bare.cycle_id(), &bare.evidence_contract())
                 .unwrap()
                 .is_none(),
             "cycles recorded without evidence must not fail show"
@@ -4097,7 +4312,7 @@ mod tests {
         let state = store
             .capture_state(&workspace, std::slice::from_ref(&source))
             .unwrap();
-        let retained_path = temporary.path().join("cpu.json");
+        let retained_path = PathBuf::from("C:/measurements/measure-2/artifacts/cpu.json");
         let with_evidence = store
             .append_cycle_with_evidence(
                 cycle(state, "measure-2"),
@@ -4126,7 +4341,11 @@ mod tests {
             .unwrap();
         let reader = store.database.reader().unwrap();
         let evidence = store
-            .read_cycle_evidence(&reader, with_evidence.cycle_id())
+            .read_cycle_evidence(
+                &reader,
+                with_evidence.cycle_id(),
+                &with_evidence.evidence_contract(),
+            )
             .unwrap()
             .expect("recorded evidence must be readable");
         assert_eq!(evidence.artifacts.len(), 1);

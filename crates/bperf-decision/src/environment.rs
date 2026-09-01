@@ -71,6 +71,26 @@ pub struct EnvironmentSummary {
     pub browser_versions: BTreeMap<Engine, String>,
 }
 
+impl EnvironmentSummary {
+    pub(crate) fn validate(&self, expected_fingerprint: &str) -> Result<()> {
+        if self.recorded_at_unix_ms == 0
+            || self.fingerprint != expected_fingerprint
+            || [&self.platform, &self.arch, &self.os_release]
+                .into_iter()
+                .any(|value| value.trim().is_empty())
+            || self.browser_versions.len() != Engine::ALL.len()
+            || Engine::ALL.into_iter().any(|engine| {
+                self.browser_versions
+                    .get(&engine)
+                    .is_none_or(|version| version.trim().is_empty())
+            })
+        {
+            bail!("persisted environment summary is incomplete or inconsistent");
+        }
+        Ok(())
+    }
+}
+
 impl EnvironmentRecord {
     pub(crate) fn recorded_at_unix_ms(&self) -> u64 {
         self.recorded_at_unix_ms

@@ -534,7 +534,7 @@ impl App {
             .history_reader
             .as_ref()
             .context("history reader is unavailable")?
-            .cycle(summary)?;
+            .cycle(&self.history.benchmark_id, &summary.cycle_id)?;
         self.cycle_details.insert(cycle_id, cycle);
         Ok(())
     }
