@@ -242,6 +242,7 @@ fn write_lineage_fixture(
     baseline_root: &Path,
     candidate_root: &Path,
     comparison: &Value,
+    baseline_environment_fingerprint: &str,
 ) -> (String, String) {
     let objects = root.join("objects");
     fs::create_dir_all(&objects).unwrap();
@@ -382,7 +383,7 @@ fn write_lineage_fixture(
             "baseline_measurement_set": null,
             "candidate_measurement_set": comparison["baseline"]["measurement_set_id"],
             "candidate_measurement_path": baseline_root.to_string_lossy(),
-            "environment_fingerprint": comparison["environment_fingerprint"],
+            "environment_fingerprint": baseline_environment_fingerprint,
             "outcome": "measured",
             "comparison": null
         }
@@ -633,8 +634,14 @@ fn independent_measurements_can_be_promoted_and_compared() {
 
     let lineages = directory.path().join("lineages");
     fs::create_dir_all(&lineages).unwrap();
-    let (first_cycle_id, cycle_id) =
-        write_lineage_fixture(&lineages, &baseline_root, &candidate_root, &comparison);
+    let environment_fingerprint = comparison["environment_fingerprint"].as_str().unwrap();
+    let (first_cycle_id, cycle_id) = write_lineage_fixture(
+        &lineages,
+        &baseline_root,
+        &candidate_root,
+        &comparison,
+        environment_fingerprint,
+    );
     let simple_history = bperf()
         .arg("history")
         .arg("--lineage-dir")
@@ -675,6 +682,29 @@ fn independent_measurements_can_be_promoted_and_compared() {
             "simple history exposed {internal_detail:?}:\n{simple_history}"
         );
     }
+
+    let mismatched_lineages = directory.path().join("mismatched").join("lineages");
+    fs::create_dir_all(&mismatched_lineages).unwrap();
+    write_lineage_fixture(
+        &mismatched_lineages,
+        &baseline_root,
+        &candidate_root,
+        &comparison,
+        "another-environment",
+    );
+    let mismatched_history = bperf()
+        .arg("history")
+        .arg("--lineage-dir")
+        .arg(&mismatched_lineages)
+        .output()
+        .unwrap();
+    assert!(!mismatched_history.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatched_history.stderr)
+            .contains("does not match its immutable evidence"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&mismatched_history.stderr)
+    );
 
     let history = bperf()
         .args([

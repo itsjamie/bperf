@@ -150,6 +150,7 @@ pub fn confirmation_target(
         .baseline_measurement_set
         .clone()
         .context("an initial baseline cycle does not need confirmation")?;
+    open_cycle_measurement(&cycle)?;
     Ok(ConfirmationTarget {
         cycle_id: cycle.cycle_id,
         benchmark_id: cycle.benchmark_id,
@@ -184,7 +185,7 @@ pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<Recorde
     let store = LineageStore::open(&options.root)?;
     let (cycle, _, _) = store.find_cycle(&options.cycle_id, None)?;
     require_promotable(&cycle)?;
-    let original = MeasurementSet::open(Path::new(&cycle.candidate_measurement_path))?;
+    let original = open_cycle_measurement(&cycle)?;
     if original.benchmark_sha256() != measurement.benchmark_sha256()
         || original.variant_sha256() != measurement.variant_sha256()
     {
@@ -231,6 +232,24 @@ fn complete_environment(measurement: &MeasurementSet) -> Result<&str> {
     measurement
         .environment_fingerprint()
         .context("complete measurement set has no environment fingerprint")
+}
+
+fn open_cycle_measurement(cycle: &CycleRecord) -> Result<MeasurementSet> {
+    let measurement = MeasurementSet::open(Path::new(&cycle.candidate_measurement_path))
+        .with_context(|| format!("failed to open measurement for cycle {}", cycle.selector()))?;
+    if measurement.root() != Path::new(&cycle.candidate_measurement_path)
+        || measurement.measurement_set_id() != cycle.candidate_measurement_set
+        || measurement.benchmark_id() != cycle.benchmark_id
+        || measurement.subject_id() != cycle.subject_id
+        || measurement.benchmark_sha256() != cycle.benchmark_sha256
+        || measurement.environment_fingerprint() != Some(cycle.environment_fingerprint.as_str())
+    {
+        bail!(
+            "measurement reference for cycle {} does not match its immutable evidence",
+            cycle.selector()
+        );
+    }
+    Ok(measurement)
 }
 
 fn validate_comparison(measurement: &MeasurementSet, comparison: &ComparisonSummary) -> Result<()> {
@@ -687,6 +706,7 @@ pub fn accept(options: AcceptOptions) -> Result<AcceptOutcome> {
     }
     let events = store.read_events(&cycle.benchmark_id)?;
     require_promotion_ready(&cycle, &events)?;
+    open_cycle_measurement(&cycle)?;
     let pending = baseline::prepare_measurement(Path::new(&cycle.candidate_measurement_path))?;
     if pending.benchmark_id() != cycle.benchmark_id {
         bail!("accepted measurement does not match the cycle benchmark");
@@ -2269,13 +2289,12 @@ fn history_measurements(events: &[LineageEvent]) -> Result<Vec<HistoryMeasuremen
             LineageEvent::Confirmation(_) | LineageEvent::Promotion(_) => None,
         })
         .map(|cycle| {
-            let measurement = MeasurementSet::open(Path::new(&cycle.candidate_measurement_path))
-                .with_context(|| {
-                    format!(
-                        "failed to read measurement for history cycle {}",
-                        cycle.selector()
-                    )
-                })?;
+            let measurement = open_cycle_measurement(cycle).with_context(|| {
+                format!(
+                    "failed to read measurement for history cycle {}",
+                    cycle.selector()
+                )
+            })?;
             Ok(HistoryMeasurement { cycle, measurement })
         })
         .collect()
@@ -2342,6 +2361,11 @@ fn validate_events(
                 }
                 require_hash_id("source state", &cycle.source_after, "state-")?;
                 require_hash_id("source change", &cycle.change_id, "change-")?;
+                require_measurement_path(
+                    "cycle candidate",
+                    &cycle.candidate_measurement_set,
+                    &cycle.candidate_measurement_path,
+                )?;
                 if let Some(module) = &cycle.benchmark_module {
                     require_portable_file_path(module)?;
                 }
@@ -2438,6 +2462,11 @@ fn validate_events(
                 )?;
                 require_cycle_id(&confirmation.cycle_id)?;
                 require_hash_id("source state", &confirmation.source_state, "state-")?;
+                require_measurement_path(
+                    "confirmation",
+                    &confirmation.confirmation_measurement_set,
+                    &confirmation.confirmation_measurement_path,
+                )?;
                 let cycle = cycles.get(&confirmation.cycle_id).with_context(|| {
                     format!(
                         "optimization history {} confirms an unknown cycle",
@@ -2866,6 +2895,13 @@ fn require_digest(value: &str) -> Result<()> {
 fn require_portable_file_path(value: &str) -> Result<()> {
     if portable_path(Path::new(value))? != value.replace('\\', "/") || value.contains('\\') {
         bail!("invalid source path {value:?}");
+    }
+    Ok(())
+}
+
+fn require_measurement_path(label: &str, measurement_set_id: &str, path: &str) -> Result<()> {
+    if Path::new(path).file_name().and_then(|name| name.to_str()) != Some(measurement_set_id) {
+        bail!("{label} path does not match measurement set {measurement_set_id:?}");
     }
     Ok(())
 }
@@ -3998,6 +4034,40 @@ mod tests {
     }
 
     #[test]
+    fn stored_confirmation_paths_must_match_their_measurement() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let cycle = store
+            .append_cycle(compared_cycle(state, "measure-1"))
+            .unwrap();
+        let mut stored = confirmation_record(
+            &cycle,
+            "measure-confirmation",
+            "environment",
+            comparison("measure-confirmation", "positive"),
+        );
+        stored.confirmation_measurement_path = "C:/measurements/measure-other".to_owned();
+        store
+            .append_event("parser", &LineageEvent::Confirmation(Box::new(stored)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("confirmation path does not match"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn repeated_search_requires_an_independent_confirmation() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -4038,7 +4108,7 @@ mod tests {
             .append_confirmation(
                 &selected,
                 "measure-confirmation",
-                Path::new("C:/measurements/confirmation"),
+                Path::new("C:/measurements/measure-confirmation"),
                 "environment",
                 comparison("measure-confirmation", "positive"),
             )
@@ -4386,6 +4456,47 @@ mod tests {
     }
 
     #[test]
+    fn stored_cycle_paths_must_match_their_measurement() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let valid = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        let mut mismatched = valid.clone();
+        mismatched.previous_cycle_id = Some(valid.cycle_id.clone());
+        mismatched.source_before = Some(valid.source_after.clone());
+        mismatched.change_id = change_id(
+            mismatched.source_before.as_deref(),
+            &mismatched.source_after,
+        );
+        mismatched.candidate_measurement_set = "measure-2".to_owned();
+        mismatched.candidate_measurement_path = "C:/measurements/measure-other".to_owned();
+        mismatched.cycle_id = cycle_id(
+            mismatched.previous_cycle_id.as_deref(),
+            &mismatched.source_after,
+            &mismatched.candidate_measurement_set,
+            None,
+        );
+        store
+            .append_event("parser", &LineageEvent::Cycle(Box::new(mismatched)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cycle candidate path does not match"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn stored_cycles_must_reference_their_source_transition() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -4402,6 +4513,7 @@ mod tests {
         wrong_transition.previous_cycle_id = Some(valid.cycle_id.clone());
         wrong_transition.source_before = Some(valid.source_after.clone());
         wrong_transition.candidate_measurement_set = "measure-2".to_owned();
+        wrong_transition.candidate_measurement_path = "C:/measurements/measure-2".to_owned();
         wrong_transition.cycle_id = cycle_id(
             wrong_transition.previous_cycle_id.as_deref(),
             &wrong_transition.source_after,
