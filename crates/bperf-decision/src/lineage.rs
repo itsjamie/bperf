@@ -1299,15 +1299,28 @@ impl LineageStore {
         if events.is_empty() {
             bail!("no optimization history for benchmark {benchmark_id:?}");
         }
-        validate_events(self.database.path(), events, benchmark_id)
+        let baseline_history = baseline_history_for(reader, benchmark_id, &events)?;
+        validate_events(
+            self.database.path(),
+            events,
+            benchmark_id,
+            &baseline_history,
+        )
     }
 
     fn read_events_if_present(&self, benchmark_id: &str) -> Result<Vec<LineageEvent>> {
-        let events = self.database.read_events(LINEAGE_EVENTS, benchmark_id)?;
+        let reader = self.database.reader()?;
+        let events = reader.read_events(LINEAGE_EVENTS, benchmark_id)?;
         if events.is_empty() {
             return Ok(events);
         }
-        validate_events(self.database.path(), events, benchmark_id)
+        let baseline_history = baseline_history_for(&reader, benchmark_id, &events)?;
+        validate_events(
+            self.database.path(),
+            events,
+            benchmark_id,
+            &baseline_history,
+        )
     }
 
     #[cfg(test)]
@@ -2256,10 +2269,26 @@ fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn baseline_history_for(
+    reader: &DatabaseReader,
+    benchmark_id: &str,
+    events: &[LineageEvent],
+) -> Result<Vec<BaselineRecord>> {
+    if events
+        .iter()
+        .any(|event| matches!(event, LineageEvent::Promotion(_)))
+    {
+        baseline::read_history_with(reader, benchmark_id)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn validate_events(
     path: &Path,
     events: Vec<LineageEvent>,
     benchmark_id: &str,
+    baseline_history: &[BaselineRecord],
 ) -> Result<Vec<LineageEvent>> {
     let mut last_cycle: Option<String> = None;
     let mut last_source: Option<String> = None;
@@ -2467,6 +2496,19 @@ fn validate_events(
                 {
                     bail!(
                         "optimization history {} contains an invalid promotion identity",
+                        path.display()
+                    );
+                }
+                if !baseline_history.is_empty()
+                    && !baseline_history.iter().any(|baseline| {
+                        baseline.matches_transition(
+                            &promotion.baseline_measurement_set,
+                            promotion.previous_baseline_measurement_set.as_deref(),
+                        )
+                    })
+                {
+                    bail!(
+                        "optimization history {} contains a promotion absent from baseline history",
                         path.display()
                     );
                 }
@@ -3036,6 +3078,30 @@ mod tests {
             },
             artifacts: Vec::new(),
         }
+    }
+
+    fn append_baseline(store: &LineageStore, measurement: &str, previous: Option<&str>) {
+        store
+            .database
+            .append_event(
+                baseline::BASELINE_EVENTS,
+                "parser",
+                &serde_json::json!({
+                    "schema_version": 2,
+                    "benchmark_id": "parser",
+                    "subject_id": "parser",
+                    "benchmark_sha256": "benchmark",
+                    "measurement_set_id": measurement,
+                    "measurement_set_path": format!("C:/measurements/{measurement}"),
+                    "variant_id": "worktree",
+                    "variant_sha256": "variant",
+                    "environment_fingerprint": "environment",
+                    "measured_at_unix_ms": 1,
+                    "promoted_at_unix_ms": 2,
+                    "previous_measurement_set_id": previous
+                }),
+            )
+            .unwrap();
     }
 
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {
@@ -3753,6 +3819,44 @@ mod tests {
         let error = store.read_events("parser").unwrap_err();
         assert!(
             error.to_string().contains("promotes an ineligible cycle"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_promotions_must_exist_in_baseline_history() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let cycle = store.append_cycle(cycle(state, "measure-1")).unwrap();
+        append_baseline(&store, "another-measurement", None);
+        let promotion_id = promotion_id(&cycle.cycle_id, &cycle.candidate_measurement_set, None);
+        store
+            .append_event(
+                "parser",
+                &LineageEvent::Promotion(PromotionRecord {
+                    schema_version: SCHEMA_VERSION,
+                    promotion_id,
+                    recorded_at_unix_ms: 3,
+                    benchmark_id: "parser".to_owned(),
+                    cycle_id: cycle.cycle_id,
+                    baseline_measurement_set: cycle.candidate_measurement_set,
+                    previous_baseline_measurement_set: None,
+                }),
+            )
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("promotion absent from baseline history"),
             "unexpected error: {error:#}"
         );
     }

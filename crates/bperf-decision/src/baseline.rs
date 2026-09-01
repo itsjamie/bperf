@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bperf_measurement::store::MeasurementSet;
-use bperf_storage::database::{Database, WriteTransaction};
+use bperf_storage::database::{Database, DatabaseReader, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use crate::environment;
@@ -175,9 +175,18 @@ fn current(registry_root: &Path, benchmark_id: &str) -> Result<BaselineRecord> {
 }
 
 fn read_current(database: &Database, benchmark_id: &str) -> Result<Option<BaselineRecord>> {
-    let mut history: Vec<BaselineRecord> = database.read_events(BASELINE_EVENTS, benchmark_id)?;
-    validate_history(&history, benchmark_id)?;
+    let reader = database.reader()?;
+    let mut history = read_history_with(&reader, benchmark_id)?;
     Ok(history.pop())
+}
+
+pub(crate) fn read_history_with(
+    reader: &DatabaseReader,
+    benchmark_id: &str,
+) -> Result<Vec<BaselineRecord>> {
+    let history = reader.read_events(BASELINE_EVENTS, benchmark_id)?;
+    validate_history(&history, benchmark_id)?;
+    Ok(history)
 }
 
 fn validate_history(history: &[BaselineRecord], benchmark_id: &str) -> Result<()> {
@@ -275,6 +284,11 @@ impl BaselineRecord {
 
     pub(crate) fn previous_measurement_set_id(&self) -> Option<&str> {
         self.previous_measurement_set_id.as_deref()
+    }
+
+    pub(crate) fn matches_transition(&self, measurement_set: &str, previous: Option<&str>) -> bool {
+        self.measurement_set_id == measurement_set
+            && self.previous_measurement_set_id.as_deref() == previous
     }
 }
 
