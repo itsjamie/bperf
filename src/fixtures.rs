@@ -1,7 +1,7 @@
 //! Acquisition and immutable locking of benchmark-owned browser resources.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -90,18 +90,13 @@ impl LockedFixtures {
         for entry in read_lock(path)? {
             let (entry, body) = validate_body(entry, "pinned benchmark fixture")?;
             let key = fixture_key(&entry.descriptor)?;
-            if entries
-                .insert(
-                    key,
-                    LockedFixture {
-                        entry,
-                        body: body.into(),
-                    },
-                )
-                .is_some()
-            {
-                bail!("fixture lock contains duplicate descriptors");
-            }
+            entries.insert(
+                key,
+                LockedFixture {
+                    entry,
+                    body: body.into(),
+                },
+            );
         }
         Ok(Self { entries })
     }
@@ -318,8 +313,12 @@ fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
     if lock.schema_version != LOCK_SCHEMA_VERSION {
         bail!("unsupported fixture lock schema in {}", path.display());
     }
+    let mut descriptors = BTreeSet::new();
     for entry in &lock.fixtures {
         validate_descriptor(&entry.descriptor)?;
+        if !descriptors.insert(fixture_key(&entry.descriptor)?) {
+            bail!("fixture lock contains duplicate descriptors");
+        }
         if entry.content_type.trim().is_empty() {
             bail!("fixture lock contains an empty content type");
         }
@@ -465,6 +464,31 @@ mod tests {
         fs::write(outside.path().join("outside.txt"), b"outside").unwrap();
         let error = resolve(root, &benchmark, &lock, &cache, &[escaped]).unwrap_err();
         assert!(format!("{error:#}").contains("fixture is outside benchmark root"));
+    }
+
+    #[test]
+    fn fixture_locks_reject_duplicate_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("fixture-lock.json");
+        let entry = json!({
+            "descriptor": {"source": "fixture.txt"},
+            "body_path": directory.path().join("unused"),
+            "sha256": "0".repeat(64),
+            "size_bytes": 0,
+            "content_type": "application/octet-stream",
+        });
+        fs::write(
+            &lock,
+            serde_json::to_vec(&json!({
+                "schema_version": LOCK_SCHEMA_VERSION,
+                "fixtures": [entry.clone(), entry],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = read_lock(&lock).err().expect("duplicate lock was accepted");
+        assert!(error.to_string().contains("duplicate descriptors"));
     }
 
     #[cfg(unix)]
