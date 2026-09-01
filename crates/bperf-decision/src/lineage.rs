@@ -190,13 +190,12 @@ pub fn record_confirmation(options: RecordConfirmationOptions) -> Result<Recorde
     {
         bail!("confirmation does not measure the selected cycle's source variant");
     }
-    let baseline_measurement_set = cycle
-        .baseline_measurement_set
-        .as_deref()
-        .context("an initial baseline cycle does not need confirmation")?;
-    if options.comparison.baseline_measurement_set != baseline_measurement_set {
-        bail!("confirmation was not compared with the selected cycle's baseline");
-    }
+    validate_confirmation_contract(
+        &cycle,
+        measurement.measurement_set_id(),
+        environment_fingerprint,
+        &options.comparison,
+    )?;
     let state = capture_measured_state(
         &store,
         &options.workspace_root,
@@ -241,6 +240,30 @@ fn validate_comparison(measurement: &MeasurementSet, comparison: &ComparisonSumm
     }
     if comparison.environment_fingerprint.as_deref() != measurement.environment_fingerprint() {
         bail!("comparison environment does not match the measured source checkpoint");
+    }
+    Ok(())
+}
+
+fn validate_confirmation_contract(
+    cycle: &CycleRecord,
+    measurement_set: &str,
+    environment_fingerprint: &str,
+    comparison: &ComparisonSummary,
+) -> Result<()> {
+    comparison.validate_contract()?;
+    let baseline_measurement_set = cycle
+        .baseline_measurement_set
+        .as_deref()
+        .context("an initial baseline cycle does not need confirmation")?;
+    if measurement_set == cycle.candidate_measurement_set {
+        bail!("confirmation must use an independent measurement set");
+    }
+    if comparison.baseline_measurement_set != baseline_measurement_set
+        || comparison.candidate_measurement_set != measurement_set
+        || comparison.environment_fingerprint.as_deref() != Some(environment_fingerprint)
+        || environment_fingerprint != cycle.environment_fingerprint
+    {
+        bail!("confirmation evidence does not match the selected cycle");
     }
     Ok(())
 }
@@ -1232,6 +1255,12 @@ impl LineageStore {
         environment_fingerprint: &str,
         comparison: ComparisonSummary,
     ) -> Result<ConfirmationRecord> {
+        validate_confirmation_contract(
+            cycle,
+            measurement_set,
+            environment_fingerprint,
+            &comparison,
+        )?;
         let confirmation_id =
             confirmation_id(&cycle.cycle_id, measurement_set, &comparison.comparison_id);
         let events = self.read_events(&cycle.benchmark_id)?;
@@ -2415,28 +2444,22 @@ fn validate_events(
                         path.display()
                     )
                 })?;
-                confirmation
-                    .comparison
-                    .validate_contract()
-                    .with_context(|| {
-                        format!(
-                            "optimization history {} contains invalid confirmation evidence",
-                            path.display()
-                        )
-                    })?;
+                validate_confirmation_contract(
+                    cycle,
+                    &confirmation.confirmation_measurement_set,
+                    &confirmation.environment_fingerprint,
+                    &confirmation.comparison,
+                )
+                .with_context(|| {
+                    format!(
+                        "optimization history {} contains invalid confirmation evidence",
+                        path.display()
+                    )
+                })?;
                 if confirmation.source_state != cycle.source_after
                     || confirmation.original_candidate_measurement_set
                         != cycle.candidate_measurement_set
-                    || confirmation.comparison.baseline_measurement_set
-                        != cycle
-                            .baseline_measurement_set
-                            .as_deref()
-                            .unwrap_or_default()
-                    || confirmation.comparison.candidate_measurement_set
-                        != confirmation.confirmation_measurement_set
                     || confirmation.comparison.verdict != confirmation.outcome
-                    || confirmation.comparison.environment_fingerprint.as_deref()
-                        != Some(&confirmation.environment_fingerprint)
                 {
                     bail!(
                         "optimization history {} contains an inconsistent confirmation",
@@ -3102,6 +3125,32 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    fn confirmation_record(
+        cycle: &CycleRecord,
+        measurement: &str,
+        environment: &str,
+        comparison: ComparisonSummary,
+    ) -> ConfirmationRecord {
+        ConfirmationRecord {
+            schema_version: SCHEMA_VERSION,
+            confirmation_id: confirmation_id(
+                &cycle.cycle_id,
+                measurement,
+                &comparison.comparison_id,
+            ),
+            recorded_at_unix_ms: 2,
+            benchmark_id: cycle.benchmark_id.clone(),
+            cycle_id: cycle.cycle_id.clone(),
+            source_state: cycle.source_after.clone(),
+            original_candidate_measurement_set: cycle.candidate_measurement_set.clone(),
+            confirmation_measurement_set: measurement.to_owned(),
+            confirmation_measurement_path: format!("C:/measurements/{measurement}"),
+            environment_fingerprint: environment.to_owned(),
+            outcome: comparison.verdict.clone(),
+            comparison,
+        }
     }
 
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {
@@ -3857,6 +3906,87 @@ mod tests {
             error
                 .to_string()
                 .contains("promotion absent from baseline history"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn confirmation_measurements_must_be_independent() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let cycle = store
+            .append_cycle(compared_cycle(state, "measure-1"))
+            .unwrap();
+        let repeated_comparison = cycle.comparison.clone().unwrap();
+
+        let error = store
+            .append_confirmation(
+                &cycle,
+                &cycle.candidate_measurement_set,
+                Path::new(&cycle.candidate_measurement_path),
+                &cycle.environment_fingerprint,
+                repeated_comparison.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must use an independent measurement set"),
+            "unexpected error: {error:#}"
+        );
+
+        let stored = confirmation_record(
+            &cycle,
+            &cycle.candidate_measurement_set,
+            &cycle.environment_fingerprint,
+            repeated_comparison,
+        );
+        store
+            .append_event("parser", &LineageEvent::Confirmation(Box::new(stored)))
+            .unwrap();
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must use an independent measurement set"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_confirmations_must_match_the_cycle_environment() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let cycle = store
+            .append_cycle(compared_cycle(state, "measure-1"))
+            .unwrap();
+        let mut confirmation_comparison = comparison("measure-confirmation", "positive");
+        confirmation_comparison.environment_fingerprint = Some("another-environment".to_owned());
+        let stored = confirmation_record(
+            &cycle,
+            "measure-confirmation",
+            "another-environment",
+            confirmation_comparison,
+        );
+        store
+            .append_event("parser", &LineageEvent::Confirmation(Box::new(stored)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not match the selected cycle"),
             "unexpected error: {error:#}"
         );
     }
