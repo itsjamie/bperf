@@ -757,7 +757,7 @@ and activates each cache directory atomically. Linux `--with-deps` installs the
 package set fixed by the same registry. Browser binaries remain separate
 because they are platform-specific and substantially larger than bperf.
 
-Capture protocol 13, benchmark-host protocol 2, environment schema 6,
+Capture protocol 13, benchmark-host protocol 2, environment schema 7,
 measurement schema 5, and doctor schema 2 identify the child-realm-capable
 ownership model. Each Rust adapter protocol is version 2. Environment and
 measurement records from earlier capture shapes require remeasurement.

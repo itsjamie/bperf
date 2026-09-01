@@ -91,7 +91,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
         serde_json::to_string(&os_release).unwrap()
     );
     let mut environment_digest = Sha256::new();
-    environment_digest.update(b"bperf-browser-environment-v4\0");
+    environment_digest.update(b"bperf-browser-environment-v5\0");
     environment_digest.update(identity_source.as_bytes());
     let environment_fingerprint = format!("{:x}", environment_digest.finalize());
     let identity: Value = serde_json::from_str(&identity_source).unwrap();
@@ -120,7 +120,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "measurement",
             &format!("{measurement_set_id}/environment"),
             &serde_json::json!({
-            "schema_version": 6,
+            "schema_version": 7,
             "recorded_at_unix_ms": 1,
             "fingerprint": environment_fingerprint,
             "identity": identity,

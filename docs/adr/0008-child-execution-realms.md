@@ -76,7 +76,7 @@ case and engine. It then retains every CPU/flamegraph scope from the CPU
 representative and every heap scope from the heap representative. This keeps
 scope evidence complete without changing the representative observation.
 
-Capture protocol 13, adapter protocol 2, environment schema 6, measurement
+Capture protocol 13, adapter protocol 2, environment schema 7, measurement
 schema 5, and artifact-retention schema 2 identify this contract. Earlier
 measurement sets require remeasurement.
 

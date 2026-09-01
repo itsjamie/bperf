@@ -16,7 +16,7 @@ use bperf_measurement::store::MeasurementSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -342,7 +342,7 @@ fn environment_identity(captures: &[CaptureEvidence]) -> Result<EnvironmentIdent
 
 fn environment_fingerprint(identity: &EnvironmentIdentity) -> Result<String> {
     let mut digest = Sha256::new();
-    digest.update(b"bperf-browser-environment-v4\0");
+    digest.update(b"bperf-browser-environment-v5\0");
     digest.update(serde_json::to_vec(identity)?);
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -379,7 +379,38 @@ fn os_release() -> Result<String> {
     command_output("cmd", &["/C", "ver"])
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn os_release() -> Result<String> {
+    let release = fs::read_to_string("/etc/os-release")
+        .context("failed to read /etc/os-release for host identity")?;
+    linux_os_release(&release, &command_output("uname", &["-r"])?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_os_release(release: &str, kernel: &str) -> Result<String> {
+    let field = |name| {
+        release.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key == name).then(|| {
+                value
+                    .trim()
+                    .trim_matches(|character| character == '"' || character == '\'')
+            })
+        })
+    };
+    let distribution = field("ID")
+        .filter(|value| !value.is_empty())
+        .context("/etc/os-release has no distribution ID")?;
+    let version = field("VERSION_ID")
+        .or_else(|| field("BUILD_ID"))
+        .filter(|value| !value.is_empty());
+    Ok(format!(
+        "{distribution}{} (kernel {kernel})",
+        version.map_or_else(String::new, |version| format!(" {version}"))
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn os_release() -> Result<String> {
     command_output("uname", &["-r"])
 }
@@ -529,7 +560,7 @@ mod tests {
 
     #[test]
     fn earlier_browser_environments_require_remeasurement() {
-        for schema_version in [2, 3, 4, 5] {
+        for schema_version in [2, 3, 4, 5, 6] {
             let directory = tempdir().unwrap();
             let path = directory.path().join("environment.json");
             fs::write(
@@ -546,6 +577,17 @@ mod tests {
             assert!(error.contains("earlier browser capture contracts"));
             assert!(error.contains("remeasured"));
         }
+    }
+
+    #[test]
+    fn linux_host_identity_distinguishes_userlands_on_the_same_kernel() {
+        let kernel = "6.8.0-test";
+        let ubuntu = linux_os_release("ID=ubuntu\nVERSION_ID=\"24.04\"\n", kernel).unwrap();
+        let debian = linux_os_release("ID=debian\nVERSION_ID=13\n", kernel).unwrap();
+
+        assert_eq!(ubuntu, "ubuntu 24.04 (kernel 6.8.0-test)");
+        assert_eq!(debian, "debian 13 (kernel 6.8.0-test)");
+        assert_ne!(ubuntu, debian);
     }
 
     #[test]
