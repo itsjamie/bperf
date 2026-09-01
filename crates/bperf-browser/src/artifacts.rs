@@ -561,7 +561,7 @@ impl Serialize for CompactNumber {
     where
         SerializerType: Serializer,
     {
-        if self.0.fract() == 0.0 && self.0 >= i64::MIN as f64 && self.0 <= i64::MAX as f64 {
+        if self.0.fract() == 0.0 && self.0 >= i64::MIN as f64 && self.0 < i64::MAX as f64 {
             serializer.serialize_i64(self.0 as i64)
         } else {
             serializer.serialize_f64(self.0)
@@ -774,6 +774,15 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn compact_numbers_do_not_saturate_values_above_i64_max() {
+        let boundary = i64::MAX as f64;
+        let value = serde_json::to_value(CompactNumber(boundary)).unwrap();
+
+        assert!(value.as_i64().is_none());
+        assert_eq!(value.as_f64(), Some(boundary));
     }
 
     #[test]
