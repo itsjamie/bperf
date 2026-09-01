@@ -7,7 +7,7 @@
 
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     path::Path,
     sync::mpsc,
     thread,
@@ -20,6 +20,16 @@ use tempfile::TempDir;
 
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCED_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+// Longer diagnostic records are split, not dropped; raise this only if a browser
+// needs larger records to remain atomic in console output.
+const MAX_BROWSER_LOG_CHUNK_BYTES: u64 = 64 * 1024;
+
+fn read_log_chunk(reader: &mut impl BufRead, chunk: &mut Vec<u8>) -> std::io::Result<usize> {
+    chunk.clear();
+    reader
+        .take(MAX_BROWSER_LOG_CHUNK_BYTES)
+        .read_until(b'\n', chunk)
+}
 
 pub(crate) struct BrowserProcess {
     child: platform::ChildProcess,
@@ -62,12 +72,13 @@ impl BrowserProcess {
         for (label, reader) in spawned.logs {
             thread::spawn(move || {
                 let mut lines = std::io::BufReader::new(reader);
-                let mut line = String::new();
+                let mut chunk = Vec::new();
                 loop {
-                    line.clear();
-                    match std::io::BufRead::read_line(&mut lines, &mut line) {
+                    match read_log_chunk(&mut lines, &mut chunk) {
                         Ok(0) => break,
-                        Ok(_) => eprint!("[{log_label}:{label}] {line}"),
+                        Ok(_) => {
+                            eprint!("[{log_label}:{label}] {}", String::from_utf8_lossy(&chunk))
+                        }
                         Err(_) => break,
                     }
                 }
@@ -882,7 +893,22 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::NulFrameDecoder;
+    use super::{MAX_BROWSER_LOG_CHUNK_BYTES, NulFrameDecoder, read_log_chunk};
+
+    #[test]
+    fn browser_logs_without_newlines_are_drained_in_bounded_chunks() {
+        let input = vec![b'x'; MAX_BROWSER_LOG_CHUNK_BYTES as usize * 2 + 1];
+        let mut reader = std::io::Cursor::new(&input);
+        let mut chunk = Vec::new();
+        let mut drained = Vec::new();
+
+        while read_log_chunk(&mut reader, &mut chunk).unwrap() != 0 {
+            assert!(chunk.len() <= MAX_BROWSER_LOG_CHUNK_BYTES as usize);
+            drained.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(drained, input);
+    }
 
     #[cfg(unix)]
     #[test]
