@@ -10,6 +10,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +26,7 @@ use crate::{
 
 const INSTALLATION_MARKER: &str = "INSTALLATION_COMPLETE";
 const INSTALLATION_METADATA: &str = "BPERF_INSTALLATION";
+const DOWNLOAD_REQUEST_ATTEMPTS: u32 = 3;
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 500_000;
 const MAX_UNCOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -295,6 +297,34 @@ fn validate_https_url(value: &str, label: &str) -> Result<ureq::http::Uri> {
     Ok(uri)
 }
 
+fn retry_request<T>(
+    mut request: impl FnMut() -> std::result::Result<T, ureq::Error>,
+) -> std::result::Result<T, ureq::Error> {
+    let mut attempt = 1;
+    loop {
+        match request() {
+            Err(error)
+                if attempt < DOWNLOAD_REQUEST_ATTEMPTS && retryable_request_error(&error) =>
+            {
+                std::thread::sleep(Duration::from_secs(u64::from(attempt)));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn retryable_request_error(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::HostNotFound
+            | ureq::Error::ConnectionFailed
+            | ureq::Error::StatusCode(408 | 429 | 500 | 502 | 503 | 504)
+    )
+}
+
 fn download(artifact: &BrowserArtifact, destination: &Path) -> Result<String> {
     let agent =
         ureq::Agent::new_with_config(ureq::Agent::config_builder().https_only(true).build());
@@ -307,9 +337,7 @@ fn download(artifact: &BrowserArtifact, destination: &Path) -> Result<String> {
         );
         io::stdout().flush().ok();
         let result = (|| -> Result<String> {
-            let mut response = agent
-                .get(url)
-                .call()
+            let mut response = retry_request(|| agent.get(url).call())
                 .with_context(|| format!("request failed for {url}"))?;
             let final_url = response.get_uri().to_string();
             validate_https_url(&final_url, "browser download redirect target")?;
@@ -755,6 +783,31 @@ mod tests {
             .unwrap(),
             ["https://override.example.test/root/browser.zip"]
         );
+    }
+
+    #[test]
+    fn browser_requests_retry_only_transient_failures() {
+        let mut transient_attempts = 0;
+        let value = retry_request(|| {
+            transient_attempts += 1;
+            if transient_attempts == 1 {
+                Err(ureq::Error::HostNotFound)
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(transient_attempts, 2);
+
+        let mut permanent_attempts = 0;
+        let error = retry_request(|| {
+            permanent_attempts += 1;
+            Err::<(), _>(ureq::Error::StatusCode(404))
+        })
+        .unwrap_err();
+        assert!(matches!(error, ureq::Error::StatusCode(404)));
+        assert_eq!(permanent_attempts, 1);
     }
 
     #[test]
