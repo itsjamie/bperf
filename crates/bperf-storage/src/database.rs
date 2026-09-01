@@ -37,6 +37,7 @@ impl Database {
             root,
         };
         let connection = database.connect_write()?;
+        initialize_schema(&connection)?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
@@ -44,7 +45,6 @@ impl Database {
                  PRAGMA wal_autocheckpoint = 1000;",
             )
             .context("failed to configure bperf database durability")?;
-        initialize_schema(&connection)?;
         Ok(database)
     }
 
@@ -536,6 +536,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     if version != 0 {
         bail!("unsupported bperf storage schema {version}; expected {STORAGE_SCHEMA_VERSION}");
     }
+    let has_schema: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
+        [],
+        |row| row.get(0),
+    )?;
+    if application_id == 0 && has_schema {
+        bail!("database has no bperf identity but already contains schema objects");
+    }
     connection
         .execute_batch(&format!(
             "BEGIN IMMEDIATE;
@@ -727,6 +735,41 @@ mod tests {
             fs::canonicalize(directory.path())
                 .unwrap()
                 .join(DATABASE_NAME)
+        );
+    }
+
+    #[test]
+    fn initialization_does_not_claim_an_unrelated_database() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(DATABASE_NAME);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE unrelated(value INTEGER); INSERT INTO unrelated VALUES (7);",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(Database::open(directory.path()).is_err());
+
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>("PRAGMA application_id", [], |row| row.get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row::<String, _, _>("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>("SELECT value FROM unrelated", [], |row| row.get(0))
+                .unwrap(),
+            7
         );
     }
 }
