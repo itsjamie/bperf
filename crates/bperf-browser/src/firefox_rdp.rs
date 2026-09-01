@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 
-const RDP_TIMEOUT: Duration = Duration::from_secs(10);
+const RDP_TIMEOUT: Duration = Duration::from_secs(30);
 const RDP_CONNECT_ATTEMPTS: usize = 50;
 const RDP_CONNECT_DELAY: Duration = Duration::from_millis(100);
 const PROFILER_CHILD_START_DELAY: Duration = Duration::from_millis(100);
