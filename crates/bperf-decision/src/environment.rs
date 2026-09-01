@@ -186,6 +186,21 @@ fn stored_record(measurement: &MeasurementSet) -> Result<Option<EnvironmentRecor
             measurement.measurement_set_id()
         )
     })?;
+    let requested: BTreeSet<_> = measurement
+        .benchmark()
+        .engines()
+        .iter()
+        .map(|engine| engine.as_str())
+        .collect();
+    let recorded: BTreeSet<_> = record
+        .identity
+        .browsers
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if recorded != requested {
+        bail!("environment record does not cover the measurement's requested engines");
+    }
     if measurement
         .environment_fingerprint()
         .is_some_and(|fingerprint| fingerprint != record.fingerprint)
@@ -235,6 +250,17 @@ fn validate_record(record: &EnvironmentRecord) -> Result<()> {
     if record.recorded_at_unix_ms == 0 {
         bail!("environment record has no capture time");
     }
+    if record.identity.bperf_version.trim().is_empty()
+        || record.identity.browser_lab_protocol_version != PROTOCOL_VERSION
+        || record.identity.host.platform.trim().is_empty()
+        || record.identity.host.arch.trim().is_empty()
+        || record.identity.host.os_release.trim().is_empty()
+        || record.identity.host.cpu_model.trim().is_empty()
+        || record.identity.host.logical_cpus == 0
+        || record.identity.host.total_memory_bytes == 0
+    {
+        bail!("environment identity is incomplete or uses an unsupported protocol");
+    }
     if environment_fingerprint(&record.identity)? != record.fingerprint {
         bail!("environment fingerprint does not match its identity");
     }
@@ -244,7 +270,18 @@ fn validate_record(record: &EnvironmentRecord) -> Result<()> {
     if expected != actual || adapters != actual || actual.is_empty() {
         bail!("runtime anchors and adapters do not match the pinned browser set");
     }
-    for (engine, anchor) in &record.anchors {
+    for (engine_name, anchor) in &record.anchors {
+        let engine = Engine::ALL
+            .into_iter()
+            .find(|engine| engine.as_str() == engine_name)
+            .with_context(|| format!("environment record has unknown engine {engine_name:?}"))?;
+        record.identity.adapters[engine_name]
+            .validate_for(engine)
+            .with_context(|| format!("{engine} adapter identity is invalid"))?;
+        let browser = &record.identity.browsers[engine_name];
+        if browser.executable_path.trim().is_empty() || browser.version.trim().is_empty() {
+            bail!("{engine} browser identity is incomplete");
+        }
         anchor
             .validate()
             .with_context(|| format!("{engine} runtime anchor is invalid"))?;
@@ -528,6 +565,73 @@ mod tests {
         let error = read(&measurement).unwrap_err();
         assert!(
             format!("{error:#}").contains("unsupported environment schema"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn persisted_environments_must_cover_every_requested_engine() {
+        let directory = tempdir().unwrap();
+        let root = prepare(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            Some(20),
+            directory.path(),
+        )
+        .unwrap();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        let engine = Engine::Chromium;
+        let identity = EnvironmentIdentity {
+            bperf_version: "test".to_owned(),
+            browser_lab_protocol_version: PROTOCOL_VERSION,
+            host: HostIdentity {
+                platform: "test".to_owned(),
+                arch: "test".to_owned(),
+                os_release: "test".to_owned(),
+                cpu_model: "test".to_owned(),
+                logical_cpus: 1,
+                total_memory_bytes: 1,
+            },
+            adapters: BTreeMap::from([(
+                engine.as_str().to_owned(),
+                AdapterEvidence::Chromium {
+                    playwright: "test".to_owned(),
+                    chromium_revision: "test".to_owned(),
+                    executable_sha256: "a".repeat(64),
+                    protocol_version: 1,
+                    browser_workload_version: 1,
+                },
+            )]),
+            browsers: BTreeMap::from([(
+                engine.as_str().to_owned(),
+                BrowserBuild {
+                    executable_path: "/test/chromium".to_owned(),
+                    version: "test".to_owned(),
+                },
+            )]),
+        };
+        let fingerprint = environment_fingerprint(&identity).unwrap();
+        measurement
+            .write_environment_record(&EnvironmentRecord {
+                schema_version: SCHEMA_VERSION,
+                recorded_at_unix_ms: 1,
+                fingerprint,
+                identity,
+                anchors: BTreeMap::from([(
+                    engine.as_str().to_owned(),
+                    RuntimeAnchorEvidence {
+                        workload: "javascript_cpu_v1".to_owned(),
+                        wall_ms: vec![1.0; 31],
+                        batch_size: 1,
+                        checksum: 1,
+                    },
+                )]),
+            })
+            .unwrap();
+
+        let error = read(&measurement).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not cover the measurement's requested engines"),
             "unexpected error: {error:#}"
         );
     }

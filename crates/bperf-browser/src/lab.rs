@@ -348,6 +348,66 @@ pub enum AdapterEvidence {
     },
 }
 
+impl AdapterEvidence {
+    /// Validates the persisted adapter identity for the engine it represents.
+    pub fn validate_for(&self, engine: Engine) -> Result<()> {
+        match (engine, self) {
+            (
+                Engine::Firefox,
+                Self::Firefox {
+                    playwright,
+                    firefox_revision,
+                    executable_sha256,
+                    protocol_version,
+                    browser_workload_version,
+                },
+            ) if !playwright.is_empty()
+                && !firefox_revision.is_empty()
+                && is_sha256(executable_sha256)
+                && *protocol_version > 0
+                && *browser_workload_version > 0 =>
+            {
+                Ok(())
+            }
+            (
+                Engine::Chromium,
+                Self::Chromium {
+                    playwright,
+                    chromium_revision,
+                    executable_sha256,
+                    protocol_version,
+                    browser_workload_version,
+                },
+            ) if !playwright.is_empty()
+                && !chromium_revision.is_empty()
+                && is_sha256(executable_sha256)
+                && *protocol_version > 0
+                && *browser_workload_version > 0 =>
+            {
+                Ok(())
+            }
+            (
+                Engine::Webkit,
+                Self::Webkit {
+                    playwright,
+                    webkit_revision,
+                    executable_sha256,
+                    protocol_version,
+                    browser_workload_version,
+                },
+            ) if !playwright.is_empty()
+                && !webkit_revision.is_empty()
+                && is_sha256(executable_sha256)
+                && *protocol_version > 0
+                && *browser_workload_version > 0 =>
+            {
+                Ok(())
+            }
+            _ => bail!("{engine} adapter identity is incomplete or has the wrong adapter kind"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserEvidence {
     pub root_pid: u32,
@@ -605,7 +665,7 @@ fn validate_evidence(
             expected_engine
         );
     }
-    validate_adapter(expected_engine, &evidence.adapter)?;
+    evidence.adapter.validate_for(expected_engine)?;
     validate_browser(expected_engine, &evidence.browser)?;
     validate_anchor(expected_engine, &evidence.anchor)?;
     if !evidence.capabilities.complete() {
@@ -628,63 +688,6 @@ fn validate_browser(engine: Engine, browser: &BrowserEvidence) -> Result<()> {
         bail!("{engine} browser identity is incomplete");
     }
     Ok(())
-}
-
-fn validate_adapter(engine: Engine, adapter: &AdapterEvidence) -> Result<()> {
-    match (engine, adapter) {
-        (
-            Engine::Firefox,
-            AdapterEvidence::Firefox {
-                playwright,
-                firefox_revision,
-                executable_sha256,
-                protocol_version,
-                browser_workload_version,
-            },
-        ) if !playwright.is_empty()
-            && !firefox_revision.is_empty()
-            && is_sha256(executable_sha256)
-            && *protocol_version > 0
-            && *browser_workload_version > 0 =>
-        {
-            Ok(())
-        }
-        (
-            Engine::Chromium,
-            AdapterEvidence::Chromium {
-                playwright,
-                chromium_revision,
-                executable_sha256,
-                protocol_version,
-                browser_workload_version,
-            },
-        ) if !playwright.is_empty()
-            && !chromium_revision.is_empty()
-            && is_sha256(executable_sha256)
-            && *protocol_version > 0
-            && *browser_workload_version > 0 =>
-        {
-            Ok(())
-        }
-        (
-            Engine::Webkit,
-            AdapterEvidence::Webkit {
-                playwright,
-                webkit_revision,
-                executable_sha256,
-                protocol_version,
-                browser_workload_version,
-            },
-        ) if !playwright.is_empty()
-            && !webkit_revision.is_empty()
-            && is_sha256(executable_sha256)
-            && *protocol_version > 0
-            && *browser_workload_version > 0 =>
-        {
-            Ok(())
-        }
-        _ => bail!("{engine} adapter identity is incomplete or has the wrong adapter kind"),
-    }
 }
 
 fn is_sha256(value: &str) -> bool {
