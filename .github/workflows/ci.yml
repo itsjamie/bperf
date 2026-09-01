@@ -200,7 +200,8 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Write release checksums
-        run: sha256sum dist/*.tar.gz | sort > dist/SHA256SUMS
+        working-directory: dist
+        run: sha256sum *.tar.gz | sort > SHA256SUMS
       - name: Publish the tagged release
         env:
           GH_REPO: ${{ github.repository }}
