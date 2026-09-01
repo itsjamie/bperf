@@ -357,6 +357,7 @@ impl MeasurementSet {
         let retention = artifact_retention::load(&database, measurement_set_id)?;
         let results = ingest(
             &schedule,
+            sampling.as_ref(),
             &benchmark.analysis_policy(),
             &root,
             trial_results,
@@ -621,19 +622,7 @@ impl MeasurementSet {
     }
 
     fn trial_is_active(&self, trial: &ScheduledTrial) -> bool {
-        match (&self.schedule.sampling, &self.sampling) {
-            (SamplingSchedule::Fixed, _) => true,
-            (SamplingSchedule::Adaptive { .. }, None) => trial.phase != TrialPhase::Final,
-            (SamplingSchedule::Adaptive { .. }, Some(decision)) => match trial.phase {
-                TrialPhase::Warmup => true,
-                TrialPhase::Pilot => decision
-                    .pilot_samples_for(&trial.workload_id, trial.engine)
-                    .is_some_and(|samples| trial.sample_index <= samples),
-                TrialPhase::Final => decision
-                    .final_samples_for(&trial.workload_id, trial.engine)
-                    .is_some_and(|samples| trial.sample_index <= samples),
-            },
-        }
+        trial_is_active(&self.schedule, self.sampling.as_ref(), trial)
     }
 
     fn next_pilot_trials(&self) -> Vec<&ScheduledTrial> {
@@ -721,6 +710,13 @@ impl MeasurementSet {
             .iter()
             .find(|trial| trial.trial_id == result.trial_id)
             .with_context(|| format!("unknown scheduled trial {}", result.trial_id))?;
+        if !self
+            .pending_trials()
+            .iter()
+            .any(|trial| trial.trial_id == scheduled.trial_id)
+        {
+            bail!("trial {} is not currently pending", result.trial_id);
+        }
         validate_trial_identity(scheduled, result)?;
         validate_result(result, &self.benchmark.analysis_policy())?;
         artifact_retention::validate_result(&self.root, result, false)?;
@@ -739,6 +735,16 @@ impl MeasurementSet {
             .write(|transaction| {
                 let current: Vec<TrialResult> = transaction
                     .read_events(MEASUREMENT_TRIALS, self.measurement_set_id())?;
+                let current_sampling: Option<SamplingDecision> = transaction.read_document(
+                    MEASUREMENT_DOCUMENTS,
+                    &measurement_document_key(self.measurement_set_id(), "sampling"),
+                )?;
+                if let Some(decision) = &current_sampling {
+                    decision.validate(&self.schedule)?;
+                }
+                if !trial_is_active(&self.schedule, current_sampling.as_ref(), scheduled) {
+                    bail!("trial {} is outside the active sampling prefix", result.trial_id);
+                }
                 if current
                     .iter()
                     .any(|attempt| attempt.trial_id == result.trial_id && attempt.valid)
@@ -831,6 +837,27 @@ impl MeasurementSet {
             .get(&engine)
             .copied()
             .unwrap_or_default()
+    }
+}
+
+fn trial_is_active(
+    schedule: &MeasurementSchedule,
+    sampling: Option<&SamplingDecision>,
+    trial: &ScheduledTrial,
+) -> bool {
+    match (&schedule.sampling, sampling) {
+        (SamplingSchedule::Fixed, None) => true,
+        (SamplingSchedule::Fixed, Some(_)) => false,
+        (SamplingSchedule::Adaptive { .. }, None) => trial.phase != TrialPhase::Final,
+        (SamplingSchedule::Adaptive { .. }, Some(decision)) => match trial.phase {
+            TrialPhase::Warmup => true,
+            TrialPhase::Pilot => decision
+                .pilot_samples_for(&trial.workload_id, trial.engine)
+                .is_some_and(|samples| trial.sample_index <= samples),
+            TrialPhase::Final => decision
+                .final_samples_for(&trial.workload_id, trial.engine)
+                .is_some_and(|samples| trial.sample_index <= samples),
+        },
     }
 }
 
@@ -1032,6 +1059,7 @@ pub(crate) struct IngestedResults {
 
 fn ingest(
     schedule: &MeasurementSchedule,
+    sampling: Option<&SamplingDecision>,
     policy: &AnalysisPolicy,
     measurement_root: &Path,
     results: Vec<TrialResult>,
@@ -1068,6 +1096,12 @@ fn ingest(
         let expected_trial = expected
             .get(result.trial_id.as_str())
             .with_context(|| format!("unknown scheduled trial {}", result.trial_id))?;
+        if !trial_is_active(schedule, sampling, expected_trial) {
+            bail!(
+                "trial {} is outside the active sampling prefix",
+                result.trial_id
+            );
+        }
         validate_trial_identity(expected_trial, &result)?;
         if !seen.insert((result.trial_id.clone(), result.attempt)) {
             bail!(
@@ -1432,6 +1466,56 @@ mod tests {
                 .unwrap()
                 .len(),
             84
+        );
+    }
+
+    #[test]
+    fn adaptive_trials_must_stay_inside_the_active_prefix() {
+        let directory = tempdir().unwrap();
+        let root = prepare_adaptive(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            "1h".parse().unwrap(),
+            None,
+            directory.path(),
+        )
+        .unwrap();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        let final_trial = measurement
+            .schedule
+            .trials
+            .iter()
+            .find(|trial| trial.phase == TrialPhase::Final)
+            .unwrap();
+        let result = synthetic_result(&measurement, final_trial, 100.0);
+
+        let error = measurement.append_result(&result).unwrap_err();
+        assert!(
+            error.to_string().contains("is not currently pending"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            measurement
+                .database
+                .read_events::<TrialResult>(MEASUREMENT_TRIALS, measurement.measurement_set_id())
+                .unwrap()
+                .is_empty()
+        );
+
+        measurement
+            .database
+            .append_event(
+                MEASUREMENT_TRIALS,
+                measurement.measurement_set_id(),
+                &result,
+            )
+            .unwrap();
+        let error = MeasurementSet::open(&root)
+            .err()
+            .expect("out-of-prefix evidence must be rejected");
+        assert!(
+            format!("{error:#}").contains("outside the active sampling prefix"),
+            "unexpected error: {error:#}"
         );
     }
 

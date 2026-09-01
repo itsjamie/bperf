@@ -348,6 +348,30 @@ pub struct WriteTransaction<'connection> {
 }
 
 impl WriteTransaction<'_> {
+    pub fn read_document<Value: DeserializeOwned>(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        validate_storage_key("namespace", namespace)?;
+        validate_storage_key("document key", key)?;
+        let payload: Option<Vec<u8>> = self
+            .transaction
+            .query_row(
+                "SELECT payload FROM storage_documents WHERE namespace = ?1 AND key = ?2",
+                params![namespace, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("failed to read {namespace} document {key:?}"))?;
+        payload
+            .map(|payload| {
+                serde_json::from_slice(&payload)
+                    .with_context(|| format!("invalid {namespace} document {key:?}"))
+            })
+            .transpose()
+    }
+
     pub fn read_events<Value: DeserializeOwned>(
         &self,
         namespace: &str,
