@@ -415,7 +415,8 @@ fn write_generated(path: &Path, content: &[u8]) -> Result<()> {
     if fs::read(path).is_ok_and(|existing| existing == content) {
         return Ok(());
     }
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+    bperf_storage::replace_file(path, content)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(test)]
