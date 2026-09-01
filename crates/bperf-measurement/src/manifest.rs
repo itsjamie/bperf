@@ -554,7 +554,18 @@ fn require_identifier(label: &str, value: &str) -> Result<()> {
 }
 
 pub fn validate_workload_id(value: &str) -> Result<()> {
-    require_identifier("workload id", value)
+    require_identifier("workload id", value)?;
+    let stem = value.split_once('.').map_or(value, |(stem, _)| stem);
+    if [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ]
+    .iter()
+    .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        bail!("workload id {value:?} uses reserved Windows device name {stem:?}");
+    }
+    Ok(())
 }
 
 fn require_nonempty(label: &str, value: &str) -> Result<()> {
@@ -900,6 +911,15 @@ mod tests {
             benchmark.workload("checkout-flow").unwrap().verifier,
             VerifierInvocation::Exact
         ));
+    }
+
+    #[test]
+    fn workload_ids_reject_reserved_windows_device_names() {
+        for id in ["CON", "nul.log", "Com1", "lpt9.capture"] {
+            assert!(validate_workload_id(id).is_err(), "accepted {id:?}");
+        }
+        assert!(validate_workload_id("console").is_ok());
+        assert!(validate_workload_id("com10").is_ok());
     }
 
     #[test]
