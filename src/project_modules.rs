@@ -184,18 +184,12 @@ fn materialize_browser_sdk(output_root: &Path) -> Result<PathBuf> {
         staged
             .write_all(source)
             .context("failed to write the embedded browser authoring module")?;
-        match staged.persist_noclobber(&path) {
-            Ok(_) => {}
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error.error).with_context(|| {
-                    format!(
-                        "failed to persist the embedded browser authoring module {}",
-                        path.display()
-                    )
-                });
-            }
-        }
+        bperf_storage::publish_staged_immutable(&path, staged).with_context(|| {
+            format!(
+                "failed to persist the embedded browser authoring module {}",
+                path.display()
+            )
+        })?;
     }
     let materialized = fs::read(&path)
         .with_context(|| format!("failed to read browser authoring module {}", path.display()))?;

@@ -55,24 +55,26 @@ pub fn publish_staged_immutable(path: &Path, staged: tempfile::NamedTempFile) ->
         .with_context(|| format!("failed to flush immutable file {}", path.display()))?;
 
     match staged.persist_noclobber(path) {
-        Ok(_) => sync_directory(parent),
+        Ok(_) => {}
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             let staged = error.file.reopen().with_context(|| {
                 format!("failed to reopen staged immutable file {}", path.display())
             })?;
             let existing = fs::File::open(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            if files_equal(staged, existing)
+            if !files_equal(staged, existing)
                 .with_context(|| format!("failed to compare immutable file {}", path.display()))?
             {
-                Ok(())
-            } else {
                 bail!("immutable file collision at {}", path.display())
             }
         }
-        Err(error) => Err(error.error)
-            .with_context(|| format!("failed to publish immutable file {}", path.display())),
+        Err(error) => {
+            return Err(error.error)
+                .with_context(|| format!("failed to publish immutable file {}", path.display()));
+        }
     }
+    // An identical winner may have crashed before flushing the directory entry.
+    sync_directory(parent)
 }
 
 fn files_equal(first: fs::File, second: fs::File) -> std::io::Result<bool> {
