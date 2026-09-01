@@ -333,7 +333,7 @@ fn representative<'a>(results: &[&'a TrialResult], metric: &str) -> Result<Repre
     values.sort_by(f64::total_cmp);
     let median = if values.len() % 2 == 0 {
         let upper = values.len() / 2;
-        (values[upper - 1] + values[upper]) / 2.0
+        values[upper - 1] + (values[upper] - values[upper - 1]) / 2.0
     } else {
         values[values.len() / 2]
     };
@@ -531,6 +531,22 @@ mod tests {
         }
 
         let completed = MeasurementSet::open(&root).unwrap();
+        let mut extreme = completed
+            .results
+            .completed
+            .values()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        for result in &mut extreme {
+            result.metrics.insert(CPU_METRIC.to_owned(), f64::MAX);
+        }
+        let extreme = extreme.iter().collect::<Vec<_>>();
+        assert_eq!(
+            representative(&extreme, CPU_METRIC).unwrap().median,
+            f64::MAX
+        );
+
         let summary = finalize(&completed).unwrap().unwrap();
         let manifest = load(&completed.database, completed.measurement_set_id())
             .unwrap()

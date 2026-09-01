@@ -723,7 +723,7 @@ fn median(values: &[f64]) -> f64 {
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
     let middle = values.len() / 2;
     if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) / 2.0
+        values[middle - 1] + (values[middle] - values[middle - 1]) / 2.0
     } else {
         values[middle]
     }
@@ -805,6 +805,11 @@ mod tests {
             assert_eq!(budget.to_string(), value);
             assert_eq!(budget.to_string().parse::<RunBudget>().unwrap(), budget);
         }
+    }
+
+    #[test]
+    fn even_medians_stay_finite_at_the_numeric_limit() {
+        assert_eq!(median(&[f64::MAX, f64::MAX]), f64::MAX);
     }
 
     #[test]
