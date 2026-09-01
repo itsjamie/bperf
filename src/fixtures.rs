@@ -176,7 +176,15 @@ pub(crate) fn resolve(
                     .is_some_and(|source_url| !source_url.is_empty())
             })
             .cloned()
-            .map(|entry| validate_body(entry, "pinned remote fixture").map(|(entry, _body)| entry))
+            .map(|mut entry| {
+                entry.body_path = cached_object_path(
+                    &cache_root,
+                    &entry.sha256,
+                    &entry.body_path,
+                    "pinned remote fixture",
+                )?;
+                validate_body(entry, "pinned remote fixture").map(|(entry, _body)| entry)
+            })
             .transpose()?;
         entries.push(match pinned {
             Some(entry) => entry,
@@ -290,12 +298,12 @@ fn cache_body(cache_root: &Path, digest: &str, body: &[u8]) -> Result<PathBuf> {
             body_path.display()
         );
     }
-    fs::canonicalize(&body_path).with_context(|| {
-        format!(
-            "failed to resolve benchmark fixture {}",
-            body_path.display()
-        )
-    })
+    cached_object_path(
+        cache_root,
+        digest,
+        &body_path,
+        "content-addressed fixture object",
+    )
 }
 
 fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
@@ -334,6 +342,27 @@ fn validate_body(mut entry: FixtureLockEntry, label: &str) -> Result<(FixtureLoc
         )
     })?;
     Ok((entry, body))
+}
+
+fn cached_object_path(
+    cache_root: &Path,
+    digest: &str,
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf> {
+    if digest.len() != 64
+        || !digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        bail!("{label} has an invalid content digest");
+    }
+    let resolved = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve {label} {}", path.display()))?;
+    if resolved != cache_root.join(digest) {
+        bail!("{label} is outside the content-addressed fixture cache");
+    }
+    Ok(resolved)
 }
 
 fn validate_descriptor(descriptor: &FixtureDescriptor) -> Result<()> {
@@ -436,6 +465,28 @@ mod tests {
         fs::write(outside.path().join("outside.txt"), b"outside").unwrap();
         let error = resolve(root, &benchmark, &lock, &cache, &[escaped]).unwrap_err();
         assert!(format!("{error:#}").contains("fixture is outside benchmark root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_addressed_cache_objects_cannot_be_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let body = b"outside";
+        let digest = format!("{:x}", Sha256::digest(body));
+        let outside_path = outside.path().join("body");
+        fs::write(&outside_path, body).unwrap();
+        symlink(&outside_path, cache.path().join(&digest)).unwrap();
+
+        let error = cache_body(cache.path(), &digest, body).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the content-addressed fixture cache"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
