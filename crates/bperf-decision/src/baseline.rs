@@ -72,14 +72,7 @@ pub(crate) fn promote_prepared(
         .as_ref()
         .filter(|record| record.measurement_set_id == pending.measurement_set_id)
     {
-        if previous.measurement_set_path != pending.measurement_set_path
-            || previous.subject_id != pending.subject_id
-            || previous.benchmark_sha256 != pending.benchmark_sha256
-            || previous.variant_id != pending.variant_id
-            || previous.variant_sha256 != pending.variant_sha256
-            || previous.environment_fingerprint != pending.environment_fingerprint
-            || previous.measured_at_unix_ms != pending.measured_at_unix_ms
-        {
+        if !previous.matches_measurement(pending) {
             bail!("existing baseline reference does not match the immutable measurement");
         }
         return Ok(previous.clone());
@@ -151,17 +144,31 @@ fn emit(record: &BaselineRecord, json: bool) -> Result<()> {
 }
 
 pub fn current_path(registry_root: &Path, benchmark_id: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(
-        current(registry_root, benchmark_id)?.measurement_set_path,
-    ))
+    validated_measurement_path(&current(registry_root, benchmark_id)?)
 }
 
 pub fn current_path_if_present(
     registry_root: &Path,
     benchmark_id: &str,
 ) -> Result<Option<PathBuf>> {
-    Ok(current_if_present(registry_root, benchmark_id)?
-        .map(|record| PathBuf::from(record.measurement_set_path)))
+    current_if_present(registry_root, benchmark_id)?
+        .as_ref()
+        .map(validated_measurement_path)
+        .transpose()
+}
+
+fn validated_measurement_path(record: &BaselineRecord) -> Result<PathBuf> {
+    let path = PathBuf::from(&record.measurement_set_path);
+    let pending = prepare_measurement(&path).with_context(|| {
+        format!(
+            "failed to validate baseline measurement {:?}",
+            record.measurement_set_id
+        )
+    })?;
+    if !record.matches_measurement(&pending) {
+        bail!("baseline reference does not match its immutable measurement");
+    }
+    Ok(path)
 }
 
 fn current_if_present(registry_root: &Path, benchmark_id: &str) -> Result<Option<BaselineRecord>> {
@@ -213,6 +220,16 @@ fn validate_history(history: &[BaselineRecord], benchmark_id: &str) -> Result<()
             || record.promoted_at_unix_ms == 0
         {
             bail!("baseline history for {benchmark_id:?} contains an incomplete reference");
+        }
+        if Path::new(&record.measurement_set_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(record.measurement_set_id.as_str())
+        {
+            bail!(
+                "baseline history for {benchmark_id:?} has a measurement path inconsistent with {:?}",
+                record.measurement_set_id
+            );
         }
         if record.previous_measurement_set_id.as_deref() != previous {
             bail!(
@@ -298,6 +315,18 @@ impl BaselineRecord {
         self.measurement_set_id == measurement_set
             && self.previous_measurement_set_id.as_deref() == previous
     }
+
+    fn matches_measurement(&self, pending: &PendingBaseline) -> bool {
+        self.benchmark_id == pending.benchmark_id
+            && self.subject_id == pending.subject_id
+            && self.benchmark_sha256 == pending.benchmark_sha256
+            && self.measurement_set_id == pending.measurement_set_id
+            && self.measurement_set_path == pending.measurement_set_path
+            && self.variant_id == pending.variant_id
+            && self.variant_sha256 == pending.variant_sha256
+            && self.environment_fingerprint == pending.environment_fingerprint
+            && self.measured_at_unix_ms == pending.measured_at_unix_ms
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +394,20 @@ mod tests {
         let error = current_path_if_present(directory.path(), "benchmark").unwrap_err();
         assert!(
             error.to_string().contains("broken predecessor"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn baseline_reads_reject_a_path_for_another_measurement() {
+        let directory = tempdir().unwrap();
+        let mut mismatched = record("first", None);
+        mismatched.measurement_set_path = "C:/measurements/second".to_owned();
+        append(directory.path(), &mismatched).unwrap();
+
+        let error = current_path_if_present(directory.path(), "benchmark").unwrap_err();
+        assert!(
+            error.to_string().contains("measurement path inconsistent"),
             "unexpected error: {error:#}"
         );
     }
