@@ -456,12 +456,16 @@ impl SpeedscopeBuilder {
         });
         let duration =
             duration.with_context(|| format!("Speedscope duration overflowed for {name}"))?;
+        let end_value = start_value + duration;
+        if !end_value.is_finite() {
+            bail!("Speedscope end value overflowed for {name}");
+        }
         self.profiles.push(SpeedscopeProfile {
             profile_type: "sampled",
             name,
             unit,
             start_value: CompactNumber(start_value),
-            end_value: CompactNumber(start_value + duration),
+            end_value: CompactNumber(end_value),
             samples,
             weights: weights.into_iter().map(CompactNumber).collect(),
         });
@@ -752,6 +756,23 @@ mod tests {
                     "weights": [2, 0.5],
                 }],
             })
+        );
+    }
+
+    #[test]
+    fn sampled_profiles_reject_an_overflowing_end_value() {
+        let mut builder = SpeedscopeBuilder::new("CPU", "bperf");
+        let frame = builder.frame(SpeedscopeFrame::named("work"));
+        assert!(
+            builder
+                .sampled_profile(
+                    "main",
+                    "milliseconds",
+                    f64::MAX,
+                    vec![vec![frame]],
+                    vec![f64::MAX],
+                )
+                .is_err()
         );
     }
 
