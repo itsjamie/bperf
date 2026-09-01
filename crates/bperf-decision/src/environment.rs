@@ -137,7 +137,7 @@ pub fn capture(browser_lab: &mut BrowserLab, measurement: &MeasurementSet) -> Re
     };
     validate_record(&record)?;
 
-    if let Some(existing) = measurement.environment_record::<EnvironmentRecord>()? {
+    if let Some(existing) = stored_record(measurement)? {
         if existing.identity != record.identity || existing.fingerprint != record.fingerprint {
             bail!("current preflight does not match the recorded environment");
         }
@@ -173,16 +173,26 @@ pub(crate) fn compatible_pair(
 }
 
 pub(crate) fn read(measurement: &MeasurementSet) -> Result<EnvironmentRecord> {
-    let record = measurement
-        .environment_record::<EnvironmentRecord>()?
-        .context("measurement set has no environment record")?;
+    stored_record(measurement)?.context("measurement set has no environment record")
+}
+
+fn stored_record(measurement: &MeasurementSet) -> Result<Option<EnvironmentRecord>> {
+    let Some(record) = measurement.environment_record::<EnvironmentRecord>()? else {
+        return Ok(None);
+    };
+    validate_record(&record).with_context(|| {
+        format!(
+            "measurement set {} has an invalid environment record",
+            measurement.measurement_set_id()
+        )
+    })?;
     if measurement
         .environment_fingerprint()
         .is_some_and(|fingerprint| fingerprint != record.fingerprint)
     {
         bail!("environment record does not match its trial evidence");
     }
-    Ok(record)
+    Ok(Some(record))
 }
 
 #[cfg(test)]
@@ -452,12 +462,13 @@ fn unix_time_ms() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
+    use bperf_measurement::store::{MeasurementSet, prepare};
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::read_path;
+    use super::*;
 
     #[test]
     fn earlier_browser_environments_require_remeasurement() {
@@ -478,5 +489,53 @@ mod tests {
             assert!(error.contains("earlier browser capture contracts"));
             assert!(error.contains("remeasured"));
         }
+    }
+
+    #[test]
+    fn persisted_environment_records_are_validated_on_read() {
+        let directory = tempdir().unwrap();
+        let root = prepare(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            Some(20),
+            directory.path(),
+        )
+        .unwrap();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        measurement
+            .write_environment_record(&EnvironmentRecord {
+                schema_version: SCHEMA_VERSION - 1,
+                recorded_at_unix_ms: 1,
+                fingerprint: "obsolete".to_owned(),
+                identity: EnvironmentIdentity {
+                    bperf_version: "test".to_owned(),
+                    browser_lab_protocol_version: PROTOCOL_VERSION,
+                    host: HostIdentity {
+                        platform: "test".to_owned(),
+                        arch: "test".to_owned(),
+                        os_release: "test".to_owned(),
+                        cpu_model: "test".to_owned(),
+                        logical_cpus: 1,
+                        total_memory_bytes: 1,
+                    },
+                    adapters: BTreeMap::new(),
+                    browsers: BTreeMap::new(),
+                },
+                anchors: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let error = read(&measurement).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported environment schema"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    fn example(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples")
+            .join(name)
     }
 }
