@@ -37,7 +37,7 @@ pub(crate) fn promote_measurement(
 
 pub(crate) fn prepare_measurement(measurement_root: &Path) -> Result<PendingBaseline> {
     let measurement = MeasurementSet::open(measurement_root)?;
-    if !measurement.final_is_complete() {
+    if !measurement.is_finalized() {
         bail!(
             "measurement set {} is incomplete and cannot become a baseline",
             measurement.measurement_set_id()

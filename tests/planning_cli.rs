@@ -518,6 +518,9 @@ fn independent_measurements_can_be_promoted_and_compared() {
     }
     assert!(directory.path().join("bperf.sqlite3").is_file());
 
+    complete_measurement(&baseline_root, 100.0, "pinned-environment");
+    complete_measurement(&candidate_root, 90.0, "pinned-environment");
+
     let registry = directory.path().join("baselines");
     let incomplete_promotion = bperf()
         .args(["baseline", "promote"])
@@ -528,9 +531,12 @@ fn independent_measurements_can_be_promoted_and_compared() {
         .unwrap();
     assert!(!incomplete_promotion.status.success());
     assert!(String::from_utf8_lossy(&incomplete_promotion.stderr).contains("is incomplete"));
-
-    complete_measurement(&baseline_root, 100.0, "pinned-environment");
-    complete_measurement(&candidate_root, 90.0, "pinned-environment");
+    for root in [&baseline_root, &candidate_root] {
+        let measurement = bperf_measurement::store::MeasurementSet::open(root).unwrap();
+        bperf_measurement::retention::finalize(&measurement)
+            .unwrap()
+            .unwrap();
+    }
 
     let promotion = bperf()
         .args(["baseline", "promote"])
