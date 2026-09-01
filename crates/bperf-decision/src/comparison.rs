@@ -1148,7 +1148,16 @@ fn log_to_improvement(log_ratio: f64) -> f64 {
 }
 
 fn mean(values: &[f64]) -> f64 {
-    values.iter().sum::<f64>() / values.len() as f64
+    let scale = values
+        .iter()
+        .map(|value| value.abs())
+        .reduce(f64::max)
+        .unwrap_or(f64::NAN);
+    if scale == 0.0 {
+        return 0.0;
+    }
+    // Normalizing first keeps a representable finite mean from overflowing its sum.
+    values.iter().map(|value| value / scale).sum::<f64>() / values.len() as f64 * scale
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -1629,6 +1638,12 @@ mod tests {
             independent_bootstrap_interval(&["a", "b"], &left, &right, 0.95, 1_000, 42),
             independent_bootstrap_interval(&["a", "b"], &left, &right, 0.95, 1_000, 42)
         );
+    }
+
+    #[test]
+    fn mean_keeps_representable_extremes_finite() {
+        assert_eq!(mean(&[f64::MAX; 3]), f64::MAX);
+        assert_eq!(mean(&[f64::MAX, -f64::MAX]), 0.0);
     }
 
     #[test]
