@@ -72,6 +72,7 @@ impl BenchmarkManifest {
             .context("resolved benchmark has no _source metadata")?;
         let metadata: ResolvedSourceOwned = serde_json::from_value(source_metadata)
             .context("resolved benchmark has invalid _source metadata")?;
+        metadata.validate("benchmark")?;
         let mut manifest: Self =
             serde_json::from_value(value).context("invalid resolved benchmark fields")?;
         manifest.source_path = PathBuf::from(metadata.path);
@@ -433,6 +434,7 @@ impl VariantDescriptor {
             .context("resolved variant has no _source metadata")?;
         let metadata: ResolvedSourceOwned = serde_json::from_value(source_metadata)
             .context("resolved variant has invalid _source metadata")?;
+        metadata.validate("variant")?;
         let mut variant: Self =
             serde_json::from_value(value).context("invalid resolved variant fields")?;
         variant.source_path = PathBuf::from(metadata.path);
@@ -790,6 +792,23 @@ struct ResolvedSourceOwned {
     sha256: String,
 }
 
+impl ResolvedSourceOwned {
+    fn validate(&self, definition: &str) -> Result<()> {
+        if self.path.trim().is_empty() {
+            bail!("resolved {definition} has an empty source path");
+        }
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("resolved {definition} has an invalid source SHA-256");
+        }
+        Ok(())
+    }
+}
+
 pub struct WorkloadInvocation<'a> {
     pub trace_file: &'a Path,
     pub verifier: VerifierInvocation<'a>,
@@ -997,5 +1016,24 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn resolved_definitions_reject_malformed_source_hashes() {
+        let benchmark = parse_benchmark(BENCHMARK).unwrap();
+        let mut resolved: serde_json::Value =
+            serde_json::from_str(&benchmark.resolved_json().unwrap()).unwrap();
+        resolved["_source"]["sha256"] = serde_json::Value::String("short".to_owned());
+        let error = BenchmarkManifest::load_resolved_bytes(&serde_json::to_vec(&resolved).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid source SHA-256"));
+
+        let variant = parse_variant(VARIANT).unwrap();
+        let mut resolved: serde_json::Value =
+            serde_json::from_str(&variant.resolved_json().unwrap()).unwrap();
+        resolved["_source"]["sha256"] = serde_json::Value::String("G".repeat(64));
+        let error = VariantDescriptor::load_resolved_bytes(&serde_json::to_vec(&resolved).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid source SHA-256"));
     }
 }
