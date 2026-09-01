@@ -465,7 +465,7 @@ impl MetricSummary {
                 {
                     bail!("{engine} metric {name:?} has invalid measured values");
                 }
-                let expected_point = 100.0 * (1.0 - candidate / baseline);
+                let expected_point = (100.0 * (1.0 - candidate / baseline)).max(-f64::MAX);
                 if !nearly_equal(point, expected_point) {
                     bail!("{engine} metric {name:?} effect contradicts its measured values");
                 }
@@ -1147,7 +1147,7 @@ fn derived_seed(seed: u64, scope: &str) -> u64 {
 }
 
 fn log_to_improvement(log_ratio: f64) -> f64 {
-    100.0 * (1.0 - (-log_ratio).exp())
+    (100.0 * (1.0 - (-log_ratio).exp())).max(-f64::MAX)
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -1178,7 +1178,7 @@ fn resampled_median(values: &[f64], rng: &mut SplitMix64) -> f64 {
 }
 
 fn duration_change_pct(baseline: f64, candidate: f64) -> f64 {
-    100.0 * (candidate / baseline - 1.0)
+    (100.0 * (candidate / baseline - 1.0)).min(f64::MAX)
 }
 
 fn quantile_sorted(values: &[f64], probability: f64) -> f64 {
@@ -1443,19 +1443,31 @@ impl DistributionSummary {
         let mut sorted = values.to_vec();
         sorted.sort_by(f64::total_cmp);
         let mean = mean(values);
-        let variance = if values.len() > 1 {
-            values
+        let standard_deviation = if values.len() > 1 {
+            let scale = values
                 .iter()
-                .map(|value| (value - mean).powi(2))
-                .sum::<f64>()
-                / (values.len() - 1) as f64
+                .map(|value| value.abs())
+                .reduce(f64::max)
+                .unwrap_or_default();
+            if scale == 0.0 {
+                0.0
+            } else {
+                // Normalizing deviations keeps finite metric ranges from overflowing their squares.
+                (values
+                    .iter()
+                    .map(|value| (value / scale - mean / scale).powi(2))
+                    .sum::<f64>()
+                    / (values.len() - 1) as f64)
+                    .sqrt()
+                    * scale
+            }
         } else {
             0.0
         };
         Self {
             count: values.len(),
             mean,
-            standard_deviation: variance.sqrt(),
+            standard_deviation,
             median: quantile_sorted(&sorted, 0.5),
             q1: quantile_sorted(&sorted, 0.25),
             q3: quantile_sorted(&sorted, 0.75),
@@ -1647,6 +1659,28 @@ mod tests {
     fn mean_keeps_representable_extremes_finite() {
         assert_eq!(mean(&[f64::MAX; 3]), f64::MAX);
         assert_eq!(mean(&[f64::MAX, -f64::MAX]), 0.0);
+    }
+
+    #[test]
+    fn extreme_finite_measurements_keep_derived_evidence_finite() {
+        let distribution = DistributionSummary::new(&[f64::MIN_POSITIVE, f64::MAX]);
+        assert!(distribution.standard_deviation.is_finite());
+        assert_eq!(
+            log_to_improvement(f64::MIN_POSITIVE.ln() - f64::MAX.ln()),
+            -f64::MAX
+        );
+        assert_eq!(duration_change_pct(f64::MIN_POSITIVE, f64::MAX), f64::MAX);
+
+        MetricSummary {
+            improvement_pct: Some(-f64::MAX),
+            ci_pct: Some([-f64::MAX, -f64::MAX]),
+            classification: "regressed".to_owned(),
+            guardrail_regressed: true,
+            baseline_value: Some(f64::MIN_POSITIVE),
+            candidate_value: Some(f64::MAX),
+        }
+        .validate(Engine::Chromium, "workload.wall_ms")
+        .unwrap();
     }
 
     #[test]
