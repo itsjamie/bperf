@@ -398,7 +398,7 @@ fn pilot_estimates_are_stable(
         return false;
     };
     let first_prefix = pilots.len() + 1 - STABILITY_PREFIXES;
-    let confidence_multiplier = inverse_normal_cdf((1.0 + policy.confidence) / 2.0);
+    let confidence_multiplier = confidence_multiplier(policy.confidence);
 
     for metric in &policy.primary_metrics {
         let requirements = (first_prefix..=pilots.len())
@@ -515,7 +515,7 @@ pub fn decide(
     });
     keys.dedup();
 
-    let confidence_multiplier = inverse_normal_cdf((1.0 + policy.confidence) / 2.0);
+    let confidence_multiplier = confidence_multiplier(policy.confidence);
     let mut strata = Vec::with_capacity(keys.len());
     for (workload_id, engine) in keys {
         let pilots = pilot_results
@@ -704,7 +704,8 @@ fn required_samples(
 }
 
 fn relative_margin_pct(confidence_multiplier: f64, deviation: f64, samples: u32) -> f64 {
-    ((confidence_multiplier * deviation / f64::from(samples).sqrt()).exp() - 1.0) * 100.0
+    (((confidence_multiplier * deviation / f64::from(samples).sqrt()).exp() - 1.0) * 100.0)
+        .min(f64::MAX)
 }
 
 fn log_standard_deviation(values: &[f64]) -> Option<f64> {
@@ -778,6 +779,11 @@ fn inverse_normal_cdf(probability: f64) -> f64 {
     }
 }
 
+fn confidence_multiplier(confidence: f64) -> f64 {
+    // The lower tail stays representable when the equivalent upper-tail probability rounds to 1.
+    -inverse_normal_cdf((1.0 - confidence) / 2.0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -810,6 +816,30 @@ mod tests {
     #[test]
     fn even_medians_stay_finite_at_the_numeric_limit() {
         assert_eq!(median(&[f64::MAX, f64::MAX]), f64::MAX);
+    }
+
+    #[test]
+    fn extreme_valid_sampling_evidence_keeps_derived_margins_finite() {
+        let schedule = schedule_with_pilots(4, 2, 100, 1_000);
+        let values = [f64::MIN_POSITIVE, f64::MAX, f64::MIN_POSITIVE, f64::MAX];
+        let mut results = Vec::new();
+        for engine in Engine::ALL {
+            for (index, value) in values.into_iter().enumerate() {
+                results.push(pilot_result(engine, index as u32 + 1, value));
+            }
+        }
+        let mut policy = policy();
+        policy.confidence = f64::from_bits(1.0_f64.to_bits() - 1);
+        let references = results.iter().collect::<Vec<_>>();
+
+        let decision = decide(&schedule, &policy, &references).unwrap();
+
+        assert!(decision.strata.iter().all(|stratum| {
+            stratum
+                .metrics
+                .iter()
+                .all(|metric| metric.selected_relative_margin_pct == Some(f64::MAX))
+        }));
     }
 
     #[test]
