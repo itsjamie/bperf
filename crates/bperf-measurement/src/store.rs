@@ -441,11 +441,34 @@ impl MeasurementSet {
             bail!("cannot commit completion before artifact retention is finalized");
         }
 
-        self.database.replace_document(
-            MEASUREMENT_DOCUMENTS,
-            &measurement_document_key(self.measurement_set_id(), "summary"),
-            summary,
-        )?;
+        let payload =
+            serde_json::to_vec(summary).context("failed to encode measurement outcome")?;
+        self.database.write(|transaction| {
+            let current_results: Vec<TrialResult> =
+                transaction.read_events(MEASUREMENT_TRIALS, self.measurement_set_id())?;
+            let current_sampling: Option<SamplingDecision> = transaction.read_document(
+                MEASUREMENT_DOCUMENTS,
+                &measurement_document_key(self.measurement_set_id(), "sampling"),
+            )?;
+            let current_retention: Option<ArtifactRetention> = transaction.read_document(
+                MEASUREMENT_DOCUMENTS,
+                &measurement_document_key(self.measurement_set_id(), "retention"),
+            )?;
+            if current_results.len() != self.results.event_count
+                || current_sampling.is_some() != self.sampling.is_some()
+                || current_retention.is_some() != self.retention.is_some()
+            {
+                bail!(
+                    "measurement set {} changed after it was opened; reopen it before committing an outcome",
+                    self.measurement_set_id()
+                );
+            }
+            transaction.replace_document(
+                MEASUREMENT_DOCUMENTS,
+                &measurement_document_key(self.measurement_set_id(), "summary"),
+                &payload,
+            )
+        })?;
 
         if !complete {
             return Ok(());
@@ -1041,6 +1064,7 @@ pub(crate) struct IngestedResults {
     invalid_attempts: HashMap<Engine, usize>,
     environment_fingerprint: Option<String>,
     attempt_counts: HashMap<String, u32>,
+    event_count: usize,
 }
 
 fn ingest(
@@ -1051,6 +1075,7 @@ fn ingest(
     results: Vec<TrialResult>,
     retention_finalized: bool,
 ) -> Result<IngestedResults> {
+    let event_count = results.len();
     let expected: HashMap<_, _> = schedule
         .trials
         .iter()
@@ -1141,6 +1166,7 @@ fn ingest(
         invalid_attempts,
         environment_fingerprint,
         attempt_counts,
+        event_count,
     })
 }
 
@@ -1376,6 +1402,45 @@ mod tests {
             1
         );
         assert_eq!(reopened.next_attempt(&trial.trial_id), 2);
+    }
+
+    #[test]
+    fn stale_measurement_handle_cannot_overwrite_a_completed_outcome() {
+        let directory = tempdir().unwrap();
+        let root = prepare(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            Some(20),
+            directory.path(),
+        )
+        .unwrap();
+        let stale = MeasurementSet::open(&root).unwrap();
+        append_pending(&stale);
+
+        let completed = MeasurementSet::open(&root).unwrap();
+        artifact_retention::finalize(&completed).unwrap().unwrap();
+        let retained = MeasurementSet::open(&root).unwrap();
+        let completed_summary = serde_json::json!({"status": "complete"});
+        retained.commit_outcome(&completed_summary).unwrap();
+
+        let error = stale
+            .commit_outcome(&serde_json::json!({"status": "open"}))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed after it was opened"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            retained
+                .database
+                .read_document::<serde_json::Value>(
+                    MEASUREMENT_DOCUMENTS,
+                    &measurement_document_key(retained.measurement_set_id(), "summary"),
+                )
+                .unwrap()
+                .unwrap(),
+            completed_summary
+        );
     }
 
     #[test]
