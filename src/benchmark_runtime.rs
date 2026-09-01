@@ -25,6 +25,7 @@ use bperf_measurement::{
 use serde::{Deserialize, Serialize};
 
 const READINESS_PROTOCOL_VERSION: u32 = 2;
+const MAX_ADAPTER_READINESS_BYTES: usize = 1024 * 1024;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Frozen workload inputs and invocation rules for repeated isolated trials.
@@ -410,7 +411,7 @@ impl VariantAdapter {
             .current_dir(invocation.working_directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("failed to start variant adapter {program:?}"))?;
         let readiness = (|| -> Result<AdapterReady> {
@@ -418,23 +419,10 @@ impl VariantAdapter {
                 .stdout
                 .take()
                 .context("variant adapter stdout was unavailable")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("variant adapter stderr was unavailable")?;
-            thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
-                    eprintln!("[variant] {line}");
-                }
-            });
 
             let (sender, receiver) = mpsc::sync_channel(1);
             thread::spawn(move || {
-                let mut line = String::new();
-                let result = BufReader::new(stdout)
-                    .read_line(&mut line)
-                    .map(|count| (count, line));
-                let _ = sender.send(result);
+                let _ = sender.send(read_adapter_readiness(stdout));
             });
             let line = match receiver.recv_timeout(invocation.ready_timeout) {
                 Ok(Ok((0, _))) => {
@@ -442,7 +430,7 @@ impl VariantAdapter {
                     bail!("variant adapter closed before readiness (status: {status:?})")
                 }
                 Ok(Ok((_, line))) => line,
-                Ok(Err(error)) => return Err(error).context("failed to read variant readiness"),
+                Ok(Err(error)) => return Err(error),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     bail!(
                         "variant adapter did not become ready within {:?}",
@@ -484,6 +472,17 @@ impl VariantAdapter {
     fn url(&self) -> &str {
         &self.url
     }
+}
+
+fn read_adapter_readiness(reader: impl Read) -> Result<(usize, String)> {
+    let mut line = String::new();
+    let count = BufReader::new(reader.take(MAX_ADAPTER_READINESS_BYTES as u64 + 1))
+        .read_line(&mut line)
+        .context("failed to read variant readiness")?;
+    if count > MAX_ADAPTER_READINESS_BYTES {
+        bail!("variant adapter readiness exceeded {MAX_ADAPTER_READINESS_BYTES} bytes");
+    }
+    Ok((count, line))
 }
 
 impl Drop for VariantAdapter {
@@ -564,6 +563,19 @@ mod tests {
 
         assert!(error.to_string().contains("exceeded"));
         assert_eq!(reader.position(), MAX_VERIFIER_OUTPUT_BYTES as u64 + 4096);
+    }
+
+    #[test]
+    fn oversized_adapter_readiness_is_rejected_before_json_decode() {
+        let output = vec![b'x'; MAX_ADAPTER_READINESS_BYTES + 4096];
+        let mut reader = std::io::Cursor::new(output);
+        let error = read_adapter_readiness(&mut reader).unwrap_err();
+
+        assert!(
+            error.to_string().contains("readiness exceeded"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(reader.position(), MAX_ADAPTER_READINESS_BYTES as u64 + 1);
     }
 
     #[test]
