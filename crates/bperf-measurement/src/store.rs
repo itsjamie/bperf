@@ -974,7 +974,7 @@ fn validate_sampling_results(
         .filter_map(|trial| completed.get(&trial.trial_id))
         .collect::<Vec<_>>();
     let expected = sampling::decide(schedule, policy, &calibration_results)?;
-    if decision != &expected {
+    if !decision.matches_calibration_evidence(&expected) {
         bail!("sampling decision does not match its calibration evidence");
     }
     Ok(())
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_decision_must_match_its_calibration_evidence() {
+    fn sampling_decision_allows_platform_rounding_but_rejects_changed_choices() {
         let directory = tempdir().unwrap();
         let root = prepare_adaptive(
             &example("browser-benchmark.yaml"),
@@ -1502,6 +1502,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        decision.strata[0].batch_size -= 1;
+        let deviation = decision.strata[0].metrics[0]
+            .log_standard_deviation
+            .unwrap();
+        decision.strata[0].metrics[0].log_standard_deviation =
+            Some(f64::from_bits(deviation.to_bits() + 3));
+        calibrated.record_sampling_decision(&decision).unwrap();
+        MeasurementSet::open(&root).unwrap();
     }
 
     #[test]

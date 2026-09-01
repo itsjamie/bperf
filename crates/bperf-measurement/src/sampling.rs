@@ -23,6 +23,9 @@ const MIN_ADAPTIVE_PILOTS: u32 = 5;
 const STABILITY_PREFIXES: usize = 3;
 const SAMPLE_REQUIREMENT_TOLERANCE: f64 = 0.10;
 const MEDIAN_ESTIMATE_TOLERANCE: f64 = 0.20;
+// Platform libm implementations may round explanatory estimates differently;
+// all discrete sampling decisions remain exact.
+const DERIVED_FLOAT_TOLERANCE: f64 = 1e-12;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,6 +284,35 @@ impl SamplingDecision {
             bail!("sampling decision budget flags are inconsistent");
         }
         Ok(())
+    }
+
+    pub(crate) fn matches_calibration_evidence(&self, expected: &Self) -> bool {
+        let mut normalized = self.clone();
+        let actual = normalized
+            .strata
+            .iter_mut()
+            .flat_map(|stratum| &mut stratum.metrics);
+        let expected_metrics = expected.strata.iter().flat_map(|stratum| &stratum.metrics);
+        for (actual, expected) in actual.zip(expected_metrics) {
+            normalize_derived_float(
+                &mut actual.log_standard_deviation,
+                expected.log_standard_deviation,
+            );
+            normalize_derived_float(
+                &mut actual.selected_relative_margin_pct,
+                expected.selected_relative_margin_pct,
+            );
+        }
+        normalized == *expected
+    }
+}
+
+fn normalize_derived_float(actual: &mut Option<f64>, expected: Option<f64>) {
+    if actual.zip(expected).is_some_and(|(actual, expected)| {
+        (actual - expected).abs()
+            <= DERIVED_FLOAT_TOLERANCE * actual.abs().max(expected.abs()).max(1.0)
+    }) {
+        *actual = expected;
     }
 }
 
