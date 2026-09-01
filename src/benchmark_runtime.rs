@@ -7,7 +7,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -389,7 +389,6 @@ struct AdapterReady {
 struct VariantAdapter {
     child: Child,
     url: String,
-    stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
 impl VariantAdapter {
@@ -406,7 +405,7 @@ impl VariantAdapter {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to start variant adapter {program:?}"))?;
-        let readiness = (|| -> Result<(AdapterReady, Arc<Mutex<Vec<String>>>)> {
+        let readiness = (|| -> Result<AdapterReady> {
             let stdout = child
                 .stdout
                 .take()
@@ -415,14 +414,9 @@ impl VariantAdapter {
                 .stderr
                 .take()
                 .context("variant adapter stderr was unavailable")?;
-            let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-            let captured_lines = Arc::clone(&stderr_lines);
             thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
                     eprintln!("[variant] {line}");
-                    if let Ok(mut lines) = captured_lines.lock() {
-                        lines.push(line);
-                    }
                 }
             });
 
@@ -463,9 +457,9 @@ impl VariantAdapter {
             if ready.url.trim().is_empty() {
                 bail!("variant adapter readiness URL is empty");
             }
-            Ok((ready, stderr_lines))
+            Ok(ready)
         })();
-        let (ready, stderr_lines) = match readiness {
+        let ready = match readiness {
             Ok(readiness) => readiness,
             Err(error) => {
                 let _ = child.kill();
@@ -476,7 +470,6 @@ impl VariantAdapter {
         Ok(Self {
             child,
             url: ready.url,
-            stderr_lines,
         })
     }
 
@@ -490,11 +483,6 @@ impl Drop for VariantAdapter {
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
-        }
-        if let Ok(lines) = self.stderr_lines.lock()
-            && !lines.is_empty()
-        {
-            eprintln!("[variant] stopped after {} diagnostic lines", lines.len());
         }
     }
 }
