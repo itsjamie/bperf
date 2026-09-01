@@ -1531,16 +1531,9 @@ fn promotion_lines(cycle: &HistoryCycle) -> Vec<Line<'static>> {
             cycle.accepted_label.as_deref().unwrap_or("accepted")
         )
     } else if ready {
-        format!("bperf accept {}", bare_cycle_selector(&cycle.selector))
+        cycle.accept_command()
     } else if cycle.promotion.confirmation_required && promotable {
-        format!(
-            "bperf confirm {} {}",
-            cycle
-                .benchmark_module
-                .as_deref()
-                .unwrap_or("<benchmark.bench.ts>"),
-            bare_cycle_selector(&cycle.selector)
-        )
+        cycle.confirm_command()
     } else {
         "measure another candidate".to_owned()
     };
@@ -2069,7 +2062,7 @@ mod tests {
             "readiness   ready",
             "searched    4/5 candidates on b-01",
             "lineage     confirmed, not accepted",
-            "bperf accept 22222222",
+            "bperf accept cycle-22222222222222",
             "accepted-only",
             "graph scope",
             "open artifact",
@@ -2092,6 +2085,34 @@ mod tests {
         assert_eq!(
             artifact_display_root(Path::new("workspace/.bperf/lineages")),
             PathBuf::from("workspace")
+        );
+    }
+
+    #[test]
+    fn promotion_confirmation_command_quotes_the_benchmark_module() {
+        let mut app = test_app();
+        let cycle_id = app.history.cycles[0].cycle_id.clone();
+        let cycle = app.cycle_details.get_mut(&cycle_id).unwrap();
+        cycle.promotion.ready = false;
+        cycle.promotion.confirmation_required = true;
+        cycle.benchmark_module = Some("benchmarks/parser suite's $draft.bench.ts".to_owned());
+
+        let command = promotion_lines(cycle)
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        #[cfg(not(windows))]
+        assert_eq!(
+            command,
+            "bperf confirm 'benchmarks/parser suite'\"'\"'s $draft.bench.ts' cycle-22222222222222"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            command,
+            "bperf confirm 'benchmarks/parser suite''s $draft.bench.ts' cycle-22222222222222"
         );
     }
 

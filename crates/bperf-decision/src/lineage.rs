@@ -373,6 +373,16 @@ pub struct HistoryCycle {
     pub artifacts: Vec<HistoryArtifact>,
 }
 
+impl HistoryCycle {
+    pub fn accept_command(&self) -> String {
+        render_accept_command(&self.selector)
+    }
+
+    pub fn confirm_command(&self) -> String {
+        render_confirm_command(self.benchmark_module.as_deref(), &self.selector)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HistoryChangeSummary {
     pub files_changed: usize,
@@ -758,17 +768,13 @@ impl CycleRecord {
     }
 
     pub fn accept_command(&self) -> String {
-        format!("bperf accept {}", self.selector())
+        render_accept_command(self.selector())
     }
 
     /// Records without a stored module path fall back to a
     /// `<benchmark.bench.ts>` placeholder the caller must substitute.
     pub fn confirm_command(&self) -> String {
-        let benchmark_module = self
-            .benchmark_module
-            .as_deref()
-            .map_or_else(|| "<benchmark.bench.ts>".to_owned(), command_path_argument);
-        format!("bperf confirm {} {}", benchmark_module, self.selector())
+        render_confirm_command(self.benchmark_module.as_deref(), self.selector())
     }
 
     /// The command that advances this cycle toward promotion, or `None` when
@@ -782,6 +788,16 @@ impl CycleRecord {
             }
         })
     }
+}
+
+fn render_accept_command(selector: &str) -> String {
+    format!("bperf accept {selector}")
+}
+
+fn render_confirm_command(benchmark_module: Option<&str>, selector: &str) -> String {
+    let benchmark_module =
+        benchmark_module.map_or_else(|| "<benchmark.bench.ts>".to_owned(), command_path_argument);
+    format!("bperf confirm {benchmark_module} {selector}")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
