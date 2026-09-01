@@ -320,13 +320,16 @@ fn verify_with_process(
     Ok(verdict)
 }
 
-fn read_limited(reader: impl Read, stream: &str) -> Result<Vec<u8>> {
+fn read_limited(mut reader: impl Read, stream: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
+        .by_ref()
         .take(MAX_VERIFIER_OUTPUT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read verifier {stream}"))?;
     if bytes.len() > MAX_VERIFIER_OUTPUT_BYTES {
+        std::io::copy(&mut reader, &mut std::io::sink())
+            .with_context(|| format!("failed to read verifier {stream}"))?;
         bail!("verifier {stream} exceeded {MAX_VERIFIER_OUTPUT_BYTES} bytes");
     }
     Ok(bytes)
@@ -550,6 +553,17 @@ mod tests {
     fn exact_verification_rejects_a_malformed_operation() {
         let error = verify_exact(&[json!({"case_id": "parser"})], &[json!(null)]).unwrap_err();
         assert!(error.to_string().contains("has no expected value"));
+    }
+
+    #[test]
+    fn oversized_verifier_output_is_drained_before_rejection() {
+        let output = vec![b'x'; MAX_VERIFIER_OUTPUT_BYTES + 4096];
+        let mut reader = std::io::Cursor::new(output);
+
+        let error = read_limited(&mut reader, "stdout").unwrap_err();
+
+        assert!(error.to_string().contains("exceeded"));
+        assert_eq!(reader.position(), MAX_VERIFIER_OUTPUT_BYTES as u64 + 4096);
     }
 
     #[test]
