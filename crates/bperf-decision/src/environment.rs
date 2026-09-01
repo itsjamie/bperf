@@ -78,12 +78,11 @@ impl EnvironmentSummary {
             || [&self.platform, &self.arch, &self.os_release]
                 .into_iter()
                 .any(|value| value.trim().is_empty())
-            || self.browser_versions.len() != Engine::ALL.len()
-            || Engine::ALL.into_iter().any(|engine| {
-                self.browser_versions
-                    .get(&engine)
-                    .is_none_or(|version| version.trim().is_empty())
-            })
+            || self.browser_versions.is_empty()
+            || self
+                .browser_versions
+                .values()
+                .any(|version| version.trim().is_empty())
         {
             bail!("persisted environment summary is incomplete or inconsistent");
         }
@@ -106,8 +105,11 @@ impl EnvironmentRecord {
 
 pub fn summary(measurement: &MeasurementSet) -> Result<EnvironmentSummary> {
     let record = read(measurement)?;
-    let browser_versions = Engine::ALL
-        .into_iter()
+    let browser_versions = measurement
+        .benchmark()
+        .engines()
+        .iter()
+        .copied()
         .map(|engine| {
             let version = record
                 .identity
@@ -593,6 +595,20 @@ mod tests {
             linux_os_release("ID=arch\nVERSION_ID=\nBUILD_ID=rolling\n", kernel).unwrap(),
             "arch rolling (kernel 6.8.0-test)"
         );
+    }
+
+    #[test]
+    fn environment_summaries_accept_requested_engine_subsets() {
+        EnvironmentSummary {
+            recorded_at_unix_ms: 1,
+            fingerprint: "environment".to_owned(),
+            platform: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            os_release: "test".to_owned(),
+            browser_versions: BTreeMap::from([(Engine::Chromium, "test".to_owned())]),
+        }
+        .validate("environment")
+        .unwrap();
     }
 
     #[test]

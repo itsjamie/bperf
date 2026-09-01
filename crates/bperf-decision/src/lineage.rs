@@ -254,6 +254,20 @@ fn open_cycle_measurement(cycle: &CycleRecord) -> Result<MeasurementSet> {
 
 fn validate_comparison(measurement: &MeasurementSet, comparison: &ComparisonSummary) -> Result<()> {
     comparison.validate_contract()?;
+    let requested = measurement
+        .benchmark()
+        .engines()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let summarized = comparison
+        .engines
+        .iter()
+        .map(|summary| summary.engine)
+        .collect::<HashSet<_>>();
+    if summarized != requested {
+        bail!("comparison does not cover the measurement's requested browser engines");
+    }
     if comparison.candidate_measurement_set != measurement.measurement_set_id() {
         bail!("comparison candidate does not match the measured source checkpoint");
     }
@@ -3187,6 +3201,27 @@ mod tests {
             outcome: comparison.verdict.clone(),
             comparison,
         }
+    }
+
+    #[test]
+    fn comparisons_cover_every_engine_requested_by_the_measurement() {
+        let temporary = tempdir().unwrap();
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples");
+        let root = bperf_measurement::store::prepare(
+            &examples.join("browser-benchmark.yaml"),
+            &examples.join("browser-variant-baseline.yaml"),
+            Some(20),
+            temporary.path(),
+        )
+        .unwrap();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        let mut comparison = comparison(measurement.measurement_set_id(), "equivalent");
+        comparison.engines.pop();
+
+        let error = validate_comparison(&measurement, &comparison).unwrap_err();
+        assert!(error.to_string().contains("requested browser engines"));
     }
 
     fn comparison(candidate: &str, verdict: &str) -> ComparisonSummary {

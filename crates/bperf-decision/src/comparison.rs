@@ -208,8 +208,11 @@ impl ComparisonSummary {
             .iter()
             .map(|summary| summary.engine)
             .collect::<HashSet<_>>();
-        if self.engines.len() != Engine::ALL.len() || engines != HashSet::from(Engine::ALL) {
-            bail!("comparison summary does not contain every required browser engine");
+        if self.engines.is_empty() {
+            bail!("comparison summary has no browser engine evidence");
+        }
+        if self.engines.len() != engines.len() {
+            bail!("comparison summary repeats a browser engine");
         }
 
         let mut engine_verdicts = Vec::with_capacity(self.engines.len());
@@ -1724,6 +1727,8 @@ mod tests {
             }],
             warnings: vec!["baseline is old".to_owned()],
         };
+
+        summary.validate_contract().unwrap();
 
         assert_eq!(
             summary.render_decision_summary(),
