@@ -967,6 +967,16 @@ fn validate_sampling_results(
             );
         }
     }
+    let calibration_results = schedule
+        .trials
+        .iter()
+        .filter(|trial| trial.phase != TrialPhase::Final)
+        .filter_map(|trial| completed.get(&trial.trial_id))
+        .collect::<Vec<_>>();
+    let expected = sampling::decide(schedule, policy, &calibration_results)?;
+    if decision != &expected {
+        bail!("sampling decision does not match its calibration evidence");
+    }
     Ok(())
 }
 
@@ -1448,6 +1458,49 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             completed_summary
+        );
+    }
+
+    #[test]
+    fn sampling_decision_must_match_its_calibration_evidence() {
+        let directory = tempdir().unwrap();
+        let root = prepare_adaptive(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            "1h".parse().unwrap(),
+            None,
+            directory.path(),
+        )
+        .unwrap();
+        let mut calibrated = MeasurementSet::open(&root).unwrap();
+        while !calibrated.calibration_is_complete() {
+            append_pending(&calibrated);
+            calibrated = MeasurementSet::open(&root).unwrap();
+        }
+        let mut decision = sampling::decide(
+            &calibrated.schedule,
+            &calibrated.benchmark.analysis_policy(),
+            &calibrated.calibration_results(),
+        )
+        .unwrap();
+        decision.strata[0].batch_size += 1;
+
+        let error = calibrated.record_sampling_decision(&decision).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its calibration evidence"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            calibrated
+                .database
+                .read_document_bytes(
+                    MEASUREMENT_DOCUMENTS,
+                    &measurement_document_key(calibrated.measurement_set_id(), "sampling"),
+                )
+                .unwrap()
+                .is_none()
         );
     }
 

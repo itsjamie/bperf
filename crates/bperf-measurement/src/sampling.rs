@@ -90,7 +90,7 @@ impl fmt::Display for RunBudget {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingDecision {
     pub schema_version: u32,
@@ -284,7 +284,7 @@ impl SamplingDecision {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StratumDecision {
     pub workload_id: String,
@@ -303,7 +303,7 @@ const fn single_batch() -> u32 {
     1
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricEstimate {
     pub metric: String,
