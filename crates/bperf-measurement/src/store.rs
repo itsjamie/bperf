@@ -163,13 +163,7 @@ fn prepare_with_sampling(
     let (measurement_set_id, schedule) = match sampling {
         SamplingRequest::Fixed(requested) => {
             let final_samples = benchmark.resolve_final_samples(requested)?;
-            let measurement_set_id = format!(
-                "measure-v{MEASUREMENT_SCHEMA_VERSION}-{}-{}-s{}-n{}",
-                &benchmark.source_sha256()[..12],
-                &variant.source_sha256()[..12],
-                benchmark.schedule_seed(),
-                final_samples
-            );
+            let measurement_set_id = fixed_measurement_set_id(&benchmark, &variant, final_samples);
             let schedule = MeasurementSchedule::build(
                 &benchmark,
                 &variant,
@@ -183,18 +177,11 @@ fn prepare_with_sampling(
                 bail!("measurement cohort must not be empty");
             }
             let (min_final_samples, max_final_samples) = benchmark.adaptive_final_sample_range()?;
-            let cohort_suffix = cohort
-                .as_deref()
-                .map(cohort_key)
-                .map(|key| format!("-c{key}"))
-                .unwrap_or_default();
-            let measurement_set_id = format!(
-                "measure-v{MEASUREMENT_SCHEMA_VERSION}-{}-{}-s{}-b{}{}",
-                &benchmark.source_sha256()[..12],
-                &variant.source_sha256()[..12],
-                benchmark.schedule_seed(),
+            let measurement_set_id = adaptive_measurement_set_id(
+                &benchmark,
+                &variant,
                 budget.milliseconds(),
-                cohort_suffix
+                cohort.as_deref(),
             );
             let schedule = MeasurementSchedule::build_adaptive(
                 &benchmark,
@@ -238,6 +225,38 @@ fn prepare_with_sampling(
         &schedule,
     )?;
     Ok(measurement_root)
+}
+
+fn fixed_measurement_set_id(
+    benchmark: &BenchmarkManifest,
+    variant: &VariantDescriptor,
+    final_samples: u32,
+) -> String {
+    format!(
+        "measure-v{MEASUREMENT_SCHEMA_VERSION}-{}-{}-s{}-n{}",
+        &benchmark.source_sha256()[..12],
+        &variant.source_sha256()[..12],
+        benchmark.schedule_seed(),
+        final_samples
+    )
+}
+
+fn adaptive_measurement_set_id(
+    benchmark: &BenchmarkManifest,
+    variant: &VariantDescriptor,
+    budget_ms: u64,
+    cohort: Option<&str>,
+) -> String {
+    let cohort_suffix = cohort
+        .map(cohort_key)
+        .map(|key| format!("-c{key}"))
+        .unwrap_or_default();
+    format!(
+        "measure-v{MEASUREMENT_SCHEMA_VERSION}-{}-{}-s{}-b{budget_ms}{cohort_suffix}",
+        &benchmark.source_sha256()[..12],
+        &variant.source_sha256()[..12],
+        benchmark.schedule_seed(),
+    )
 }
 
 fn cohort_key(value: &str) -> String {
@@ -315,7 +334,7 @@ impl MeasurementSet {
                 &measurement_document_key(measurement_set_id, "schedule"),
             )?
             .context("measurement set has no schedule")?;
-        validate_schedule(&benchmark, &variant, &schedule)?;
+        validate_schedule(&benchmark, &variant, measurement_set_id, &schedule)?;
         let sampling: Option<SamplingDecision> = database.read_document(
             MEASUREMENT_DOCUMENTS,
             &measurement_document_key(measurement_set_id, "sampling"),
@@ -910,6 +929,7 @@ fn validate_sampling_results(
 fn validate_schedule(
     benchmark: &BenchmarkManifest,
     variant: &VariantDescriptor,
+    measurement_set_id: &str,
     schedule: &MeasurementSchedule,
 ) -> Result<()> {
     if schedule.schema_version != MEASUREMENT_SCHEMA_VERSION {
@@ -927,26 +947,52 @@ fn validate_schedule(
     if schedule.variant_id != variant.id() || schedule.variant_sha256 != variant.source_sha256() {
         bail!("schedule and resolved variant identities do not match");
     }
-    if let SamplingSchedule::Adaptive {
-        budget_ms,
-        min_final_samples,
-    } = schedule.sampling
+    if schedule
+        .cohort
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
     {
-        let (expected_minimum, expected_maximum) = benchmark.adaptive_final_sample_range()?;
-        if budget_ms == 0
-            || min_final_samples != expected_minimum
-            || schedule.final_samples != expected_maximum
-        {
-            bail!("adaptive schedule does not match the resolved benchmark policy");
-        }
+        bail!("measurement cohort must not be empty");
     }
-    let trial_ids: HashSet<_> = schedule
-        .trials
-        .iter()
-        .map(|trial| trial.trial_id.as_str())
-        .collect();
-    if trial_ids.len() != schedule.trials.len() {
-        bail!("schedule contains duplicate trial identifiers");
+    let expected = match schedule.sampling {
+        SamplingSchedule::Fixed => {
+            let final_samples = benchmark.resolve_final_samples(Some(schedule.final_samples))?;
+            let expected_id = fixed_measurement_set_id(benchmark, variant, final_samples);
+            MeasurementSchedule::build(benchmark, variant, expected_id, final_samples)
+        }
+        SamplingSchedule::Adaptive {
+            budget_ms,
+            min_final_samples,
+        } => {
+            let (expected_minimum, expected_maximum) = benchmark.adaptive_final_sample_range()?;
+            if budget_ms == 0
+                || min_final_samples != expected_minimum
+                || schedule.final_samples != expected_maximum
+            {
+                bail!("adaptive schedule does not match the resolved benchmark policy");
+            }
+            let expected_id = adaptive_measurement_set_id(
+                benchmark,
+                variant,
+                budget_ms,
+                schedule.cohort.as_deref(),
+            );
+            MeasurementSchedule::build_adaptive(
+                benchmark,
+                variant,
+                expected_id,
+                budget_ms,
+                expected_minimum,
+                expected_maximum,
+                schedule.cohort.clone(),
+            )
+        }
+    };
+    if expected.measurement_set_id != measurement_set_id {
+        bail!("measurement directory does not match its deterministic schedule identity");
+    }
+    if schedule != &expected {
+        bail!("schedule does not match the deterministic benchmark capture contract");
     }
     Ok(())
 }
@@ -1250,6 +1296,33 @@ mod tests {
         let reopened = MeasurementSet::open(&root).unwrap();
         assert!(reopened.final_is_complete());
         assert!(!root.join("trials.jsonl").exists());
+    }
+
+    #[test]
+    fn stored_schedules_cannot_omit_requested_engine_trials() {
+        let benchmark = BenchmarkManifest::load(&example("browser-benchmark.yaml")).unwrap();
+        let variant = VariantDescriptor::load(&example("browser-variant-baseline.yaml")).unwrap();
+        let final_samples = benchmark.resolve_final_samples(Some(20)).unwrap();
+        let measurement_set_id = fixed_measurement_set_id(&benchmark, &variant, final_samples);
+        let mut schedule = MeasurementSchedule::build(
+            &benchmark,
+            &variant,
+            measurement_set_id.clone(),
+            final_samples,
+        );
+        validate_schedule(&benchmark, &variant, &measurement_set_id, &schedule).unwrap();
+
+        schedule
+            .trials
+            .retain(|trial| trial.engine != Engine::Webkit);
+        let error =
+            validate_schedule(&benchmark, &variant, &measurement_set_id, &schedule).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic benchmark capture contract"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

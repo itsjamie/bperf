@@ -10,7 +10,7 @@ use crate::{
     manifest::{BenchmarkManifest, VariantDescriptor},
 };
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeasurementSchedule {
     pub schema_version: u32,
@@ -149,7 +149,7 @@ impl TrialPhase {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduledTrial {
     pub trial_id: String,
