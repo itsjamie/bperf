@@ -182,10 +182,20 @@ pub struct ComparisonSummary {
 
 impl ComparisonSummary {
     pub(crate) fn validate_contract(&self) -> Result<()> {
+        if self.comparison_id.trim().is_empty() {
+            bail!("comparison summary has an empty comparison identity");
+        }
         if self.baseline_measurement_set.trim().is_empty()
             || self.candidate_measurement_set.trim().is_empty()
         {
             bail!("comparison summary has an empty measurement-set identity");
+        }
+        if self
+            .environment_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint.trim().is_empty())
+        {
+            bail!("comparison summary has an empty environment fingerprint");
         }
         if self.policy != "strict_all" {
             bail!(
@@ -295,7 +305,13 @@ impl EngineSummary {
                 anchor.status
             );
         }
-        for metric in self.metrics.values() {
+        if self.metrics.is_empty() {
+            bail!("{} comparison has no primary metric evidence", self.engine);
+        }
+        for (name, metric) in &self.metrics {
+            if name.trim().is_empty() {
+                bail!("{} comparison has an empty metric identity", self.engine);
+            }
             if !matches!(
                 metric.classification.as_str(),
                 "improved" | "regressed" | "equivalent" | "inconclusive"
@@ -315,7 +331,7 @@ impl EngineSummary {
             || self
                 .anchor
                 .as_ref()
-                .is_some_and(|anchor| anchor.status != "stable")
+                .is_none_or(|anchor| anchor.status != "stable")
         {
             return Ok("inconclusive");
         }
@@ -1643,13 +1659,38 @@ mod tests {
                         drift_pct: Some(0.0),
                         ci_pct: Some([-1.0, 1.0]),
                     }),
-                    metrics: BTreeMap::new(),
+                    metrics: BTreeMap::from([(
+                        "workload.wall_ms".to_owned(),
+                        MetricSummary {
+                            improvement_pct: Some(0.0),
+                            ci_pct: Some([-1.0, 1.0]),
+                            classification: "equivalent".to_owned(),
+                            guardrail_regressed: false,
+                            baseline_value: Some(100.0),
+                            candidate_value: Some(100.0),
+                        },
+                    )]),
                 })
                 .collect(),
             warnings: Vec::new(),
         };
         summary.validate_contract().unwrap();
+        let valid_engine = summary.engines[0].clone();
 
+        summary.engines[0].anchor = None;
+        let error = summary.validate_contract().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its decision evidence")
+        );
+
+        summary.engines[0] = valid_engine.clone();
+        summary.engines[0].metrics.clear();
+        let error = summary.validate_contract().unwrap_err();
+        assert!(error.to_string().contains("no primary metric evidence"));
+
+        summary.engines[0] = valid_engine.clone();
         summary.verdict = "positive".to_owned();
         let error = summary.validate_contract().unwrap_err();
         assert!(
@@ -1659,6 +1700,7 @@ mod tests {
         );
 
         summary.verdict = "equivalent".to_owned();
+        summary.engines[0] = valid_engine;
         summary.engines[0].verdict = "negative".to_owned();
         let error = summary.validate_contract().unwrap_err();
         assert!(

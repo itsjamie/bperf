@@ -2862,7 +2862,11 @@ mod tests {
                     engine,
                     verdict: verdict.to_owned(),
                     correctness: "pass".to_owned(),
-                    anchor: None,
+                    anchor: Some(crate::comparison::AnchorSummary {
+                        status: "stable".to_owned(),
+                        drift_pct: Some(0.0),
+                        ci_pct: Some([-1.0, 1.0]),
+                    }),
                     metrics: BTreeMap::from([(
                         "workload.wall_ms".to_owned(),
                         MetricSummary {
