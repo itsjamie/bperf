@@ -1484,7 +1484,7 @@ fn render_action(frame: &mut Frame<'_>, area: Rect, app: &App, module: &Benchmar
         );
         if inner.height >= 4 {
             let label = format!("enter  record a message and run {}", module.id);
-            let button_width = u16::try_from(label.chars().count() + 4)
+            let button_width = u16::try_from(display_width(&label) + 4)
                 .unwrap_or(inner.width)
                 .min(inner.width);
             let button = Rect::new(inner.x, inner.y + 2, button_width, 3);
