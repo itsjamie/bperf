@@ -261,16 +261,17 @@ fn verify_with_process(
         .context("verifier stderr was unavailable")?;
     let stdout_reader = thread::spawn(move || read_limited(stdout, "stdout"));
     let stderr_reader = thread::spawn(move || read_limited(stderr, "stderr"));
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("verifier stdin was unavailable")?;
-        serde_json::to_writer(&mut stdin, payload).context("failed to encode verifier payload")?;
+    let mut input = serde_json::to_vec(payload).context("failed to encode verifier payload")?;
+    input.push(b'\n');
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("verifier stdin was unavailable")?;
+    let stdin_writer = thread::spawn(move || {
         stdin
-            .write_all(b"\n")
-            .context("failed to terminate verifier payload")?;
-    }
+            .write_all(&input)
+            .context("failed to write verifier payload")
+    });
 
     let status = loop {
         if let Some(status) = child.try_wait().context("failed waiting for verifier")? {
@@ -279,12 +280,16 @@ fn verify_with_process(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdin_writer.join();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             bail!("workload verifier exceeded its {:?} timeout", timeout);
         }
         thread::sleep(Duration::from_millis(10));
     };
+    stdin_writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("verifier stdin writer panicked"))??;
     let stdout = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("verifier stdout reader panicked"))??;
@@ -489,6 +494,8 @@ impl Drop for VariantAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use serde_json::json;
 
     use super::*;
@@ -543,5 +550,49 @@ mod tests {
     fn exact_verification_rejects_a_malformed_operation() {
         let error = verify_exact(&[json!({"case_id": "parser"})], &[json!(null)]).unwrap_err();
         assert!(error.to_string().contains("has no expected value"));
+    }
+
+    #[test]
+    fn verifier_timeout_covers_a_blocked_stdin_write() {
+        let operations = [json!({"value": "x".repeat(8 * 1024 * 1024)})];
+        let results = [json!(null)];
+        let payload = VerifierPayload {
+            schema_version: 1,
+            benchmark_id: "benchmark",
+            subject_id: "subject",
+            variant_id: "variant",
+            workload_id: "workload",
+            engine: Engine::Chromium,
+            phase: TrialPhase::Final,
+            sample_index: 0,
+            operations: &operations,
+            workload_result: &results,
+        };
+        let command = vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "benchmark_runtime::tests::verifier_process_that_ignores_stdin".to_owned(),
+        ];
+        let started = Instant::now();
+        let error = verify_with_process(
+            &payload,
+            &command,
+            Duration::from_millis(250),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded its"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for verifier_timeout_covers_a_blocked_stdin_write"]
+    fn verifier_process_that_ignores_stdin() {
+        thread::sleep(Duration::from_secs(10));
     }
 }
