@@ -781,6 +781,16 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
         target_id: &str,
         target_type: &str,
     ) -> Result<()> {
+        // Captured realms are page-local and normally few; add a target-id index
+        // if O(n²) attachment validation becomes measurable.
+        if self.sessions.contains_key(session_id)
+            || self
+                .sessions
+                .values()
+                .any(|session| session.target_id == target_id)
+        {
+            bail!("Chromium reported a duplicate target attachment");
+        }
         let capture_scope = match target_type {
             "worker" => {
                 let scope = format!("worker-{}", self.next_worker_scope);
@@ -1644,6 +1654,29 @@ mod tests {
             .expect("unissued response was accepted");
         assert!(error.to_string().contains("unissued response id 1"));
         assert!(connection.responses.is_empty());
+    }
+
+    #[test]
+    fn duplicate_target_attachments_are_rejected_before_initialization() {
+        let mut connection =
+            CdpConnection::new(ScriptedTransport::default(), PathBuf::from("downloads"));
+        connection.sessions.insert(
+            "session".to_owned(),
+            SessionState::page("target".to_owned()),
+        );
+
+        assert!(
+            connection
+                .initialize_autoattached_target("session", "other-target", "worker")
+                .is_err()
+        );
+        assert!(
+            connection
+                .initialize_autoattached_target("other-session", "target", "worker")
+                .is_err()
+        );
+        assert_eq!(connection.sessions.len(), 1);
+        assert!(connection.process.sent.is_empty());
     }
 
     #[test]
