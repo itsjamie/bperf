@@ -68,6 +68,7 @@ impl PlaywrightInstallation {
 
     pub(crate) fn browser(&self, name: BrowserName) -> Result<InstalledBrowser> {
         let artifact = self.artifact(name)?;
+        validate_installed_artifact(&artifact)?;
         Ok(InstalledBrowser {
             browser_version: artifact.browser_version,
             directory: artifact.directory,
@@ -123,6 +124,7 @@ impl PlaywrightInstallation {
 
     fn install_browser(&self, artifact: BrowserArtifact) -> Result<()> {
         if artifact.executable.is_file() && artifact.directory.join(INSTALLATION_MARKER).is_file() {
+            validate_installed_artifact(&artifact)?;
             println!(
                 "{} {} is already installed at {}",
                 artifact.name.registry_name(),
@@ -204,6 +206,7 @@ impl PlaywrightInstallation {
             if artifact.executable.is_file()
                 && artifact.directory.join(INSTALLATION_MARKER).is_file()
             {
+                validate_installed_artifact(&artifact)?;
                 return Ok(());
             }
             return Err(error).with_context(|| {
@@ -222,6 +225,55 @@ impl PlaywrightInstallation {
         );
         Ok(())
     }
+}
+
+fn validate_installed_artifact(artifact: &BrowserArtifact) -> Result<()> {
+    let directory_metadata = match fs::symlink_metadata(&artifact.directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect browser installation {}",
+                    artifact.directory.display()
+                )
+            });
+        }
+    };
+    if !directory_metadata.is_dir() {
+        bail!(
+            "browser installation path is not a directory: {}",
+            artifact.directory.display()
+        );
+    }
+
+    let relative_executable = artifact
+        .executable
+        .strip_prefix(&artifact.directory)
+        .context("browser executable escaped its installation directory")?;
+    // The standard process API cannot bind validation to launch; preventing
+    // concurrent replacement requires platform-specific handle-based execution.
+    let mut path = artifact.directory.clone();
+    for component in relative_executable.components() {
+        path.push(component);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect browser path {}", path.display()));
+            }
+        };
+        let expected = if path == artifact.executable {
+            metadata.is_file()
+        } else {
+            metadata.is_dir()
+        };
+        if !expected {
+            bail!("browser installation contains an alias: {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn write_installation_receipt(directory: &Path, metadata: &str) -> Result<()> {
@@ -862,6 +914,34 @@ mod tests {
             .unwrap(),
             ["https://override.example.test/root/browser.zip"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_browser_executables_cannot_be_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let installation = PlaywrightInstallation {
+            distribution: Registry::embedded().unwrap(),
+            host: HostPlatform {
+                browser_artifact: "win64".to_owned(),
+                native_dependencies: native_dependencies::Capability::NotRequired,
+            },
+            browser_cache: cache.path().to_owned(),
+        };
+        let artifact = installation
+            .artifact(BrowserName::ChromiumHeadlessShell)
+            .unwrap();
+        fs::create_dir_all(artifact.executable.parent().unwrap()).unwrap();
+        let outside = cache.path().join("outside.exe");
+        fs::write(&outside, b"foreign executable").unwrap();
+        symlink(&outside, &artifact.executable).unwrap();
+
+        let error = installation
+            .browser(BrowserName::ChromiumHeadlessShell)
+            .unwrap_err();
+        assert!(error.to_string().contains("contains an alias"));
     }
 
     #[test]
