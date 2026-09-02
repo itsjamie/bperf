@@ -25,6 +25,9 @@ const MAX_RDP_HEADER_BYTES: usize = 64 * 1024;
 // Bulk replies are buffered because profiler parsing needs the complete document.
 // Stream them into their consumers before raising this ceiling.
 const MAX_RDP_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+// Profile JSON is fully buffered before parsing. Raise this only after Firefox
+// profile validation and artifact persistence operate on a bounded stream.
+const MAX_PROFILE_JSON_BYTES: u64 = 512 * 1024 * 1024;
 const PROFILER_CHILD_START_DELAY: Duration = Duration::from_millis(100);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_SNAPSHOT_PREFIX: &str = "Firefox emitted an invalid .fxsnapshot: ";
@@ -129,12 +132,7 @@ impl FirefoxDebugSession {
             "type": "getPreviouslyCapturedProfileDataBulk",
             "handle": handle,
         }))?;
-        let mut source = String::new();
-        GzDecoder::new(compressed.as_slice())
-            .read_to_string(&mut source)
-            .context("Firefox profiler returned invalid gzip data")?;
-        serde_json::from_str::<Value>(&source).context("Firefox profiler returned invalid JSON")?;
-        Ok(source)
+        decompress_profile(&compressed, MAX_PROFILE_JSON_BYTES)
     }
 
     pub(crate) fn capture_heap(
@@ -199,6 +197,23 @@ impl FirefoxDebugSession {
             ))),
         }
     }
+}
+
+fn decompress_profile(compressed: &[u8], max_bytes: u64) -> Result<String> {
+    let read_limit = max_bytes
+        .checked_add(1)
+        .context("Firefox profile size limit overflowed")?;
+    let mut source = Vec::new();
+    GzDecoder::new(compressed)
+        .take(read_limit)
+        .read_to_end(&mut source)
+        .context("Firefox profiler returned invalid gzip data")?;
+    let source_bytes =
+        u64::try_from(source.len()).context("Firefox profile size does not fit in u64")?;
+    if source_bytes > max_bytes {
+        bail!("Firefox profiler exceeded the {max_bytes} byte profile limit");
+    }
+    String::from_utf8(source).context("Firefox profiler returned non-UTF-8 profile data")
 }
 
 fn profiler_start_request(perf_actor: &str) -> Value {
@@ -807,6 +822,7 @@ fn invalid_snapshot(reason: impl std::fmt::Display) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use flate2::{Compression, write::GzEncoder};
     use tempfile::tempdir;
 
     use super::*;
@@ -848,6 +864,16 @@ mod tests {
     fn rdp_headers_have_a_bounded_read() {
         let mut input = std::io::Cursor::new(vec![b'x'; MAX_RDP_HEADER_BYTES + 1]);
         assert!(read_rdp_header(&mut input).is_err());
+    }
+
+    #[test]
+    fn compressed_profiles_cannot_expand_past_the_memory_limit() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(br#"{"profile":"too large"}"#).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let error = decompress_profile(&compressed, 8).unwrap_err();
+        assert!(error.to_string().contains("profile limit"));
     }
 
     #[test]
