@@ -199,7 +199,9 @@ impl Database {
     fn connect_read(&self) -> Result<Connection> {
         let connection = Connection::open_with_flags(
             &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .with_context(|| format!("failed to open bperf database {}", self.path.display()))?;
         connection
@@ -215,8 +217,11 @@ impl Database {
     }
 
     fn connect_write(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.path)
-            .with_context(|| format!("failed to open bperf database {}", self.path.display()))?;
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .with_context(|| format!("failed to open bperf database {}", self.path.display()))?;
         connection
             .busy_timeout(Duration::from_secs(30))
             .context("failed to configure bperf database lock timeout")?;
@@ -771,5 +776,27 @@ mod tests {
                 .unwrap(),
             7
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_open_does_not_follow_an_alias() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let outside = directory.path().join("outside.sqlite3");
+        drop(Connection::open(&outside).unwrap());
+        symlink(&outside, directory.path().join(DATABASE_NAME)).unwrap();
+
+        assert!(Database::open(directory.path()).is_err());
+        let outside = Connection::open(outside).unwrap();
+        let tables: i64 = outside
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'storage_documents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 }
