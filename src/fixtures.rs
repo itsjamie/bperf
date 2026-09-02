@@ -380,6 +380,7 @@ fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
     let mut descriptors = BTreeSet::new();
     for entry in &lock.fixtures {
         validate_descriptor(&entry.descriptor)?;
+        validate_provenance(entry)?;
         if !descriptors.insert(fixture_key(&entry.descriptor)?) {
             bail!("fixture lock contains duplicate descriptors");
         }
@@ -388,6 +389,31 @@ fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
         }
     }
     Ok(lock.fixtures)
+}
+
+fn validate_provenance(entry: &FixtureLockEntry) -> Result<()> {
+    match (
+        remote_uri(&entry.descriptor.source)?,
+        entry.source_url.as_deref(),
+        entry.final_url.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(source), Some(recorded), Some(final_url)) if source == recorded => {
+            let final_uri = remote_uri(final_url)?
+                .context("fixture lock has a non-HTTP(S) final remote URL")?;
+            if source
+                .scheme_str()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                && final_uri
+                    .scheme_str()
+                    .is_none_or(|scheme| !scheme.eq_ignore_ascii_case("https"))
+            {
+                bail!("fixture lock records an HTTPS downgrade");
+            }
+            Ok(())
+        }
+        _ => bail!("fixture lock has inconsistent source provenance"),
+    }
 }
 
 fn validate_body(
@@ -629,6 +655,23 @@ mod tests {
 
         let error = read_lock(&lock).err().expect("duplicate lock was accepted");
         assert!(error.to_string().contains("duplicate descriptors"));
+    }
+
+    #[test]
+    fn local_fixture_locks_cannot_claim_remote_provenance() {
+        let entry: FixtureLockEntry = serde_json::from_value(json!({
+            "descriptor": {"source": "fixture.txt"},
+            "source_url": "https://example.com/fixture.txt",
+            "final_url": "https://example.com/fixture.txt",
+            "body_path": "unused",
+            "sha256": "0".repeat(64),
+            "size_bytes": 0,
+            "content_type": "text/plain",
+        }))
+        .unwrap();
+
+        let error = validate_provenance(&entry).unwrap_err();
+        assert!(error.to_string().contains("inconsistent source provenance"));
     }
 
     #[test]
