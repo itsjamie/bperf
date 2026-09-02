@@ -183,10 +183,16 @@ pub(crate) fn resolve(
         .into_iter()
         .map(|entry| fixture_key(&entry.descriptor).map(|key| (key, entry)))
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut descriptor_keys = BTreeSet::new();
+    for descriptor in descriptors {
+        validate_descriptor(descriptor)?;
+        if !descriptor_keys.insert(fixture_key(descriptor)?) {
+            bail!("managed benchmark contains duplicate fixture descriptors");
+        }
+    }
     let agent = ureq::agent();
     let mut entries = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
-        validate_descriptor(descriptor)?;
         let key = fixture_key(descriptor)?;
         let pinned = existing
             .get(&key)
@@ -653,6 +659,33 @@ mod tests {
 
         let error = read_lock(&lock).err().expect("duplicate lock was accepted");
         assert!(error.to_string().contains("duplicate descriptors"));
+    }
+
+    #[test]
+    fn fixture_resolution_does_not_write_duplicate_lock_entries() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let benchmark = root.join("sample.bench.ts");
+        let source = root.join("fixture.txt");
+        let lock = root.join("fixture-lock.json");
+        let cache = root.join("objects");
+        fs::write(&benchmark, "export default 1;\n").unwrap();
+        fs::write(&source, b"fixture").unwrap();
+        let descriptor: FixtureDescriptor =
+            serde_json::from_value(json!({"source": "fixture.txt"})).unwrap();
+
+        let error = resolve(
+            root,
+            &benchmark,
+            &lock,
+            &cache,
+            &[descriptor.clone(), descriptor],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate fixture descriptors"));
+        assert!(!lock.exists());
+        assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
     }
 
     #[test]
