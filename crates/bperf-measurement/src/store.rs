@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::{ArtifactEvidence, Engine, TrialBatchConfig};
-use bperf_storage::database::Database;
+use bperf_storage::{create_contained_directory, database::Database};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -195,19 +195,8 @@ fn prepare_with_sampling(
             (measurement_set_id, schedule)
         }
     };
-    let measurement_root = artifact_root.join(&measurement_set_id);
-    fs::create_dir_all(&measurement_root).with_context(|| {
-        format!(
-            "failed to create measurement directory {}",
-            measurement_root.display()
-        )
-    })?;
-    let measurement_root = fs::canonicalize(&measurement_root).with_context(|| {
-        format!(
-            "failed to resolve measurement directory {}",
-            measurement_root.display()
-        )
-    })?;
+    let measurement_root =
+        create_contained_directory(artifact_root, Path::new(&measurement_set_id))?;
     let database = Database::for_collection(artifact_root, "measurements")?;
     database.publish_document_bytes(
         MEASUREMENT_DOCUMENTS,
@@ -406,14 +395,15 @@ impl MeasurementSet {
         &self.schedule
     }
 
-    pub fn preflight_run_root(&self, run_id: &str) -> PathBuf {
-        self.root.join(PREFLIGHT_CAPTURE_DIRECTORY).join(run_id)
+    pub fn preflight_run_root(&self, run_id: &str) -> Result<PathBuf> {
+        create_contained_directory(
+            &self.root,
+            &Path::new(PREFLIGHT_CAPTURE_DIRECTORY).join(run_id),
+        )
     }
 
     pub fn freeze_workload(&self, workload_id: &str, content: &[u8]) -> Result<()> {
-        let root = self.root.join(FROZEN_WORKLOAD_DIRECTORY);
-        fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create {}", root.display()))?;
+        let root = create_contained_directory(&self.root, Path::new(FROZEN_WORKLOAD_DIRECTORY))?;
         write_immutable(&root.join(format!("{workload_id}.json")), content)
     }
 
@@ -1712,7 +1702,10 @@ mod tests {
         )
         .unwrap();
         let measurement = MeasurementSet::open(&root).unwrap();
-        let preflight_marker = measurement.preflight_run_root("test").join("capture.bin");
+        let preflight_marker = measurement
+            .preflight_run_root("test")
+            .unwrap()
+            .join("capture.bin");
         let workload_marker = root.join("workloads").join("checkout.json");
         fs::create_dir_all(preflight_marker.parent().unwrap()).unwrap();
         fs::write(&preflight_marker, b"capture").unwrap();

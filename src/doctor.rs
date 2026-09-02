@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,11 +28,7 @@ pub fn run(options: DoctorOptions) -> Result<()> {
     }
 
     let run_id = unique_run_id()?;
-    let run_root = artifact_root.join(&run_id);
-    fs::create_dir_all(&run_root)
-        .with_context(|| format!("failed to create {}", run_root.display()))?;
-    let run_root = fs::canonicalize(&run_root)
-        .with_context(|| format!("failed to resolve {}", run_root.display()))?;
+    let run_root = bperf_storage::create_contained_directory(&artifact_root, Path::new(&run_id))?;
 
     let results = BrowserLab::run(runtime, |browser_lab| {
         let mut results = Vec::with_capacity(engines.len());

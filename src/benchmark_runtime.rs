@@ -60,11 +60,12 @@ impl BenchmarkRuntime {
             .workloads
             .get(&trial.workload_id)
             .with_context(|| format!("workload {} was not loaded", trial.workload_id))?;
-        let artifact_root = measurement
-            .root()
-            .join("artifacts")
-            .join(&trial.trial_id)
-            .join(format!("attempt-{attempt:04}"));
+        let artifact_root = bperf_storage::create_contained_directory(
+            measurement.root(),
+            &Path::new("artifacts")
+                .join(&trial.trial_id)
+                .join(format!("attempt-{attempt:04}")),
+        )?;
         let mut evidence = browser_lab.measure_trial(BrowserTrialRequest {
             engine: trial.engine,
             artifact_root: &artifact_root,

@@ -5,7 +5,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -15,6 +15,69 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 
 pub mod database;
+
+/// Creates a directory below `root` without following pre-existing symlink
+/// components. The root itself is resolved as the caller-selected boundary.
+pub fn create_contained_directory(root: &Path, relative: &Path) -> Result<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!(
+            "contained directory path must be relative and normalized: {}",
+            relative.display()
+        );
+    }
+
+    fs::create_dir_all(root)
+        .with_context(|| format!("failed to create storage root {}", root.display()))?;
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve storage root {}", root.display()))?;
+    let mut directory = root.clone();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            unreachable!("relative path components were validated")
+        };
+        directory.push(name);
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&directory).with_context(|| {
+                    format!(
+                        "failed to inspect storage directory {}",
+                        directory.display()
+                    )
+                })?;
+                if !metadata.is_dir() {
+                    bail!("storage path is not a directory: {}", directory.display());
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create storage directory {}", directory.display())
+                });
+            }
+        }
+    }
+
+    // Preventing a hostile concurrent rename requires descriptor-relative
+    // traversal (openat); the final check still detects such a race.
+    let directory = fs::canonicalize(&directory).with_context(|| {
+        format!(
+            "failed to resolve storage directory {}",
+            directory.display()
+        )
+    })?;
+    if !directory.starts_with(&root) {
+        bail!(
+            "storage directory escaped its root: {} is outside {}",
+            directory.display(),
+            root.display()
+        );
+    }
+    Ok(directory)
+}
 
 /// Publishes immutable content without ever exposing a partially written final
 /// path. A concurrent publisher of identical content is accepted.
@@ -240,6 +303,22 @@ mod tests {
 
         assert!(publish_immutable(&path, b"complete").is_err());
         assert!(fs::symlink_metadata(path).unwrap().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_directory_creation_does_not_follow_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("alias")).unwrap();
+
+        assert!(create_contained_directory(&root, Path::new("alias/child")).is_err());
+        assert!(!outside.join("child").exists());
     }
 
     #[test]

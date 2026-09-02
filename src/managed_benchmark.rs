@@ -520,10 +520,7 @@ fn materialize(
     let state_root = absolute_directory(state_root)?;
     let object_root = absolute_directory(object_root)?;
     let key = benchmark_key(&benchmark);
-    let generated_root = state_root.join(key);
-    fs::create_dir_all(&generated_root)
-        .with_context(|| format!("failed to create {}", generated_root.display()))?;
-    let generated_root = fs::canonicalize(&generated_root)?;
+    let generated_root = bperf_storage::create_contained_directory(&state_root, Path::new(&key))?;
     let fixture_lock = generated_root.join("fixture-lock.json");
     let project_bundle = project_modules::bundle(&root, &benchmark, &generated_root)?;
     let project = PreparedBenchmarkProject {
@@ -790,8 +787,8 @@ fn write_inputs(
     description: &ManagedDescription,
     trial_policy: TrialPolicy,
 ) -> Result<MaterializedInputs> {
-    let workload_root = generated_root.join("workloads");
-    fs::create_dir_all(&workload_root)?;
+    let workload_root =
+        bperf_storage::create_contained_directory(generated_root, Path::new("workloads"))?;
 
     let mut benchmark_identity_files = BTreeSet::from([
         path_value(project.benchmark),

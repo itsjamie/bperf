@@ -12,7 +12,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::{ArtifactKind, Engine};
 use bperf_measurement::{manifest::VariantDescriptor, store::MeasurementSet};
-use bperf_storage::database::{Database, DatabaseReader, WriteTransaction};
+use bperf_storage::{
+    create_contained_directory,
+    database::{Database, DatabaseReader, WriteTransaction},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1020,9 +1023,7 @@ struct LineageStore {
 
 impl LineageStore {
     fn open(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root)
-            .with_context(|| format!("failed to create lineage store {}", root.display()))?;
-        fs::create_dir_all(root.join("objects"))
+        create_contained_directory(root, Path::new("objects"))
             .context("failed to create lineage object directory")?;
         Self::load(root)
     }

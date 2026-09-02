@@ -137,7 +137,7 @@ pub(crate) struct EnvironmentPair {
 }
 
 pub fn capture(browser_lab: &mut BrowserLab, measurement: &MeasurementSet) -> Result<String> {
-    let run_root = measurement.preflight_run_root(&unique_id("run")?);
+    let run_root = measurement.preflight_run_root(&unique_id("run")?)?;
     let mut captures = Vec::new();
     for engine in measurement.benchmark().engines() {
         eprintln!("[measure] preflight {engine}");
