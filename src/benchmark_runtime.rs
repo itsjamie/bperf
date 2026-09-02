@@ -275,16 +275,26 @@ fn verify_with_process(
             .context("failed to write verifier payload")
     });
 
+    let mut status = None;
     let status = loop {
-        if let Some(status) = child.try_wait().context("failed waiting for verifier")? {
-            break status;
+        if status.is_none() {
+            status = child.try_wait().context("failed waiting for verifier")?;
+        }
+        if status.is_some()
+            && stdin_writer.is_finished()
+            && stdout_reader.is_finished()
+            && stderr_reader.is_finished()
+        {
+            break status.take().context("verifier status disappeared")?;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdin_writer.join();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Descendants can retain inherited pipes after the direct child
+            // exits. Process-tree cleanup is platform-specific, so detach the
+            // pipe threads here rather than letting them defeat the deadline.
             bail!("workload verifier exceeded its {:?} timeout", timeout);
         }
         thread::sleep(Duration::from_millis(10));
@@ -635,6 +645,62 @@ mod tests {
 
         assert!(error.to_string().contains("exceeded its"));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn verifier_timeout_covers_pipes_inherited_by_descendants() {
+        let payload = VerifierPayload {
+            schema_version: 1,
+            benchmark_id: "benchmark",
+            subject_id: "subject",
+            variant_id: "variant",
+            workload_id: "workload",
+            engine: Engine::Chromium,
+            phase: TrialPhase::Final,
+            sample_index: 0,
+            operations: &[],
+            workload_result: &[],
+        };
+        let command = vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "benchmark_runtime::tests::verifier_process_with_inheriting_descendant".to_owned(),
+        ];
+        let started = Instant::now();
+        let error = verify_with_process(
+            &payload,
+            &command,
+            Duration::from_millis(250),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded its"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for verifier_timeout_covers_pipes_inherited_by_descendants"]
+    fn verifier_process_with_inheriting_descendant() {
+        let mut descendant = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "benchmark_runtime::tests::verifier_descendant_holding_pipes",
+            ])
+            .spawn()
+            .unwrap();
+        thread::spawn(move || descendant.wait());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for verifier_timeout_covers_pipes_inherited_by_descendants"]
+    fn verifier_descendant_holding_pipes() {
+        thread::sleep(Duration::from_secs(2));
     }
 
     #[test]
