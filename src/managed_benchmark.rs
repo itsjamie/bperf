@@ -938,9 +938,6 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 }
 
 fn write_generated(path: &Path, content: &[u8]) -> Result<()> {
-    if fs::read(path).is_ok_and(|existing| existing == content) {
-        return Ok(());
-    }
     bperf_storage::replace_file(path, content)
         .with_context(|| format!("failed to write {}", path.display()))
 }

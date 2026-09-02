@@ -227,10 +227,8 @@ pub(crate) fn resolve(
         )
     })?;
     let body = format!("{}\n", serde_json::to_string_pretty(&lock)?);
-    if !fs::read(lock_path).is_ok_and(|existing| existing == body.as_bytes()) {
-        bperf_storage::replace_file(lock_path, body.as_bytes())
-            .with_context(|| format!("failed to write fixture lock {}", lock_path.display()))?;
-    }
+    bperf_storage::replace_file(lock_path, body.as_bytes())
+        .with_context(|| format!("failed to write fixture lock {}", lock_path.display()))?;
     let fixture_lock = fs::canonicalize(lock_path)
         .with_context(|| format!("failed to resolve fixture lock {}", lock_path.display()))?;
     let mut fixture_files = lock
@@ -835,9 +833,7 @@ mod tests {
 
         let error = cache_body(cache.path(), &body[..], "fixture").unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("outside the content-addressed fixture cache"),
+            format!("{error:#}").contains("immutable path is not a regular file"),
             "unexpected error: {error:#}"
         );
     }

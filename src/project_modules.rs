@@ -3,7 +3,6 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -178,19 +177,12 @@ pub(crate) fn bundle(
 fn materialize_browser_sdk(output_root: &Path) -> Result<PathBuf> {
     let source = BROWSER_SDK_SOURCE.as_bytes();
     let path = output_root.join(format!("bperf-browser-sdk-{:x}.ts", Sha256::digest(source)));
-    if !path.exists() {
-        let mut staged = tempfile::NamedTempFile::new_in(output_root)
-            .context("failed to stage the embedded browser authoring module")?;
-        staged
-            .write_all(source)
-            .context("failed to write the embedded browser authoring module")?;
-        bperf_storage::publish_staged_immutable(&path, staged).with_context(|| {
-            format!(
-                "failed to persist the embedded browser authoring module {}",
-                path.display()
-            )
-        })?;
-    }
+    bperf_storage::publish_immutable(&path, source).with_context(|| {
+        format!(
+            "failed to persist the embedded browser authoring module {}",
+            path.display()
+        )
+    })?;
     let materialized = fs::read(&path)
         .with_context(|| format!("failed to read browser authoring module {}", path.display()))?;
     if materialized != source {
@@ -406,9 +398,6 @@ fn relative_path(root: &Path, target: &Path) -> Result<String> {
 }
 
 fn write_generated(path: &Path, content: &[u8]) -> Result<()> {
-    if fs::read(path).is_ok_and(|existing| existing == content) {
-        return Ok(());
-    }
     bperf_storage::replace_file(path, content)
         .with_context(|| format!("failed to write {}", path.display()))
 }
@@ -549,5 +538,22 @@ mod tests {
 
         assert_eq!(fs::read(second.bundle_file()).unwrap(), first_source);
         assert_eq!(fs::read(second.metadata_file()).unwrap(), first_metadata);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_files_replace_identical_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = temporary.path().join("outside");
+        let generated = temporary.path().join("generated");
+        fs::write(&outside, b"same").unwrap();
+        symlink(&outside, &generated).unwrap();
+
+        write_generated(&generated, b"same").unwrap();
+
+        assert!(!fs::symlink_metadata(&generated).unwrap().is_symlink());
+        assert_eq!(fs::read(generated).unwrap(), b"same");
     }
 }

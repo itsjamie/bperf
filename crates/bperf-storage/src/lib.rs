@@ -22,13 +22,13 @@ pub fn publish_immutable(path: &Path, content: &[u8]) -> Result<()> {
     let parent = parent_directory(path)?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create storage directory {}", parent.display()))?;
-    match fs::read(path) {
-        Ok(existing) if existing == content => return Ok(()),
-        Ok(_) => bail!("immutable file collision at {}", path.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+    if let Some(existing) = open_existing_immutable(path)? {
+        if files_equal(content, existing)
+            .with_context(|| format!("failed to compare immutable file {}", path.display()))?
+        {
+            return Ok(());
         }
+        bail!("immutable file collision at {}", path.display());
     }
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("failed to stage immutable file {}", path.display()))?;
@@ -60,8 +60,12 @@ pub fn publish_staged_immutable(path: &Path, staged: tempfile::NamedTempFile) ->
             let staged = error.file.reopen().with_context(|| {
                 format!("failed to reopen staged immutable file {}", path.display())
             })?;
-            let existing = fs::File::open(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            let existing = open_existing_immutable(path)?.with_context(|| {
+                format!(
+                    "immutable file {} disappeared during publication",
+                    path.display()
+                )
+            })?;
             if !files_equal(staged, existing)
                 .with_context(|| format!("failed to compare immutable file {}", path.display()))?
             {
@@ -77,7 +81,18 @@ pub fn publish_staged_immutable(path: &Path, staged: tempfile::NamedTempFile) ->
     sync_directory(parent)
 }
 
-fn files_equal(first: fs::File, second: fs::File) -> std::io::Result<bool> {
+fn open_existing_immutable(path: &Path) -> Result<Option<fs::File>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => fs::File::open(path)
+            .with_context(|| format!("failed to read {}", path.display()))
+            .map(Some),
+        Ok(_) => bail!("immutable path is not a regular file: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn files_equal(first: impl Read, second: impl Read) -> std::io::Result<bool> {
     let mut first = BufReader::new(first);
     let mut second = BufReader::new(second);
     loop {
@@ -210,6 +225,21 @@ mod tests {
         publish_immutable(&path, b"complete").unwrap();
         assert!(publish_immutable(&path, b"different").is_err());
         assert_eq!(fs::read(path).unwrap(), b"complete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_publication_rejects_identical_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        let path = directory.path().join("object");
+        fs::write(&outside, b"complete").unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(publish_immutable(&path, b"complete").is_err());
+        assert!(fs::symlink_metadata(path).unwrap().is_symlink());
     }
 
     #[test]
