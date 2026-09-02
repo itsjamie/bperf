@@ -966,7 +966,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                         .unwrap_or("unknown error")
                 ));
             }
-            Some(_) | None => {}
+            Some(_) => {}
+            None => bail!("WebKit browser event has no method"),
         }
         Ok(())
     }
@@ -1088,7 +1089,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                     self.dispatch_target_event(page_proxy_id, &target_id, nested)?;
                 }
             }
-            Some(_) | None => {}
+            Some(_) => {}
+            None => bail!("WebKit page-proxy event has no method"),
         }
         Ok(())
     }
@@ -1274,7 +1276,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                     .context("profile belongs to an unknown WebKit target")?
                     .profile = Some(params);
             }
-            Some(_) | None => {}
+            Some(_) => {}
+            None => bail!("WebKit target event has no method"),
         }
         Ok(())
     }
@@ -2364,6 +2367,30 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unissued response id 1"));
         assert!(connection.responses.is_empty());
+    }
+
+    #[test]
+    fn malformed_event_envelopes_are_rejected() {
+        let mut connection = InspectorConnection::new(
+            FakeTransport::default(),
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        assert!(connection.dispatch_message(json!({})).is_err());
+
+        connection
+            .pages
+            .insert("proxy".to_owned(), route("target", None));
+        assert!(
+            connection
+                .dispatch_page_message("proxy", json!({}))
+                .is_err()
+        );
+        assert!(
+            connection
+                .dispatch_target_event("proxy", "target", json!({}))
+                .is_err()
+        );
     }
 
     #[derive(Default)]
