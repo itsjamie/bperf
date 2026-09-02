@@ -868,7 +868,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
 
     fn dispatch_message(&mut self, message: Value) -> Result<()> {
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
-            self.store_response(id, &message);
+            self.store_response(id, &message)?;
             return Ok(());
         }
         if let Some(page_proxy_id) = message.get("pageProxyId").and_then(Value::as_str) {
@@ -888,13 +888,16 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         self.dispatch_browser_event(message)
     }
 
-    fn store_response(&mut self, id: u64, message: &Value) {
+    fn store_response(&mut self, id: u64, message: &Value) -> Result<()> {
+        if id == 0 || id >= self.next_id {
+            bail!("WebKit inspector returned unissued response id {id}");
+        }
         if let Some(method) = self.background_responses.remove(&id) {
             if let Some(error) = message.get("error") {
                 self.fatal_error
                     .get_or_insert_with(|| format!("{method} failed: {}", protocol_error(error)));
             }
-            return;
+            return Ok(());
         }
         let response = if let Some(error) = message.get("error") {
             Err(protocol_error(error))
@@ -902,6 +905,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
             Ok(message.get("result").cloned().unwrap_or(Value::Null))
         };
         self.responses.insert(id, response);
+        Ok(())
     }
 
     fn dispatch_browser_event(&mut self, message: Value) -> Result<()> {
@@ -980,7 +984,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
 
     fn dispatch_page_message(&mut self, page_proxy_id: &str, message: Value) -> Result<()> {
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
-            self.store_response(id, &message);
+            self.store_response(id, &message)?;
             return Ok(());
         }
         let method = message.get("method").and_then(Value::as_str);
@@ -1079,7 +1083,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                 )
                 .context("WebKit target dispatched invalid JSON")?;
                 if let Some(id) = nested.get("id").and_then(Value::as_u64) {
-                    self.store_response(id, &nested);
+                    self.store_response(id, &nested)?;
                 } else {
                     self.dispatch_target_event(page_proxy_id, &target_id, nested)?;
                 }
@@ -1232,7 +1236,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                 )
                 .context("WebKit worker dispatched invalid JSON")?;
                 if let Some(id) = nested.get("id").and_then(Value::as_u64) {
-                    self.store_response(id, &nested);
+                    self.store_response(id, &nested)?;
                 } else if nested.get("method").and_then(Value::as_str)
                     == Some("ScriptProfiler.trackingComplete")
                 {
@@ -2348,6 +2352,20 @@ mod tests {
         assert!(connection.process.sent.is_empty());
     }
 
+    #[test]
+    fn unissued_response_ids_are_rejected() {
+        let mut connection = InspectorConnection::new(
+            FakeTransport::default(),
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        let error = connection
+            .dispatch_message(json!({"id": 1, "result": {}}))
+            .unwrap_err();
+        assert!(error.to_string().contains("unissued response id 1"));
+        assert!(connection.responses.is_empty());
+    }
+
     #[derive(Default)]
     struct ScriptedTransport {
         sent: Vec<Value>,
@@ -2595,6 +2613,7 @@ mod tests {
         connection
             .pages
             .insert("proxy".to_owned(), route("target", None));
+        let response_id = connection.allocate_id().unwrap();
         connection
             .dispatch_page_message(
                 "proxy",
@@ -2603,7 +2622,7 @@ mod tests {
                     "params": {
                         "targetId": "target",
                         "message": serde_json::to_string(&json!({
-                            "id": 41,
+                            "id": response_id,
                             "result": {"value": 42}
                         })).unwrap()
                     }
@@ -2611,7 +2630,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            connection.responses.remove(&41).unwrap().unwrap(),
+            connection.responses.remove(&response_id).unwrap().unwrap(),
             json!({"value": 42})
         );
 
@@ -2666,18 +2685,19 @@ mod tests {
             },
         );
         connection.pages.insert("proxy".to_owned(), page);
+        let response_id = connection.allocate_id().unwrap();
 
         connection
             .dispatch_page_message(
                 "proxy",
                 worker_dispatch(json!({
-                    "id": 41,
+                    "id": response_id,
                     "result": {"value": 42}
                 })),
             )
             .unwrap();
         assert_eq!(
-            connection.responses.remove(&41).unwrap().unwrap(),
+            connection.responses.remove(&response_id).unwrap().unwrap(),
             json!({"value": 42})
         );
 
@@ -2914,13 +2934,15 @@ mod tests {
             serde_json::from_str(outer["params"]["message"].as_str().unwrap()).unwrap();
         let nested_id = nested["id"].as_u64().unwrap();
 
-        connection.store_response(
-            nested_id,
-            &json!({
-                "id": nested_id,
-                "error": {"message": "interception failed"}
-            }),
-        );
+        connection
+            .store_response(
+                nested_id,
+                &json!({
+                    "id": nested_id,
+                    "error": {"message": "interception failed"}
+                }),
+            )
+            .unwrap();
 
         let error = connection.check_fatal_error().unwrap_err().to_string();
         assert!(error.contains("Network.interceptRequestWithError"));

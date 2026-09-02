@@ -613,6 +613,9 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
 
     fn dispatch(&mut self, message: Value) -> Result<Option<CdpAction>> {
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if id == 0 || id >= self.next_id {
+                bail!("Chromium CDP returned unissued response id {id}");
+            }
             let result = if let Some(error) = message.get("error") {
                 Err(protocol_error(error))
             } else {
@@ -1622,6 +1625,18 @@ mod tests {
     #[test]
     fn required_protocol_strings_cannot_be_empty() {
         assert!(required_string(&json!({"sessionId": ""}), "sessionId").is_err());
+    }
+
+    #[test]
+    fn unissued_response_ids_are_rejected() {
+        let mut connection =
+            CdpConnection::new(ScriptedTransport::default(), PathBuf::from("downloads"));
+        let error = connection
+            .dispatch(json!({"id": 1, "result": {}}))
+            .err()
+            .expect("unissued response was accepted");
+        assert!(error.to_string().contains("unissued response id 1"));
+        assert!(connection.responses.is_empty());
     }
 
     #[test]

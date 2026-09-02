@@ -574,6 +574,9 @@ impl<Transport: JugglerTransport> JugglerConnection<Transport> {
 
     fn dispatch(&mut self, message: Value) -> Result<Option<JugglerAction>> {
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if id == 0 || id >= self.next_id {
+                bail!("Firefox Juggler returned unissued response id {id}");
+            }
             let result = if let Some(error) = message.get("error") {
                 Err(protocol_error(error))
             } else {
@@ -1546,6 +1549,18 @@ mod tests {
         fn terminate(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn unissued_response_ids_are_rejected() {
+        let mut connection =
+            JugglerConnection::new(ScriptedTransport::default(), PathBuf::from("downloads"));
+        let error = connection
+            .dispatch(json!({"id": 1, "result": {}}))
+            .err()
+            .expect("unissued response was accepted");
+        assert!(error.to_string().contains("unissued response id 1"));
+        assert!(connection.responses.is_empty());
     }
 
     #[test]
