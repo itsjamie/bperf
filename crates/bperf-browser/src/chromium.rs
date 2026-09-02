@@ -1349,7 +1349,32 @@ fn parse_cpu_profile(value: &Value) -> Result<ChromiumProfile> {
     {
         bail!("Chromium emitted an invalid CPU profile");
     }
+    validate_profile_graph(&profile)?;
     Ok(profile)
+}
+
+fn validate_profile_graph(profile: &ChromiumProfile) -> Result<()> {
+    let mut nodes = HashSet::new();
+    for node in &profile.nodes {
+        if !nodes.insert(node.id) {
+            bail!("Chromium CPU profile contains duplicate node IDs");
+        }
+    }
+    let mut children = HashSet::new();
+    for node in &profile.nodes {
+        for child in &node.children {
+            if !nodes.contains(child) {
+                bail!("Chromium CPU profile references a missing child node");
+            }
+            if !children.insert(*child) {
+                bail!("Chromium CPU profile assigns a node multiple parents");
+            }
+        }
+    }
+    if profile.samples.iter().any(|sample| !nodes.contains(sample)) {
+        bail!("Chromium CPU profile samples a missing node");
+    }
+    Ok(())
 }
 
 fn profile_graph(
@@ -1614,6 +1639,18 @@ mod tests {
     #[test]
     fn malformed_chromium_captures_fail_explicitly() {
         assert!(parse_cpu_profile(&json!({})).is_err());
+        assert!(
+            parse_cpu_profile(&json!({
+                "nodes": [{
+                    "id": 1,
+                    "callFrame": {"lineNumber": 0, "columnNumber": 0},
+                    "children": [2]
+                }],
+                "samples": [1],
+                "timeDeltas": [1]
+            }))
+            .is_err()
+        );
         let directory = tempdir().unwrap();
         let path = directory.path().join("heap.json");
         fs::write(&path, "{}").unwrap();
