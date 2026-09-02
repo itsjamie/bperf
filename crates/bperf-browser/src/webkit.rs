@@ -380,7 +380,7 @@ impl WebKitLane {
             let profile = self
                 .connection
                 .wait_for_profile(&page.page_proxy_id, CAPTURE_TIMEOUT)?;
-            if profile_traces(&profile).len() < 10 {
+            if profile_sample_count(&profile)? < 10 {
                 bail!("WebKit CPU profile did not contain enough samples");
             }
             self.connection
@@ -2166,12 +2166,10 @@ fn parse_profile(value: &Value) -> Result<WebKitProfile> {
     serde_json::from_value(value.clone()).context("WebKit emitted an invalid CPU profile")
 }
 
-fn profile_traces(value: &Value) -> Vec<WebKitStackTrace> {
-    parse_profile(value)
-        .ok()
-        .and_then(|profile| profile.samples)
-        .map(|samples| samples.stack_traces)
-        .unwrap_or_default()
+fn profile_sample_count(value: &Value) -> Result<usize> {
+    Ok(parse_profile(value)?
+        .samples
+        .map_or(0, |samples| samples.stack_traces.len()))
 }
 
 fn target_traces(value: &Value, target_url: &str) -> Result<Vec<WebKitStackTrace>> {
@@ -2552,6 +2550,7 @@ mod tests {
 
     #[test]
     fn malformed_webkit_captures_fail_explicitly() {
+        assert!(profile_sample_count(&json!({"samples":{"stackTraces":{}}})).is_err());
         assert!(parse_live_heap_bytes("{}").is_err());
         assert!(parse_live_heap_bytes(r#"{"nodes":[1,2,3]}"#).is_err());
         assert!(parse_live_heap_bytes(r#"{"nodes":[1,-1,0,0]}"#).is_err());
