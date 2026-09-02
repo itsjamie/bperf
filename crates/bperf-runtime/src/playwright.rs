@@ -30,6 +30,9 @@ const DOWNLOAD_REQUEST_ATTEMPTS: u32 = 3;
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 500_000;
 const MAX_UNCOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+// Unix kernels impose much smaller link-target limits; this keeps archive
+// validation bounded without encoding one platform's exact maximum.
+const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlaywrightInstallation {
@@ -430,7 +433,12 @@ fn install_symlink(entry: &mut impl Read, root: &Path, relative: &Path) -> Resul
     use std::os::unix::fs::symlink;
 
     let mut value = String::new();
-    entry.read_to_string(&mut value)?;
+    entry
+        .take(MAX_SYMLINK_TARGET_BYTES as u64 + 1)
+        .read_to_string(&mut value)?;
+    if value.len() > MAX_SYMLINK_TARGET_BYTES {
+        bail!("browser archive symlink target exceeds the size limit");
+    }
     let link = Path::new(&value);
     if link.is_absolute() {
         bail!("browser archive symlink has an absolute target");
@@ -847,6 +855,15 @@ mod tests {
         assert!(validate_relative_target(Path::new("one/two"), Path::new("../target")).is_ok());
         assert!(validate_relative_target(Path::new("one"), Path::new("../../target")).is_err());
         assert!(validate_relative_target(Path::new("one"), Path::new("/target")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_symlink_targets_are_rejected_before_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = std::io::Cursor::new(vec![b'a'; MAX_SYMLINK_TARGET_BYTES + 1]);
+        assert!(install_symlink(&mut target, root.path(), Path::new("alias")).is_err());
+        assert!(!root.path().join("alias").exists());
     }
 
     #[cfg(unix)]
