@@ -277,7 +277,18 @@ pub fn validate_artifact_set(engine: Engine, artifacts: &[ArtifactEvidence]) -> 
     for artifact in artifacts {
         validate_capture_scope(&artifact.capture_scope)
             .with_context(|| format!("{engine} returned an invalid capture scope"))?;
-        if !paths.insert(artifact.path.as_str()) {
+        let relative = Path::new(&artifact.path);
+        if artifact.path.trim().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!(
+                "{engine} artifact path must be contained: {}",
+                artifact.path
+            );
+        }
+        if !paths.insert(relative.components().collect::<PathBuf>()) {
             bail!(
                 "{engine} returned duplicate artifact path {}",
                 artifact.path
@@ -309,17 +320,6 @@ pub fn validate_artifact_set(engine: Engine, artifacts: &[ArtifactEvidence]) -> 
     }
 
     for artifact in artifacts {
-        let relative = Path::new(&artifact.path);
-        if artifact.path.trim().is_empty()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            bail!(
-                "{engine} artifact path must be contained: {}",
-                artifact.path
-            );
-        }
         if artifact.size_bytes == 0
             || artifact.format != expected_artifact_format(engine, artifact.kind)
             || !is_sha256(&artifact.sha256)
@@ -737,6 +737,9 @@ mod tests {
         let format = std::mem::replace(&mut artifacts[0].format, "unknown".to_owned());
         assert!(validate_artifact_set(Engine::Webkit, &artifacts).is_err());
         artifacts[0].format = format;
+        artifacts[0].path = "nested/artifact.json".to_owned();
+        artifacts[1].path = "nested//artifact.json".to_owned();
+        assert!(validate_artifact_set(Engine::Webkit, &artifacts).is_err());
         artifacts[0].path = "../outside.json".to_owned();
         assert!(validate_artifact_set(Engine::Webkit, &artifacts).is_err());
     }
