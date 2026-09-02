@@ -21,6 +21,10 @@ use serde_json::{Value, json};
 const RDP_TIMEOUT: Duration = Duration::from_secs(30);
 const RDP_CONNECT_ATTEMPTS: usize = 50;
 const RDP_CONNECT_DELAY: Duration = Duration::from_millis(100);
+const MAX_RDP_HEADER_BYTES: usize = 64 * 1024;
+// Bulk replies are buffered because profiler parsing needs the complete document.
+// Stream them into their consumers before raising this ceiling.
+const MAX_RDP_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 const PROFILER_CHILD_START_DELAY: Duration = Duration::from_millis(100);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_SNAPSHOT_PREFIX: &str = "Firefox emitted an invalid .fxsnapshot: ";
@@ -333,18 +337,7 @@ impl RdpClient {
     }
 
     fn next_message(&mut self) -> Result<RdpMessage> {
-        let mut header = Vec::new();
-        let bytes = self
-            .reader
-            .read_until(b':', &mut header)
-            .context("failed reading a Firefox RDP packet header")?;
-        if bytes == 0 {
-            bail!("Firefox RDP connection closed");
-        }
-        if header.last() != Some(&b':') {
-            bail!("Firefox RDP connection closed inside a packet header");
-        }
-        header.pop();
+        let header = read_rdp_header(&mut self.reader)?;
         let header =
             std::str::from_utf8(&header).context("Firefox RDP packet header was not UTF-8")?;
         let (bulk, length) = parse_rdp_header(header)?;
@@ -368,8 +361,27 @@ impl RdpClient {
     }
 }
 
+fn read_rdp_header(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+    let mut header = Vec::new();
+    let bytes = reader
+        .take(MAX_RDP_HEADER_BYTES as u64 + 1)
+        .read_until(b':', &mut header)
+        .context("failed reading a Firefox RDP packet header")?;
+    if bytes == 0 {
+        bail!("Firefox RDP connection closed");
+    }
+    if header.last() != Some(&b':') {
+        if bytes > MAX_RDP_HEADER_BYTES {
+            bail!("Firefox RDP packet header exceeded {MAX_RDP_HEADER_BYTES} bytes");
+        }
+        bail!("Firefox RDP connection closed inside a packet header");
+    }
+    header.pop();
+    Ok(header)
+}
+
 fn parse_rdp_header(header: &str) -> Result<(Option<(String, String)>, usize)> {
-    if let Some(rest) = header.strip_prefix("bulk ") {
+    let (bulk, length) = if let Some(rest) = header.strip_prefix("bulk ") {
         let mut fields = rest.split(' ');
         let actor = fields.next().unwrap_or_default();
         let packet_type = fields.next().unwrap_or_default();
@@ -381,15 +393,17 @@ fn parse_rdp_header(header: &str) -> Result<(Option<(String, String)>, usize)> {
         {
             bail!("Invalid Firefox RDP packet length");
         }
-        let length = length
-            .parse::<usize>()
-            .context("Invalid Firefox RDP packet length")?;
-        return Ok((Some((actor.to_owned(), packet_type.to_owned())), length));
-    }
-    let length = header
+        (Some((actor.to_owned(), packet_type.to_owned())), length)
+    } else {
+        (None, header)
+    };
+    let length = length
         .parse::<usize>()
         .context("Invalid Firefox RDP packet length")?;
-    Ok((None, length))
+    if length > MAX_RDP_MESSAGE_BYTES {
+        bail!("Firefox RDP packet exceeded {MAX_RDP_MESSAGE_BYTES} bytes");
+    }
+    Ok((bulk, length))
 }
 
 fn check_rdp_error(packet: &Value, action: &str) -> Result<()> {
@@ -822,6 +836,18 @@ mod tests {
             (Some(("profiler".to_owned(), "profile".to_owned())), 42)
         );
         assert!(parse_rdp_header("bulk actor type nope").is_err());
+        for header in [
+            (MAX_RDP_MESSAGE_BYTES + 1).to_string(),
+            format!("bulk actor type {}", MAX_RDP_MESSAGE_BYTES + 1),
+        ] {
+            assert!(parse_rdp_header(&header).is_err());
+        }
+    }
+
+    #[test]
+    fn rdp_headers_have_a_bounded_read() {
+        let mut input = std::io::Cursor::new(vec![b'x'; MAX_RDP_HEADER_BYTES + 1]);
+        assert!(read_rdp_header(&mut input).is_err());
     }
 
     #[test]
