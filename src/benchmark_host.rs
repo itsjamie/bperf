@@ -44,6 +44,7 @@ pub(crate) struct AdapterOptions {
     pub(crate) root: PathBuf,
     pub(crate) benchmark: PathBuf,
     pub(crate) fixture_lock: PathBuf,
+    pub(crate) fixture_cache: PathBuf,
     pub(crate) bundle: PathBuf,
     pub(crate) bundle_metadata: PathBuf,
 }
@@ -57,8 +58,12 @@ pub(crate) struct BenchmarkHost {
 }
 
 impl BenchmarkHost {
-    pub(crate) fn start(bundle: &BrowserProjectBundle, fixture_lock: &Path) -> Result<Self> {
-        let content = Arc::new(HostedBenchmark::load(bundle, fixture_lock)?);
+    pub(crate) fn start(
+        bundle: &BrowserProjectBundle,
+        fixture_lock: &Path,
+        fixture_cache: &Path,
+    ) -> Result<Self> {
+        let content = Arc::new(HostedBenchmark::load(bundle, fixture_lock, fixture_cache)?);
         let server = Arc::new(
             Server::http("127.0.0.1:0")
                 .map_err(|error| anyhow!("failed to bind benchmark host: {error}"))?,
@@ -149,7 +154,7 @@ pub(crate) fn run_adapter(options: AdapterOptions) -> Result<()> {
         &options.bundle,
         &options.bundle_metadata,
     )?;
-    let host = BenchmarkHost::start(&bundle, &options.fixture_lock)?;
+    let host = BenchmarkHost::start(&bundle, &options.fixture_lock, &options.fixture_cache)?;
     serde_json::to_writer(
         io::stdout(),
         &json!({
@@ -201,7 +206,11 @@ struct HostedBenchmark {
 }
 
 impl HostedBenchmark {
-    fn load(bundle: &BrowserProjectBundle, fixture_lock: &Path) -> Result<Self> {
+    fn load(
+        bundle: &BrowserProjectBundle,
+        fixture_lock: &Path,
+        fixture_cache: &Path,
+    ) -> Result<Self> {
         let bundle_source = fs::read(bundle.bundle_file()).with_context(|| {
             format!(
                 "failed to read browser bundle {}",
@@ -210,7 +219,7 @@ impl HostedBenchmark {
         })?;
         Ok(Self {
             bundle: bundle_source.into(),
-            fixtures: LockedFixtures::load(fixture_lock)?,
+            fixtures: LockedFixtures::load(fixture_lock, fixture_cache)?,
         })
     }
 
@@ -419,7 +428,6 @@ mod tests {
         let benchmark = root.join("sample.bench.ts");
         let bundle_file = root.join("browser-bundle.js");
         let metadata_file = root.join("browser-bundle.json");
-        let body_file = root.join("fixture-body");
         let lock_file = root.join("fixture-lock.json");
         fs::write(&benchmark, "export default 42;\n").unwrap();
         fs::write(&bundle_file, "globalThis.bundleLoaded = true;\n").unwrap();
@@ -435,6 +443,8 @@ mod tests {
         )
         .unwrap();
         let fixture = b"0123456789";
+        let fixture_digest = format!("{:x}", Sha256::digest(fixture));
+        let body_file = root.join(&fixture_digest);
         fs::write(&body_file, fixture).unwrap();
         let descriptor = json!({
             "source": "./segment.txt",
@@ -450,7 +460,7 @@ mod tests {
                 "fixtures": [{
                     "descriptor": descriptor,
                     "body_path": body_file,
-                    "sha256": format!("{:x}", Sha256::digest(fixture)),
+                    "sha256": fixture_digest,
                     "size_bytes": fixture.len(),
                     "content_type": "application/octet-stream",
                 }],
@@ -461,7 +471,7 @@ mod tests {
 
         let bundle =
             BrowserProjectBundle::open(root, &benchmark, &bundle_file, &metadata_file).unwrap();
-        let host = BenchmarkHost::start(&bundle, &lock_file).unwrap();
+        let host = BenchmarkHost::start(&bundle, &lock_file, root).unwrap();
         fs::write(&body_file, b"mutated after validation").unwrap();
 
         let page = request(host.url(), "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");

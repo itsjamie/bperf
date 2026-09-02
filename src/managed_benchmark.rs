@@ -551,7 +551,13 @@ fn materialize(
         );
     }
     validate_description(&description)?;
-    write_inputs(&project, &generated_root, &description, trial_policy)
+    write_inputs(
+        &project,
+        &generated_root,
+        &object_root,
+        &description,
+        trial_policy,
+    )
 }
 
 fn absolute_directory(path: &Path) -> Result<PathBuf> {
@@ -600,7 +606,7 @@ fn discover_managed_benchmark(
     let unresolved_lock = temporary.path().join("unresolved-fixture-lock.json");
 
     let (unresolved_description, mut source_files) = {
-        let host = BenchmarkHost::start(project.bundle, &unresolved_lock)?;
+        let host = BenchmarkHost::start(project.bundle, &unresolved_lock, object_root)?;
         let description =
             inspect_description_in_every_engine(browser_lab, host.url(), "unresolved")?;
         let source_files = BTreeSet::from_iter(host.source_files().iter().cloned());
@@ -620,7 +626,7 @@ fn discover_managed_benchmark(
     )?;
 
     {
-        let host = BenchmarkHost::start(project.bundle, fixture_lock)?;
+        let host = BenchmarkHost::start(project.bundle, fixture_lock, object_root)?;
         source_files.extend(host.source_files().iter().cloned());
         let resolved_description =
             inspect_description_in_every_engine(browser_lab, host.url(), "resolved")?;
@@ -780,6 +786,7 @@ fn validate_description(description: &ManagedDescription) -> Result<()> {
 fn write_inputs(
     project: &PreparedBenchmarkProject<'_>,
     generated_root: &Path,
+    object_root: &Path,
     description: &ManagedDescription,
     trial_policy: TrialPolicy,
 ) -> Result<MaterializedInputs> {
@@ -899,6 +906,8 @@ fn write_inputs(
                 path_value(project.benchmark),
                 "--fixture-lock",
                 path_value(&description.fixture_lock),
+                "--fixture-cache",
+                path_value(object_root),
                 "--bundle",
                 path_value(project.bundle.bundle_file()),
                 "--bundle-metadata",

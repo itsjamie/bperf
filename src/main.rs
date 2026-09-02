@@ -94,6 +94,9 @@ struct BenchmarkHostArgs {
     fixture_lock: PathBuf,
 
     #[arg(long)]
+    fixture_cache: PathBuf,
+
+    #[arg(long)]
     bundle: PathBuf,
 
     #[arg(long)]
@@ -492,6 +495,7 @@ fn main() -> Result<ExitCode> {
                 root: args.root,
                 benchmark: args.benchmark,
                 fixture_lock: args.fixture_lock,
+                fixture_cache: args.fixture_cache,
                 bundle: args.bundle,
                 bundle_metadata: args.bundle_metadata,
             })?;

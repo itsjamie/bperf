@@ -92,9 +92,17 @@ pub(crate) struct StreamDelivery {
 }
 
 impl LockedFixtures {
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path, cache_root: &Path) -> Result<Self> {
+        let cache_root = fs::canonicalize(cache_root)
+            .with_context(|| format!("failed to resolve fixture cache {}", cache_root.display()))?;
         let mut entries = BTreeMap::new();
-        for entry in read_lock(path)? {
+        for mut entry in read_lock(path)? {
+            entry.body_path = cached_object_path(
+                &cache_root,
+                &entry.sha256,
+                &entry.body_path,
+                "pinned benchmark fixture",
+            )?;
             let (entry, body) = validate_body(entry, "pinned benchmark fixture")?;
             let key = fixture_key(&entry.descriptor)?;
             entries.insert(key, LockedFixture { entry, body });
@@ -568,9 +576,10 @@ mod tests {
     #[test]
     fn locked_fixture_bodies_are_independent_disk_streams() {
         let directory = tempfile::tempdir().unwrap();
-        let body_path = directory.path().join("body");
-        let lock_path = directory.path().join("fixture-lock.json");
         let body = b"012345";
+        let digest = format!("{:x}", Sha256::digest(body));
+        let body_path = directory.path().join(&digest);
+        let lock_path = directory.path().join("fixture-lock.json");
         let descriptor = json!({"source": "fixture.txt"});
         fs::write(&body_path, body).unwrap();
         fs::write(
@@ -580,7 +589,7 @@ mod tests {
                 "fixtures": [{
                     "descriptor": descriptor,
                     "body_path": body_path,
-                    "sha256": format!("{:x}", Sha256::digest(body)),
+                    "sha256": digest,
                     "size_bytes": body.len(),
                     "content_type": "text/plain",
                 }],
@@ -589,7 +598,7 @@ mod tests {
         )
         .unwrap();
 
-        let fixtures = LockedFixtures::load(&lock_path).unwrap();
+        let fixtures = LockedFixtures::load(&lock_path, directory.path()).unwrap();
         let key = serde_json::to_string(&descriptor).unwrap();
         let fixture = fixtures.find(&key).unwrap();
         fs::write(&body_path, b"mutated").unwrap();
@@ -606,6 +615,45 @@ mod tests {
         assert_eq!(&prefix, b"01");
         assert_eq!(complete, body);
         assert_eq!(remainder, b"2345");
+    }
+
+    #[test]
+    fn fixture_locks_cannot_read_outside_the_content_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let body = b"outside";
+        let digest = format!("{:x}", Sha256::digest(body));
+        let body_path = outside.join(&digest);
+        fs::write(&body_path, body).unwrap();
+        let lock_path = directory.path().join("fixture-lock.json");
+        fs::write(
+            &lock_path,
+            serde_json::to_vec(&json!({
+                "schema_version": LOCK_SCHEMA_VERSION,
+                "fixtures": [{
+                    "descriptor": {"source": "fixture.txt"},
+                    "body_path": body_path,
+                    "sha256": digest,
+                    "size_bytes": body.len(),
+                    "content_type": "text/plain",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = LockedFixtures::load(&lock_path, &cache)
+            .err()
+            .expect("outside fixture body was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the content-addressed fixture cache"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
