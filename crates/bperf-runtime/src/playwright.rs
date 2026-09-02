@@ -426,8 +426,15 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         );
         let mut output = File::create_new(&target)
             .with_context(|| format!("failed to create {}", target.display()))?;
-        io::copy(&mut entry, &mut output)
+        let declared_size = entry.size();
+        let extracted_size = io::copy(&mut entry.by_ref().take(declared_size + 1), &mut output)
             .with_context(|| format!("failed to extract {}", target.display()))?;
+        if extracted_size != declared_size {
+            bail!(
+                "browser archive entry {} expanded to {extracted_size} bytes; declared {declared_size}",
+                relative.display()
+            );
+        }
         set_mode(&target, entry.unix_mode())?;
     }
     Ok(())
@@ -889,6 +896,36 @@ mod tests {
                 registry_platform: "ubuntu24.04-arm64".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn browser_archive_entries_cannot_exceed_their_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("browser.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        archive
+            .start_file(
+                "browser",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.write_all(b"sixteen-byte-file").unwrap();
+        archive.finish().unwrap();
+
+        let mut bytes = fs::read(&archive_path).unwrap();
+        bytes[22..26].copy_from_slice(&1_u32.to_le_bytes());
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&archive_path, bytes).unwrap();
+        let destination = directory.path().join("staged");
+        fs::create_dir(&destination).unwrap();
+
+        let error = extract_zip(&archive_path, &destination).unwrap_err();
+        assert!(format!("{error:#}").contains("declared 1"));
     }
 
     #[cfg(unix)]
