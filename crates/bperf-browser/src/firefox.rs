@@ -1275,10 +1275,11 @@ fn stack_belongs_to_target(
     if !visiting.insert(stack_index) {
         bail!("Firefox CPU profile contains a stack cycle");
     }
-    let Some(stack_row) = thread.stack_table.data.get(stack_index) else {
-        visiting.remove(&stack_index);
-        return Ok(false);
-    };
+    let stack_row = thread
+        .stack_table
+        .data
+        .get(stack_index)
+        .context("Firefox CPU profile references a missing stack")?;
     let prefix = stack_row
         .get(thread.stack_table.schema.prefix)
         .and_then(Value::as_f64)
@@ -1658,6 +1659,38 @@ mod tests {
             )
             .is_ok()
         );
+
+        let profile = parse_profile(
+            &json!({
+                "meta": {"interval": 1},
+                "pages": [{
+                    "innerWindowID": 42,
+                    "url": "http://127.0.0.1:4317/"
+                }],
+                "threads": [{
+                    "name": "main",
+                    "pid": 1,
+                    "tid": 1,
+                    "samples": {
+                        "schema": {"stack": 0, "time": 1},
+                        "data": [[0, 0], [1, 1]]
+                    },
+                    "stackTable": {
+                        "schema": {"prefix": 0, "frame": 1},
+                        "data": [[null, 0]]
+                    },
+                    "frameTable": {
+                        "schema": {"location": 0, "innerWindowID": 1},
+                        "data": [[0, 42]]
+                    },
+                    "stringTable": ["js::RunScript"]
+                }],
+                "processes": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").is_err());
     }
 
     #[test]
