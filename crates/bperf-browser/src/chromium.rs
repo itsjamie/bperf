@@ -717,19 +717,16 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
                 }
             }
             "Target.detachedFromTarget" => {
-                if let Some(detached) = params.get("sessionId").and_then(Value::as_str) {
-                    let detached_state = self.sessions.remove(detached);
-                    if self.primary_sessions.contains(detached) {
-                        self.fatal_error =
-                            Some("Chromium detached the active page target".to_owned());
-                    } else if self.capture_phase != CapturePhase::Idle
-                        && detached_state.is_some_and(|state| state.capture_scope.is_some())
-                    {
-                        self.fatal_error = Some(
-                            "Chromium detached a worker or iframe during complete capture"
-                                .to_owned(),
-                        );
-                    }
+                let detached = required_string(&params, "sessionId")?;
+                let detached_state = self.sessions.remove(&detached);
+                if self.primary_sessions.contains(&detached) {
+                    self.fatal_error = Some("Chromium detached the active page target".to_owned());
+                } else if self.capture_phase != CapturePhase::Idle
+                    && detached_state.is_some_and(|state| state.capture_scope.is_some())
+                {
+                    self.fatal_error = Some(
+                        "Chromium detached a worker or iframe during complete capture".to_owned(),
+                    );
                 }
                 Ok(None)
             }
@@ -1623,8 +1620,18 @@ mod tests {
     }
 
     #[test]
-    fn required_protocol_strings_cannot_be_empty() {
+    fn required_protocol_identifiers_cannot_be_missing_or_empty() {
         assert!(required_string(&json!({"sessionId": ""}), "sessionId").is_err());
+        let mut connection =
+            CdpConnection::new(ScriptedTransport::default(), PathBuf::from("downloads"));
+        assert!(
+            connection
+                .dispatch(json!({
+                    "method": "Target.detachedFromTarget",
+                    "params": {}
+                }))
+                .is_err()
+        );
     }
 
     #[test]
