@@ -523,8 +523,21 @@ fn valid_snapshot_id(value: &str) -> bool {
 fn wait_for_snapshot(path: &Path) -> Result<()> {
     let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
     loop {
-        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
-            return Ok(());
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                bail!(
+                    "Firefox heap snapshot is not a regular file: {}",
+                    path.display()
+                )
+            }
+            Ok(metadata) if metadata.len() > 0 => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect Firefox heap snapshot {}", path.display())
+                });
+            }
         }
         if Instant::now() >= deadline {
             bail!("Firefox did not write heap snapshot {}", path.display());
@@ -842,6 +855,21 @@ mod tests {
         for valid in ["1", "123456", "123-456"] {
             assert!(valid_snapshot_id(valid), "{valid}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heap_snapshot_waiting_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.fxsnapshot");
+        let alias = directory.path().join("alias.fxsnapshot");
+        fs::write(&target, b"snapshot").unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let error = wait_for_snapshot(&alias).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]
