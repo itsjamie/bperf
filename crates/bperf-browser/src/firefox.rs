@@ -1208,17 +1208,21 @@ struct GeckoSample {
 fn thread_samples(thread: &GeckoThread) -> Result<Vec<GeckoSample>> {
     let mut samples = Vec::new();
     for row in &thread.samples.data {
-        let Some(stack) = row.get(thread.samples.schema.stack).and_then(Value::as_f64) else {
-            continue;
-        };
-        let Some(time) = row.get(thread.samples.schema.time).and_then(Value::as_f64) else {
-            continue;
-        };
-        if !time.is_finite() {
+        let stack = row
+            .get(thread.samples.schema.stack)
+            .context("Firefox CPU profile sample has no stack column")?;
+        if stack.is_null() {
             continue;
         }
-        let stack_index =
-            numeric_index(stack).context("Firefox CPU profile contains an invalid stack index")?;
+        let stack_index = stack
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+            .context("Firefox CPU profile contains an invalid stack index")?;
+        let time = row
+            .get(thread.samples.schema.time)
+            .and_then(Value::as_f64)
+            .filter(|time| time.is_finite())
+            .context("Firefox CPU profile sample has an invalid time")?;
         samples.push(GeckoSample { stack_index, time });
     }
     Ok(samples)
@@ -1653,12 +1657,11 @@ mod tests {
     fn malformed_gecko_profiles_fail_explicitly() {
         assert!(parse_profile("{}").is_err());
         assert!(parse_profile(r#"{"threads":[],"processes":false}"#).is_err());
-        assert!(
-            parse_profile(
-                r#"{"threads":[{"name":"main","pid":1,"tid":1,"samples":{"schema":{"stack":0,"time":1},"data":[["bad",0]]},"stackTable":{"schema":{"prefix":0,"frame":1},"data":[]},"frameTable":{"schema":{"location":0},"data":[]},"stringTable":[]}],"processes":[]}"#
-            )
-            .is_ok()
-        );
+        let malformed = parse_profile(
+            r#"{"threads":[{"name":"main","pid":1,"tid":1,"samples":{"schema":{"stack":0,"time":1},"data":[["bad",0]]},"stackTable":{"schema":{"prefix":0,"frame":1},"data":[]},"frameTable":{"schema":{"location":0},"data":[]},"stringTable":[]}],"processes":[]}"#,
+        )
+        .unwrap();
+        assert!(thread_samples(&malformed.threads[0]).is_err());
 
         let profile = parse_profile(
             &json!({
