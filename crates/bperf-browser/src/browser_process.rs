@@ -23,6 +23,9 @@ const FORCED_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 // Longer diagnostic records are split, not dropped; raise this only if a browser
 // needs larger records to remain atomic in console output.
 const MAX_BROWSER_LOG_CHUNK_BYTES: u64 = 64 * 1024;
+// Protocol replies are parsed as complete JSON values. Stream engine capture
+// fields into their consumers before raising this full-frame ceiling.
+const MAX_BROWSER_PROTOCOL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 fn read_log_chunk(reader: &mut impl BufRead, chunk: &mut Vec<u8>) -> std::io::Result<usize> {
     chunk.clear();
@@ -88,7 +91,7 @@ impl BrowserProcess {
         let (sender, frames) = mpsc::sync_channel(32);
         thread::spawn(move || {
             let mut reader = spawned.reader;
-            let mut decoder = NulFrameDecoder::default();
+            let mut decoder = NulFrameDecoder::new(MAX_BROWSER_PROTOCOL_FRAME_BYTES);
             let mut bytes = [0_u8; 64 * 1024];
             loop {
                 match reader.read(&mut bytes) {
@@ -101,13 +104,19 @@ impl BrowserProcess {
                         }
                         break;
                     }
-                    Ok(count) => {
-                        for frame in decoder.push(&bytes[..count]) {
-                            if sender.send(Ok(frame)).is_err() {
-                                return;
+                    Ok(count) => match decoder.push(&bytes[..count]) {
+                        Ok(frames) => {
+                            for frame in frames {
+                                if sender.send(Ok(frame)).is_err() {
+                                    return;
+                                }
                             }
                         }
-                    }
+                        Err(error) => {
+                            let _ = sender.send(Err(error.to_string()));
+                            break;
+                        }
+                    },
                     Err(error) => {
                         let _ = sender.send(Err(format!(
                             "failed reading browser protocol pipe: {error}"
@@ -198,25 +207,43 @@ impl Drop for BrowserProcess {
     }
 }
 
-#[derive(Default)]
 struct NulFrameDecoder {
     pending: Vec<u8>,
+    max_frame_bytes: usize,
 }
 
 impl NulFrameDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+    fn new(max_frame_bytes: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            max_frame_bytes,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut frames = Vec::new();
         let mut start = 0;
         for (index, byte) in bytes.iter().enumerate() {
             if *byte != 0 {
                 continue;
             }
-            self.pending.extend_from_slice(&bytes[start..index]);
+            self.append(&bytes[start..index])?;
             frames.push(std::mem::take(&mut self.pending));
             start = index + 1;
         }
-        self.pending.extend_from_slice(&bytes[start..]);
-        frames
+        self.append(&bytes[start..])?;
+        Ok(frames)
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > self.max_frame_bytes.saturating_sub(self.pending.len()) {
+            bail!(
+                "browser protocol JSON frame exceeded {} bytes",
+                self.max_frame_bytes
+            );
+        }
+        self.pending.extend_from_slice(bytes);
+        Ok(())
     }
 
     fn has_partial_frame(&self) -> bool {
@@ -893,7 +920,10 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BROWSER_LOG_CHUNK_BYTES, NulFrameDecoder, read_log_chunk};
+    use super::{
+        MAX_BROWSER_LOG_CHUNK_BYTES, MAX_BROWSER_PROTOCOL_FRAME_BYTES, NulFrameDecoder,
+        read_log_chunk,
+    };
 
     #[test]
     fn browser_logs_without_newlines_are_drained_in_bounded_chunks() {
@@ -1018,24 +1048,31 @@ mod tests {
 
     #[test]
     fn protocol_frames_may_be_fragmented_or_coalesced() {
-        let mut decoder = NulFrameDecoder::default();
-        assert!(decoder.push(br#"{"id":1"#).is_empty());
+        let mut decoder = NulFrameDecoder::new(MAX_BROWSER_PROTOCOL_FRAME_BYTES);
+        assert!(decoder.push(br#"{"id":1"#).unwrap().is_empty());
         assert_eq!(
-            decoder.push(b"}\0{\"id\":2}\0{\"id\""),
+            decoder.push(b"}\0{\"id\":2}\0{\"id\"").unwrap(),
             [br#"{"id":1}"#.to_vec(), br#"{"id":2}"#.to_vec()]
         );
-        assert_eq!(decoder.push(b":3}\0"), [br#"{"id":3}"#.to_vec()]);
+        assert_eq!(decoder.push(b":3}\0").unwrap(), [br#"{"id":3}"#.to_vec()]);
         assert!(!decoder.has_partial_frame());
     }
 
     #[test]
     fn protocol_framer_preserves_large_heap_payloads() {
         let payload = vec![b'x'; 2 * 1024 * 1024];
-        let mut decoder = NulFrameDecoder::default();
-        assert!(decoder.push(&payload[..1_000_000]).is_empty());
+        let mut decoder = NulFrameDecoder::new(MAX_BROWSER_PROTOCOL_FRAME_BYTES);
+        assert!(decoder.push(&payload[..1_000_000]).unwrap().is_empty());
         let mut tail = payload[1_000_000..].to_vec();
         tail.push(0);
-        assert_eq!(decoder.push(&tail), [payload]);
+        assert_eq!(decoder.push(&tail).unwrap(), [payload]);
+    }
+
+    #[test]
+    fn protocol_frames_have_a_bounded_read() {
+        let mut decoder = NulFrameDecoder::new(4);
+        assert!(decoder.push(b"123").unwrap().is_empty());
+        assert!(decoder.push(b"45\0").is_err());
     }
 
     #[cfg(windows)]
