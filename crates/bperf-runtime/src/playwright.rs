@@ -404,13 +404,14 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         if relative.as_os_str().is_empty() {
             continue;
         }
+        let declared_size = entry.size();
         if entry.is_dir() {
             let target = create_archive_directory(destination, &relative)?;
             set_mode(&target, entry.unix_mode())?;
             continue;
         }
         if entry.is_symlink() {
-            install_symlink(&mut entry, destination, &relative)?;
+            install_symlink(&mut entry, destination, &relative, declared_size)?;
             continue;
         }
         let parent = create_archive_directory(
@@ -426,7 +427,6 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         );
         let mut output = File::create_new(&target)
             .with_context(|| format!("failed to create {}", target.display()))?;
-        let declared_size = entry.size();
         let extracted_size = io::copy(&mut entry.by_ref().take(declared_size + 1), &mut output)
             .with_context(|| format!("failed to extract {}", target.display()))?;
         if extracted_size != declared_size {
@@ -441,15 +441,25 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn install_symlink(entry: &mut impl Read, root: &Path, relative: &Path) -> Result<()> {
+fn install_symlink(
+    entry: &mut impl Read,
+    root: &Path,
+    relative: &Path,
+    declared_size: u64,
+) -> Result<()> {
     use std::os::unix::fs::symlink;
 
-    let mut value = String::new();
-    entry
-        .take(MAX_SYMLINK_TARGET_BYTES as u64 + 1)
-        .read_to_string(&mut value)?;
-    if value.len() > MAX_SYMLINK_TARGET_BYTES {
+    if declared_size > MAX_SYMLINK_TARGET_BYTES as u64 {
         bail!("browser archive symlink target exceeds the size limit");
+    }
+    let mut value = String::new();
+    entry.take(declared_size + 1).read_to_string(&mut value)?;
+    let extracted_size = value.len() as u64;
+    if extracted_size != declared_size {
+        bail!(
+            "browser archive symlink {} expanded to {extracted_size} bytes; declared {declared_size}",
+            relative.display()
+        );
     }
     let link = Path::new(&value);
     if link.is_absolute() {
@@ -470,7 +480,12 @@ fn install_symlink(entry: &mut impl Read, root: &Path, relative: &Path) -> Resul
 }
 
 #[cfg(not(unix))]
-fn install_symlink(_entry: &mut impl Read, _root: &Path, relative: &Path) -> Result<()> {
+fn install_symlink(
+    _entry: &mut impl Read,
+    _root: &Path,
+    relative: &Path,
+    _declared_size: u64,
+) -> Result<()> {
     bail!(
         "browser archive contains unsupported symlink {}",
         relative.display()
@@ -933,8 +948,48 @@ mod tests {
     fn oversized_symlink_targets_are_rejected_before_installation() {
         let root = tempfile::tempdir().unwrap();
         let mut target = std::io::Cursor::new(vec![b'a'; MAX_SYMLINK_TARGET_BYTES + 1]);
-        assert!(install_symlink(&mut target, root.path(), Path::new("alias")).is_err());
+        assert!(
+            install_symlink(
+                &mut target,
+                root.path(),
+                Path::new("alias"),
+                MAX_SYMLINK_TARGET_BYTES as u64 + 1,
+            )
+            .is_err()
+        );
         assert!(!root.path().join("alias").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_archive_symlinks_cannot_exceed_their_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("browser.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        archive
+            .add_symlink(
+                "alias",
+                "long-target",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+
+        let mut bytes = fs::read(&archive_path).unwrap();
+        bytes[22..26].copy_from_slice(&1_u32.to_le_bytes());
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&archive_path, bytes).unwrap();
+        let destination = directory.path().join("staged");
+        fs::create_dir(&destination).unwrap();
+
+        let error = extract_zip(&archive_path, &destination).unwrap_err();
+        assert!(format!("{error:#}").contains("declared 1"));
+        assert!(!destination.join("alias").exists());
     }
 
     #[cfg(unix)]
