@@ -713,7 +713,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
     }
 
     fn send_browser(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let id = self.allocate_id();
+        let id = self.allocate_id()?;
         self.process.send(&json!({
             "id": id,
             "method": method,
@@ -730,7 +730,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let id = self.allocate_id();
+        let id = self.allocate_id()?;
         self.process.send(&json!({
             "id": id,
             "method": method,
@@ -749,8 +749,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let nested_id = self.allocate_id();
-        let outer_id = self.allocate_id();
+        let nested_id = self.allocate_id()?;
+        let outer_id = self.allocate_id()?;
         let message = serde_json::to_string(&json!({
             "id": nested_id,
             "method": method,
@@ -795,7 +795,7 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let id = self.allocate_id();
+        let id = self.allocate_id()?;
         let message = serde_json::to_string(&json!({
             "id": id,
             "method": method,
@@ -824,8 +824,8 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         method: &str,
         params: Value,
     ) -> Result<()> {
-        let nested_id = self.allocate_id();
-        let outer_id = self.allocate_id();
+        let nested_id = self.allocate_id()?;
+        let outer_id = self.allocate_id()?;
         self.background_responses
             .insert(nested_id, method.to_owned());
         self.background_responses
@@ -2085,10 +2085,13 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
             .with_context(|| format!("WebKit page {page_proxy_id} has no current target"))
     }
 
-    fn allocate_id(&mut self) -> u64 {
+    fn allocate_id(&mut self) -> Result<u64> {
         let id = self.next_id;
-        self.next_id += 1;
-        id
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .context("WebKit request id overflowed")?;
+        Ok(id)
     }
 
     fn check_fatal_error(&mut self) -> Result<()> {
@@ -2329,6 +2332,22 @@ mod tests {
     #[test]
     fn required_protocol_strings_cannot_be_empty() {
         assert!(required_string(&json!({"targetId": ""}), "targetId").is_err());
+    }
+
+    #[test]
+    fn request_ids_cannot_wrap() {
+        let mut connection = InspectorConnection::new(
+            FakeTransport::default(),
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        connection.next_id = u64::MAX;
+
+        let error = connection
+            .send_browser("Playwright.enable", json!({}), REQUEST_TIMEOUT)
+            .unwrap_err();
+        assert!(error.to_string().contains("request id overflowed"));
+        assert!(connection.process.sent.is_empty());
     }
 
     #[derive(Default)]
