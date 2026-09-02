@@ -324,6 +324,8 @@ impl BenchmarkManifest {
             if !(self.trials.min_final_samples..=self.trials.max_final_samples).contains(&count) {
                 bail!("fixed trials.mode must be within min_final_samples..=max_final_samples");
             }
+        } else {
+            self.adaptive_final_sample_range()?;
         }
 
         if !(0.0..1.0).contains(&self.statistics.confidence) {
@@ -989,6 +991,13 @@ mod tests {
         let changed = BENCHMARK.replace("    - webkit\n", "    - webkit\n    - chromium\n");
         let error = parse_benchmark(&changed).unwrap_err();
         assert!(error.to_string().contains("duplicate engine"));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_trial_mode_during_manifest_validation() {
+        let changed = BENCHMARK.replace("  mode: auto", "  mode: eventually");
+        let error = parse_benchmark(&changed).unwrap_err();
+        assert!(error.to_string().contains("unsupported trials.mode"));
     }
 
     #[test]
