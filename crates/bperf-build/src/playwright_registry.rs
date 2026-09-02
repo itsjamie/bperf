@@ -197,6 +197,9 @@ fn authenticated_package(version: &str) -> Result<AuthenticatedPackage> {
 
 fn download_limited(url: &str, limit: u64) -> Result<Vec<u8>> {
     let mut response = ureq::get(url)
+        .config()
+        .https_only(true)
+        .build()
         .call()
         .with_context(|| format!("failed to download {url}"))?;
     let mut bytes = Vec::new();
