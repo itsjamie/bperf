@@ -10,7 +10,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ureq::{Agent, ResponseExt, http::Uri};
+use ureq::{Agent, Body, ResponseExt, http::Uri};
+use url::Url;
 
 use crate::project_modules::project_file;
 
@@ -19,6 +20,7 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 // Fixture bodies are fully cached before a run. Raise this only after acquisition
 // enforces an aggregate cache quota across every fixture in a benchmark.
 const MAX_FIXTURE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_LOOPBACK_HTTP_REDIRECTS: u32 = 10;
 // Worker shutdown cannot interrupt a paced response sleep. Raise this only
 // after benchmark-host pacing waits on its shutdown signal.
 const MAX_STREAM_INTERVAL_MS: u64 = 10_000;
@@ -255,25 +257,7 @@ fn acquire(
         remote_uri(&descriptor.source)?
     {
         let source_url = source_uri.to_string();
-        let https_only = source_uri
-            .scheme_str()
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
-        let mut response = match agent
-            .get(&source_url)
-            .config()
-            .https_only(https_only)
-            .build()
-            .call()
-        {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => {
-                bail!("remote fixture {source_url} returned HTTP {status}")
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to acquire remote fixture {source_url}"));
-            }
-        };
+        let mut response = acquire_remote(agent, &source_url)?;
         let final_url = response.get_uri().to_string();
         let content_type = response
             .headers()
@@ -308,6 +292,53 @@ fn acquire(
         size_bytes: cached.size_bytes,
         content_type,
     })
+}
+
+fn acquire_remote(agent: &Agent, source_url: &str) -> Result<ureq::http::Response<Body>> {
+    let mut url = Url::parse(source_url).context("remote fixture has an invalid source URL")?;
+    let mut redirect_count = 0;
+    loop {
+        let uri = remote_uri(url.as_str())?.context("remote fixture redirect is not HTTP(S)")?;
+        let https_only = uri
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
+        let mut config = agent.get(url.as_str()).config().https_only(https_only);
+        if !https_only {
+            config = config.max_redirects(0);
+        }
+        let response = match config.build().call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(status)) => {
+                bail!("remote fixture {source_url} returned HTTP {status}")
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to acquire remote fixture {source_url}"));
+            }
+        };
+        if https_only || !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        if redirect_count == MAX_LOOPBACK_HTTP_REDIRECTS {
+            bail!("remote fixture {source_url} exceeded the redirect limit");
+        }
+        redirect_count += 1;
+        let location = response
+            .headers()
+            .get("location")
+            .context("remote fixture redirect has no Location header")?
+            .to_str()
+            .context("remote fixture redirect has an invalid Location header")?;
+        url = validated_redirect_url(&url, location)?;
+    }
+}
+
+fn validated_redirect_url(current: &Url, location: &str) -> Result<Url> {
+    let redirected = current
+        .join(location)
+        .context("remote fixture has an invalid redirect URL")?;
+    remote_uri(redirected.as_str())?.context("remote fixture redirect is not HTTP(S)")?;
+    Ok(redirected)
 }
 
 fn cache_body(cache_root: &Path, mut source: impl Read, label: &str) -> Result<CachedBody> {
@@ -781,6 +812,20 @@ mod tests {
             remote_uri("http://127.0.0.1/fixture.bin")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn loopback_http_redirects_cannot_cross_to_external_plaintext() {
+        let source = Url::parse("http://127.0.0.1/source").unwrap();
+        let error = validated_redirect_url(&source, "http://example.com/fixture.bin").unwrap_err();
+        assert!(error.to_string().contains("require HTTPS"));
+
+        assert_eq!(
+            validated_redirect_url(&source, "/fixture.bin")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1/fixture.bin"
         );
     }
 

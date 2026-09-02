@@ -44,6 +44,7 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 tiny_http = "0.12"
 tokio = { version = "1.52", features = ["rt"] }
 ureq = "3.3"
+url = "2.5"
 
 [profile.release]
 lto = "thin"
