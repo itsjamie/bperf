@@ -2116,6 +2116,7 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
     value
         .get(field)
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .with_context(|| format!("WebKit protocol value has no string {field}"))
 }
@@ -2323,6 +2324,11 @@ mod tests {
         fn terminate(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn required_protocol_strings_cannot_be_empty() {
+        assert!(required_string(&json!({"targetId": ""}), "targetId").is_err());
     }
 
     #[derive(Default)]

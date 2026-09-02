@@ -1297,6 +1297,7 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
     value
         .get(field)
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .with_context(|| format!("Chromium CDP value has no string {field}"))
 }
@@ -1616,6 +1617,11 @@ mod tests {
             .join("captures")
             .join("chromium")
             .join(name)
+    }
+
+    #[test]
+    fn required_protocol_strings_cannot_be_empty() {
+        assert!(required_string(&json!({"sessionId": ""}), "sessionId").is_err());
     }
 
     #[test]
