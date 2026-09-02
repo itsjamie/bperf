@@ -402,6 +402,9 @@ struct VariantAdapter {
 
 impl VariantAdapter {
     fn start(invocation: &VariantInvocation<'_>) -> Result<Self> {
+        let ready_deadline = Instant::now()
+            .checked_add(invocation.ready_timeout)
+            .context("variant adapter readiness timeout is too large for this platform")?;
         let (program, arguments) = invocation
             .command
             .split_first()
@@ -424,7 +427,9 @@ impl VariantAdapter {
             thread::spawn(move || {
                 let _ = sender.send(read_adapter_readiness(stdout));
             });
-            let line = match receiver.recv_timeout(invocation.ready_timeout) {
+            let line = match receiver
+                .recv_timeout(ready_deadline.saturating_duration_since(Instant::now()))
+            {
                 Ok(Ok((0, _))) => {
                     let status = child.try_wait().ok().flatten();
                     bail!("variant adapter closed before readiness (status: {status:?})")
@@ -514,6 +519,21 @@ mod tests {
         assert_eq!(ready.protocol_version, READINESS_PROTOCOL_VERSION);
         assert_eq!(ready.url, "http://127.0.0.1:4317/");
         assert_eq!(ready._source_files.len(), 1);
+    }
+
+    #[test]
+    fn adapter_readiness_timeout_cannot_become_an_indefinite_wait() {
+        let command = ["must-not-run".to_owned()];
+        let invocation = VariantInvocation {
+            command: &command,
+            ready_timeout: Duration::MAX,
+            working_directory: Path::new("."),
+        };
+
+        let error = VariantAdapter::start(&invocation)
+            .err()
+            .expect("overflowing readiness timeout was accepted");
+        assert!(error.to_string().contains("timeout is too large"));
     }
 
     #[test]
