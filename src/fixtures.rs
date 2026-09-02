@@ -10,7 +10,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ureq::{Agent, Body, ResponseExt, http::Uri};
+use ureq::{
+    Agent, Body, ResponseExt,
+    http::{HeaderValue, Uri},
+};
 use url::Url;
 
 use crate::project_modules::project_file;
@@ -388,9 +391,7 @@ fn read_lock(path: &Path) -> Result<Vec<FixtureLockEntry>> {
         if !descriptors.insert(fixture_key(&entry.descriptor)?) {
             bail!("fixture lock contains duplicate descriptors");
         }
-        if entry.content_type.trim().is_empty() {
-            bail!("fixture lock contains an empty content type");
-        }
+        validate_content_type("fixture lock", &entry.content_type)?;
     }
     Ok(lock.fixtures)
 }
@@ -510,13 +511,12 @@ fn validate_descriptor(descriptor: &FixtureDescriptor) -> Result<()> {
     if descriptor.source.trim().is_empty() {
         bail!("fixture descriptor contains an empty source");
     }
-    if descriptor
+    if let Some(content_type) = descriptor
         .response
         .as_ref()
         .and_then(|response| response.content_type.as_deref())
-        .is_some_and(|content_type| content_type.trim().is_empty())
     {
-        bail!("fixture descriptor contains an empty content type");
+        validate_content_type("fixture descriptor", content_type)?;
     }
     if descriptor
         .response
@@ -534,6 +534,13 @@ fn validate_descriptor(descriptor: &FixtureDescriptor) -> Result<()> {
         .is_some_and(|interval| interval > MAX_STREAM_INTERVAL_MS)
     {
         bail!("fixture descriptor stream interval exceeds {MAX_STREAM_INTERVAL_MS} ms");
+    }
+    Ok(())
+}
+
+fn validate_content_type(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.parse::<HeaderValue>().is_err() {
+        bail!("{label} contains an invalid content type");
     }
     Ok(())
 }
@@ -720,6 +727,18 @@ mod tests {
 
         let error = validate_descriptor(&descriptor).unwrap_err();
         assert!(error.to_string().contains("stream interval exceeds"));
+    }
+
+    #[test]
+    fn fixture_content_types_must_be_valid_http_header_values() {
+        let descriptor: FixtureDescriptor = serde_json::from_value(json!({
+            "source": "fixture.txt",
+            "response": {"contentType": "text/plain\r\nX-Injected: true"},
+        }))
+        .unwrap();
+
+        let error = validate_descriptor(&descriptor).unwrap_err();
+        assert!(error.to_string().contains("invalid content type"));
     }
 
     #[test]
