@@ -1010,9 +1010,11 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                         .pages
                         .get_mut(page_proxy_id)
                         .context("target belongs to an unknown WebKit page")?;
+                    if page.targets.contains_key(&target_id) {
+                        bail!("WebKit reported a duplicate target attachment");
+                    }
                     page.targets
-                        .entry(target_id.clone())
-                        .or_insert_with(TargetRoute::default);
+                        .insert(target_id.clone(), TargetRoute::default());
                     if provisional {
                         page.provisional_target = Some(target_id.clone());
                     } else if page.current_target.is_none() {
@@ -2822,6 +2824,38 @@ mod tests {
         let page = &connection.pages["proxy"];
         assert_eq!(page.current_target.as_deref(), Some("new"));
         assert_eq!(page.provisional_target, None);
+    }
+
+    #[test]
+    fn duplicate_target_attachments_are_rejected_before_initialization() {
+        let mut connection = InspectorConnection::new(
+            FakeTransport::default(),
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        connection
+            .pages
+            .insert("proxy".to_owned(), route("target", None));
+
+        let error = connection
+            .dispatch_page_message(
+                "proxy",
+                json!({
+                    "method": "Target.targetCreated",
+                    "params": {
+                        "targetInfo": {
+                            "type": "page",
+                            "targetId": "target",
+                            "isPaused": false
+                        }
+                    }
+                }),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate target attachment"));
+        assert_eq!(connection.pages["proxy"].targets.len(), 1);
+        assert!(connection.process.sent.is_empty());
     }
 
     #[test]
