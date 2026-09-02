@@ -1413,6 +1413,29 @@ mod tests {
     }
 
     #[test]
+    fn trial_artifacts_must_belong_to_their_attempt() {
+        let directory = tempdir().unwrap();
+        let root = prepare(
+            &example("browser-benchmark.yaml"),
+            &example("browser-variant-baseline.yaml"),
+            Some(20),
+            directory.path(),
+        )
+        .unwrap();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        let trial = measurement.pending_trials()[0];
+        let mut result = synthetic_result(&measurement, trial, 100.0);
+        result.artifacts[0].path =
+            result.artifacts[0]
+                .path
+                .replacen("attempt-0001", "attempt-0002", 1);
+
+        let error = measurement.append_result(&result).unwrap_err();
+
+        assert!(format!("{error:#}").contains("outside its attempt directory"));
+    }
+
+    #[test]
     fn stale_measurement_handle_cannot_overwrite_a_completed_outcome() {
         let directory = tempdir().unwrap();
         let root = prepare(
@@ -1789,11 +1812,12 @@ mod tests {
         trial: &ScheduledTrial,
         metric_value: f64,
     ) -> TrialResult {
+        let attempt = measurement.next_attempt(&trial.trial_id);
         TrialResult {
             schema_version: MEASUREMENT_SCHEMA_VERSION,
             measurement_set_id: measurement.measurement_set_id().to_owned(),
             trial_id: trial.trial_id.clone(),
-            attempt: measurement.next_attempt(&trial.trial_id),
+            attempt,
             workload_id: trial.workload_id.clone(),
             engine: trial.engine,
             phase: trial.phase,
@@ -1813,11 +1837,21 @@ mod tests {
                 (BATCH_SIZE_METRIC.into(), 1.0),
                 (TRIAL_ELAPSED_METRIC.into(), 30.0),
             ]),
-            artifacts: synthetic_artifacts(measurement.root(), &trial.trial_id, trial.engine),
+            artifacts: synthetic_artifacts(
+                measurement.root(),
+                &trial.trial_id,
+                attempt,
+                trial.engine,
+            ),
         }
     }
 
-    fn synthetic_artifacts(root: &Path, trial_id: &str, engine: Engine) -> Vec<ArtifactEvidence> {
+    fn synthetic_artifacts(
+        root: &Path,
+        trial_id: &str,
+        attempt: u32,
+        engine: Engine,
+    ) -> Vec<ArtifactEvidence> {
         [
             ArtifactKind::CpuProfile,
             ArtifactKind::JsHeap,
@@ -1831,8 +1865,9 @@ mod tests {
                 ArtifactKind::JsHeap => "heap",
                 ArtifactKind::Flamegraph => "flamegraph",
             };
-            let relative = PathBuf::from("synthetic")
+            let relative = PathBuf::from("artifacts")
                 .join(trial_id)
+                .join(format!("attempt-{attempt:04}"))
                 .join(format!("{name}.txt"));
             let path = root.join(&relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();

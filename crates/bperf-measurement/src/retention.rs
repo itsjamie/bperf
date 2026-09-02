@@ -128,6 +128,19 @@ pub(crate) fn validate_result(
     if result.valid {
         validate_artifact_set(result.engine, &result.artifacts)
             .with_context(|| format!("trial {} has invalid artifacts", result.trial_id))?;
+        let expected_directory = Path::new("artifacts")
+            .join(&result.trial_id)
+            .join(format!("attempt-{:04}", result.attempt));
+        if result
+            .artifacts
+            .iter()
+            .any(|artifact| Path::new(&artifact.path).parent() != Some(&expected_directory))
+        {
+            bail!(
+                "trial {} artifact path is outside its attempt directory",
+                result.trial_id
+            );
+        }
         if retention_finalized {
             Ok(())
         } else {
@@ -629,6 +642,7 @@ mod tests {
                     };
                     let relative = PathBuf::from("artifacts")
                         .join(trial_id)
+                        .join("attempt-0001")
                         .join(format!("{scope}-{name}.txt"));
                     let path = root.join(&relative);
                     fs::create_dir_all(path.parent().unwrap()).unwrap();

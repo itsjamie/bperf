@@ -145,7 +145,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
             "webkit" => Engine::Webkit,
             _ => unreachable!(),
         };
-        let artifact_dir = root.join("synthetic-artifacts").join(trial_id);
+        let artifact_dir = root.join("artifacts").join(trial_id).join("attempt-0001");
         fs::create_dir_all(&artifact_dir).unwrap();
         let mut artifacts = Vec::new();
         let artifact_kinds: &[(ArtifactKind, &str)] = &[
