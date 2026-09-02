@@ -230,7 +230,12 @@ impl PlaywrightInstallation {
 fn validate_installed_artifact(artifact: &BrowserArtifact) -> Result<()> {
     let directory_metadata = match fs::symlink_metadata(&artifact.directory) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!(
+                "browser installation is missing: {}",
+                artifact.directory.display()
+            )
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -258,7 +263,9 @@ fn validate_installed_artifact(artifact: &BrowserArtifact) -> Result<()> {
         path.push(component);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                bail!("browser installation is incomplete: {}", path.display())
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("failed to inspect browser path {}", path.display()));
@@ -272,6 +279,16 @@ fn validate_installed_artifact(artifact: &BrowserArtifact) -> Result<()> {
         if !expected {
             bail!("browser installation contains an alias: {}", path.display());
         }
+    }
+    let marker = artifact.directory.join(INSTALLATION_MARKER);
+    if !fs::symlink_metadata(&marker)
+        .with_context(|| format!("browser installation is incomplete: {}", marker.display()))?
+        .is_file()
+    {
+        bail!(
+            "browser installation completion marker is not a file: {}",
+            marker.display()
+        );
     }
     Ok(())
 }
@@ -942,6 +959,29 @@ mod tests {
             .browser(BrowserName::ChromiumHeadlessShell)
             .unwrap_err();
         assert!(error.to_string().contains("contains an alias"));
+    }
+
+    #[test]
+    fn incomplete_browser_installations_are_not_discovered() {
+        let cache = tempfile::tempdir().unwrap();
+        let installation = PlaywrightInstallation {
+            distribution: Registry::embedded().unwrap(),
+            host: HostPlatform {
+                browser_artifact: "win64".to_owned(),
+                native_dependencies: native_dependencies::Capability::NotRequired,
+            },
+            browser_cache: cache.path().to_owned(),
+        };
+        let artifact = installation
+            .artifact(BrowserName::ChromiumHeadlessShell)
+            .unwrap();
+        fs::create_dir_all(artifact.executable.parent().unwrap()).unwrap();
+        fs::write(&artifact.executable, b"executable").unwrap();
+
+        let error = installation
+            .browser(BrowserName::ChromiumHeadlessShell)
+            .unwrap_err();
+        assert!(error.to_string().contains("incomplete"));
     }
 
     #[test]
