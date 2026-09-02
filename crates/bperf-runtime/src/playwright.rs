@@ -404,9 +404,8 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         if relative.as_os_str().is_empty() {
             continue;
         }
-        let target = destination.join(&relative);
         if entry.is_dir() {
-            fs::create_dir_all(&target)?;
+            let target = create_archive_directory(destination, &relative)?;
             set_mode(&target, entry.unix_mode())?;
             continue;
         }
@@ -414,12 +413,18 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
             install_symlink(&mut entry, destination, &relative)?;
             continue;
         }
-        fs::create_dir_all(
-            target
+        let parent = create_archive_directory(
+            destination,
+            relative
                 .parent()
                 .context("browser archive entry has no parent")?,
         )?;
-        let mut output = File::create(&target)
+        let target = parent.join(
+            relative
+                .file_name()
+                .context("browser archive entry has no file name")?,
+        );
+        let mut output = File::create_new(&target)
             .with_context(|| format!("failed to create {}", target.display()))?;
         io::copy(&mut entry, &mut output)
             .with_context(|| format!("failed to extract {}", target.display()))?;
@@ -443,16 +448,17 @@ fn install_symlink(entry: &mut impl Read, root: &Path, relative: &Path) -> Resul
     if link.is_absolute() {
         bail!("browser archive symlink has an absolute target");
     }
-    let parent = relative
+    let relative_parent = relative
         .parent()
         .context("browser archive symlink has no parent")?;
-    validate_relative_target(parent, link)?;
-    let target = root.join(relative);
-    fs::create_dir_all(
-        target
-            .parent()
-            .context("browser archive symlink has no parent")?,
-    )?;
+    let parent = create_archive_directory(root, relative_parent)?;
+    let canonical_root = fs::canonicalize(root)?;
+    validate_archive_symlink_target(&canonical_root, &parent, link)?;
+    let target = parent.join(
+        relative
+            .file_name()
+            .context("browser archive symlink has no file name")?,
+    );
     symlink(link, &target).with_context(|| format!("failed to create symlink {}", target.display()))
 }
 
@@ -464,21 +470,56 @@ fn install_symlink(_entry: &mut impl Read, _root: &Path, relative: &Path) -> Res
     )
 }
 
-#[cfg(any(unix, test))]
-fn validate_relative_target(parent: &Path, link: &Path) -> Result<()> {
-    let mut depth = parent.components().count();
-    for component in link.components() {
-        match component {
-            std::path::Component::Normal(_) => depth += 1,
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if depth > 0 => depth -= 1,
-            std::path::Component::ParentDir => {
-                bail!("browser archive symlink escapes its installation")
-            }
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                bail!("browser archive symlink target is not relative")
-            }
+fn create_archive_directory(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve archive root {}", root.display()))?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("browser archive directory is not relative")
+    }
+    let directory = root.join(relative);
+    let existing = directory
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .context("browser archive directory has no existing ancestor")?;
+    if !fs::canonicalize(existing)?.starts_with(&root) {
+        bail!("browser archive directory escapes its installation")
+    }
+    fs::create_dir_all(&directory)?;
+    let directory = fs::canonicalize(directory)?;
+    if !directory.starts_with(&root) {
+        bail!("browser archive directory escapes its installation")
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_archive_symlink_target(root: &Path, parent: &Path, link: &Path) -> Result<()> {
+    let target = parent.join(link);
+    let existing = match fs::symlink_metadata(&target) {
+        Ok(_) => target.as_path(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => target
+            .parent()
+            .context("browser archive symlink target has no parent")?,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect browser archive symlink target {}",
+                    target.display()
+                )
+            });
         }
+    };
+    let resolved = fs::canonicalize(existing).with_context(|| {
+        format!(
+            "failed to resolve browser archive symlink target {}",
+            target.display()
+        )
+    })?;
+    if !resolved.starts_with(root) {
+        bail!("browser archive symlink target escapes its installation")
     }
     Ok(())
 }
@@ -850,13 +891,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn symlink_targets_cannot_escape_the_archive() {
-        assert!(validate_relative_target(Path::new("one/two"), Path::new("../target")).is_ok());
-        assert!(validate_relative_target(Path::new("one"), Path::new("../../target")).is_err());
-        assert!(validate_relative_target(Path::new("one"), Path::new("/target")).is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn oversized_symlink_targets_are_rejected_before_installation() {
@@ -864,6 +898,45 @@ mod tests {
         let mut target = std::io::Cursor::new(vec![b'a'; MAX_SYMLINK_TARGET_BYTES + 1]);
         assert!(install_symlink(&mut target, root.path(), Path::new("alias")).is_err());
         assert!(!root.path().join("alias").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_archive_symlinks_cannot_escape_through_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("browser.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        archive
+            .add_directory("nested", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .add_symlink(
+                "nested/back",
+                "..",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .add_symlink(
+                "escape",
+                "nested/back/../outside",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .start_file("escape/owned", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"escaped").unwrap();
+        archive.finish().unwrap();
+
+        let destination = directory.path().join("staged");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(&outside).unwrap();
+
+        let error = extract_zip(&archive_path, &destination).unwrap_err();
+        assert!(error.to_string().contains("escapes its installation"));
+        assert!(!outside.join("owned").exists());
     }
 
     #[cfg(unix)]
