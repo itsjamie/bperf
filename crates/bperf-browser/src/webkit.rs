@@ -892,18 +892,20 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         if id == 0 || id >= self.next_id {
             bail!("WebKit inspector returned unissued response id {id}");
         }
+        let response = match (message.get("result"), message.get("error")) {
+            (Some(result), None) => Ok(result.clone()),
+            (None, Some(error)) => Err(protocol_error(error)),
+            _ => {
+                bail!("WebKit inspector response id {id} must contain exactly one result or error")
+            }
+        };
         if let Some(method) = self.background_responses.remove(&id) {
-            if let Some(error) = message.get("error") {
+            if let Err(error) = response {
                 self.fatal_error
-                    .get_or_insert_with(|| format!("{method} failed: {}", protocol_error(error)));
+                    .get_or_insert_with(|| format!("{method} failed: {error}"));
             }
             return Ok(());
         }
-        let response = if let Some(error) = message.get("error") {
-            Err(protocol_error(error))
-        } else {
-            Ok(message.get("result").cloned().unwrap_or(Value::Null))
-        };
         if self.responses.contains_key(&id) {
             bail!("WebKit inspector returned duplicate response id {id}");
         }
@@ -2382,6 +2384,14 @@ mod tests {
                 .is_err()
         );
         assert_eq!(connection.responses[&1].as_ref().unwrap()["value"], "first");
+
+        connection.next_id = 4;
+        for malformed in [
+            json!({"id": 2}),
+            json!({"id": 3, "result": {}, "error": {}}),
+        ] {
+            assert!(connection.dispatch_message(malformed).is_err());
+        }
     }
 
     #[test]

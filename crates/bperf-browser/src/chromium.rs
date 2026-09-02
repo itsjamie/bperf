@@ -616,10 +616,12 @@ impl<Transport: CdpTransport> CdpConnection<Transport> {
             if id == 0 || id >= self.next_id {
                 bail!("Chromium CDP returned unissued response id {id}");
             }
-            let result = if let Some(error) = message.get("error") {
-                Err(protocol_error(error))
-            } else {
-                Ok(message.get("result").cloned().unwrap_or_else(|| json!({})))
+            let result = match (message.get("result"), message.get("error")) {
+                (Some(result), None) => Ok(result.clone()),
+                (None, Some(error)) => Err(protocol_error(error)),
+                _ => {
+                    bail!("Chromium CDP response id {id} must contain exactly one result or error")
+                }
             };
             if self.ignored_responses.remove(&id) {
                 if let Err(error) = result {
@@ -1670,6 +1672,14 @@ mod tests {
                 .is_err()
         );
         assert_eq!(connection.responses[&1].as_ref().unwrap()["value"], "first");
+
+        connection.next_id = 4;
+        for malformed in [
+            json!({"id": 2}),
+            json!({"id": 3, "result": {}, "error": {}}),
+        ] {
+            assert!(connection.dispatch(malformed).is_err());
+        }
     }
 
     #[test]
