@@ -934,27 +934,22 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                 }
             }
             Some("Playwright.pageProxyDestroyed") => {
-                if let Some(page_proxy_id) = message
-                    .get("params")
-                    .and_then(|params| params.get("pageProxyId"))
-                    .and_then(Value::as_str)
-                {
-                    let expected = self.pages.get(page_proxy_id).is_some_and(|page| {
-                        self.closing_contexts.contains(&page.browser_context_id)
-                    });
-                    if self.pages.remove(page_proxy_id).is_some() && !expected {
-                        self.fatal_error =
-                            Some(format!("WebKit page proxy {page_proxy_id} was destroyed"));
-                    }
+                let page_proxy_id = required_string(
+                    message
+                        .get("params")
+                        .context("pageProxyDestroyed has no params")?,
+                    "pageProxyId",
+                )?;
+                let expected = self
+                    .pages
+                    .get(&page_proxy_id)
+                    .is_some_and(|page| self.closing_contexts.contains(&page.browser_context_id));
+                if self.pages.remove(&page_proxy_id).is_some() && !expected {
+                    self.fatal_error =
+                        Some(format!("WebKit page proxy {page_proxy_id} was destroyed"));
                 }
-                if let Some(page_proxy_id) = message
-                    .get("params")
-                    .and_then(|params| params.get("pageProxyId"))
-                    .and_then(Value::as_str)
-                {
-                    self.closed_pages.insert(page_proxy_id.to_owned());
-                    self.pending_page_messages.remove(page_proxy_id);
-                }
+                self.closed_pages.insert(page_proxy_id.clone());
+                self.pending_page_messages.remove(&page_proxy_id);
             }
             Some("Playwright.provisionalLoadFailed") => {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -2377,6 +2372,14 @@ mod tests {
             PathBuf::from("downloads"),
         );
         assert!(connection.dispatch_message(json!({})).is_err());
+        assert!(
+            connection
+                .dispatch_browser_event(json!({
+                    "method": "Playwright.pageProxyDestroyed",
+                    "params": {}
+                }))
+                .is_err()
+        );
 
         connection
             .pages
