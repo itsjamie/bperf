@@ -1,6 +1,6 @@
 [package]
 name = "bperf-decision"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Evidence comparison, baselines, and optimization history for bperf"
 license = "MIT"

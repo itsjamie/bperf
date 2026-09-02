@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "bperf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bperf-browser",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "bperf-browser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bperf-runtime",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "bperf-build"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "bperf-decision"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bperf-browser",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "bperf-measurement"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bperf-browser",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "bperf-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "bperf-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rusqlite",

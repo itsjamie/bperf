@@ -82,7 +82,7 @@ Cargo can build and install the same self-contained executable directly from a
 tag:
 
 ```text
-cargo install --git https://github.com/itsjamie/bperf --tag v0.1.0 --locked bperf
+cargo install --git https://github.com/itsjamie/bperf --tag v0.1.1 --locked bperf
 bperf browsers install
 bperf doctor
 ```
