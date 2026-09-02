@@ -613,7 +613,13 @@ impl<Transport: JugglerTransport> JugglerConnection<Transport> {
                     bail!("Firefox attached an unsupported target type");
                 }
                 let target_id = required_string(target, "targetId")?;
-                self.sessions.entry(session_id.clone()).or_default();
+                if self.sessions.contains_key(&session_id)
+                    || self.target_sessions.contains_key(&target_id)
+                {
+                    bail!("Firefox reported a duplicate target attachment");
+                }
+                self.sessions
+                    .insert(session_id.clone(), SessionState::default());
                 self.target_sessions.insert(target_id, session_id);
                 Ok(None)
             }
@@ -1561,6 +1567,38 @@ mod tests {
             .expect("unissued response was accepted");
         assert!(error.to_string().contains("unissued response id 1"));
         assert!(connection.responses.is_empty());
+    }
+
+    #[test]
+    fn duplicate_target_attachments_are_rejected_without_overwriting_routes() {
+        let mut connection =
+            JugglerConnection::new(ScriptedTransport::default(), PathBuf::from("downloads"));
+        let attached = |session_id: &str, target_id: &str| {
+            json!({
+                "method": "Browser.attachedToTarget",
+                "params": {
+                    "sessionId": session_id,
+                    "targetInfo": {"type": "page", "targetId": target_id}
+                }
+            })
+        };
+
+        assert!(connection.dispatch(attached("session", "target")).is_ok());
+        assert!(
+            connection
+                .dispatch(attached("other-session", "target"))
+                .is_err()
+        );
+        assert!(
+            connection
+                .dispatch(attached("session", "other-target"))
+                .is_err()
+        );
+        assert_eq!(
+            connection.target_sessions.get("target").map(String::as_str),
+            Some("session")
+        );
+        assert_eq!(connection.sessions.len(), 1);
     }
 
     #[test]
