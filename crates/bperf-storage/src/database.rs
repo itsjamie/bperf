@@ -48,9 +48,24 @@ impl Database {
         Ok(database)
     }
 
-    /// Resolves a conventional collection such as `measurements` or `lineages`
-    /// to its enclosing data directory. Any other path is itself a data root.
+    /// Resolves an existing collection alias, then maps a conventional name
+    /// such as `measurements` or `lineages` to its enclosing data directory.
+    /// Any other path is itself a data root.
     pub fn for_collection(collection_root: &Path, conventional_name: &str) -> Result<Self> {
+        let collection_root = match fs::canonicalize(collection_root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                collection_root.to_owned()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve bperf collection {}",
+                        collection_root.display()
+                    )
+                });
+            }
+        };
         let data_root = if collection_root.file_name().and_then(|value| value.to_str())
             == Some(conventional_name)
         {
@@ -61,7 +76,7 @@ impl Database {
                 )
             })?
         } else {
-            collection_root
+            &collection_root
         };
         Self::open(data_root)
     }
@@ -741,6 +756,22 @@ mod tests {
                 .unwrap()
                 .join(DATABASE_NAME)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collection_aliases_resolve_to_the_same_database_as_their_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let measurements = directory.path().join("data").join("measurements");
+        fs::create_dir_all(&measurements).unwrap();
+        let alias = directory.path().join("artifact-override");
+        symlink(&measurements, &alias).unwrap();
+
+        let aliased = Database::for_collection(&alias, "measurements").unwrap();
+        let direct = Database::for_collection(&measurements, "measurements").unwrap();
+        assert!(aliased.same_store(&direct));
     }
 
     #[test]
