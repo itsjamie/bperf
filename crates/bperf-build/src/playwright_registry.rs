@@ -552,19 +552,21 @@ fn short_platform(host: &str) -> Result<&'static str> {
     if host == "win64" {
         return Ok("win-x64");
     }
-    if host.starts_with("mac") {
-        return Ok(if host.ends_with("-arm64") {
-            "mac-arm64"
-        } else {
-            "mac-x64"
-        });
+    if let Some(version) = host.strip_prefix("mac") {
+        if host.ends_with("-arm64") {
+            return Ok("mac-arm64");
+        }
+        if !version.is_empty() && !version.contains('-') {
+            return Ok("mac-x64");
+        }
     }
     if host.starts_with("ubuntu") || host.starts_with("debian") {
-        return Ok(if host.ends_with("-arm64") {
-            "linux-arm64"
-        } else {
-            "linux-x64"
-        });
+        if host.ends_with("-arm64") {
+            return Ok("linux-arm64");
+        }
+        if host.ends_with("-x64") {
+            return Ok("linux-x64");
+        }
     }
     bail!("unsupported Playwright host platform {host}")
 }
@@ -923,6 +925,13 @@ fn is_identifier_continue(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unknown_playwright_host_architectures() {
+        for host in ["win-arm64", "mac", "mac15-riscv64", "ubuntu24.04-ppc64"] {
+            assert!(short_platform(host).is_err(), "accepted {host}");
+        }
+    }
 
     #[test]
     fn verifies_the_pinned_npm_signature() {
