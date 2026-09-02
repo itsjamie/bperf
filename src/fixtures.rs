@@ -16,6 +16,9 @@ use crate::project_modules::project_file;
 
 const LOCK_SCHEMA_VERSION: u32 = 1;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+// Worker shutdown cannot interrupt a paced response sleep. Raise this only
+// after benchmark-host pacing waits on its shutdown signal.
+const MAX_STREAM_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -447,6 +450,15 @@ fn validate_descriptor(descriptor: &FixtureDescriptor) -> Result<()> {
     {
         bail!("fixture descriptor contains a zero stream chunk size");
     }
+    if descriptor
+        .response
+        .as_ref()
+        .and_then(|response| response.stream.as_ref())
+        .and_then(|stream| stream.interval_ms)
+        .is_some_and(|interval| interval > MAX_STREAM_INTERVAL_MS)
+    {
+        bail!("fixture descriptor stream interval exceeds {MAX_STREAM_INTERVAL_MS} ms");
+    }
     Ok(())
 }
 
@@ -571,6 +583,23 @@ mod tests {
 
         let error = read_lock(&lock).err().expect("duplicate lock was accepted");
         assert!(error.to_string().contains("duplicate descriptors"));
+    }
+
+    #[test]
+    fn fixture_stream_intervals_cannot_stall_host_shutdown() {
+        let descriptor: FixtureDescriptor = serde_json::from_value(json!({
+            "source": "fixture.txt",
+            "response": {
+                "stream": {
+                    "chunkSize": 1,
+                    "intervalMs": MAX_STREAM_INTERVAL_MS + 1,
+                },
+            },
+        }))
+        .unwrap();
+
+        let error = validate_descriptor(&descriptor).unwrap_err();
+        assert!(error.to_string().contains("stream interval exceeds"));
     }
 
     #[test]
