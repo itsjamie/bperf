@@ -1228,9 +1228,22 @@ fn thread_samples(thread: &GeckoThread) -> Result<Vec<GeckoSample>> {
     Ok(samples)
 }
 
-fn numeric_index(value: f64) -> Option<usize> {
-    (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= usize::MAX as f64)
-        .then_some(value as usize)
+fn required_index(row: &[Value], column: usize, field: &str) -> Result<usize> {
+    row.get(column)
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .with_context(|| format!("Firefox CPU profile has an invalid {field} index"))
+}
+
+fn optional_index(row: &[Value], column: usize, field: &str) -> Result<Option<usize>> {
+    let value = row
+        .get(column)
+        .with_context(|| format!("Firefox CPU profile has no {field} column"))?;
+    if value.is_null() {
+        Ok(None)
+    } else {
+        required_index(row, column, field).map(Some)
+    }
 }
 
 fn target_window_ids(profile: &GeckoProfile, target_url: &str) -> HashSet<u64> {
@@ -1284,35 +1297,29 @@ fn stack_belongs_to_target(
         .data
         .get(stack_index)
         .context("Firefox CPU profile references a missing stack")?;
-    let prefix = stack_row
-        .get(thread.stack_table.schema.prefix)
-        .and_then(Value::as_f64)
-        .and_then(numeric_index);
-    let frame_index = stack_row
-        .get(thread.stack_table.schema.frame)
-        .and_then(Value::as_f64)
-        .and_then(numeric_index);
-    let frame = frame_index.and_then(|index| thread.frame_table.data.get(index));
-    let location = frame
-        .and_then(|row| row.get(thread.frame_table.schema.location))
-        .and_then(Value::as_f64)
-        .and_then(numeric_index)
-        .and_then(|index| thread.string_table.get(index));
-    let inner_window_id = frame
-        .and_then(|row| {
-            thread
-                .frame_table
-                .schema
-                .inner_window_id
-                .and_then(|column| row.get(column))
-        })
+    let prefix = optional_index(stack_row, thread.stack_table.schema.prefix, "stack prefix")?;
+    let frame_index = required_index(stack_row, thread.stack_table.schema.frame, "stack frame")?;
+    let frame = thread
+        .frame_table
+        .data
+        .get(frame_index)
+        .context("Firefox CPU profile references a missing frame")?;
+    let location_index =
+        required_index(frame, thread.frame_table.schema.location, "frame location")?;
+    let location = thread
+        .string_table
+        .get(location_index)
+        .context("Firefox CPU profile references a missing location")?;
+    let inner_window_id = thread
+        .frame_table
+        .schema
+        .inner_window_id
+        .and_then(|column| frame.get(column))
         .and_then(Value::as_u64);
     let result = inner_window_id.is_some_and(|id| target_window_ids.contains(&id))
-        || location.is_some_and(|location| {
-            location.contains(target_url)
-                || location_contains_benchmark_code(location)
-                || benchmark_worker_entry(location)
-        })
+        || location.contains(target_url)
+        || location_contains_benchmark_code(location)
+        || benchmark_worker_entry(location)
         || prefix
             .map(|prefix| {
                 stack_belongs_to_target(
@@ -1461,42 +1468,35 @@ fn speedscope_stack(
         .data
         .get(stack_index)
         .context("Firefox CPU profile references a missing stack")?;
-    let prefix = row
-        .get(thread.stack_table.schema.prefix)
-        .and_then(Value::as_f64)
-        .and_then(numeric_index);
+    let prefix = optional_index(row, thread.stack_table.schema.prefix, "stack prefix")?;
     let mut stack = if let Some(prefix) = prefix {
         speedscope_stack(thread, prefix, page_urls, cache, builder, visiting)?
     } else {
         Vec::new()
     };
-    let frame_index = row
-        .get(thread.stack_table.schema.frame)
-        .and_then(Value::as_f64)
-        .and_then(numeric_index);
-    if let Some(frame_index) = frame_index {
-        let frame = thread.frame_table.data.get(frame_index);
-        let location = frame
-            .and_then(|row| row.get(thread.frame_table.schema.location))
-            .and_then(Value::as_f64)
-            .and_then(numeric_index)
-            .and_then(|index| thread.string_table.get(index))
-            .map_or("(unknown)", String::as_str);
-        let page_url = frame
-            .and_then(|row| {
-                thread
-                    .frame_table
-                    .schema
-                    .inner_window_id
-                    .and_then(|column| row.get(column))
-            })
-            .and_then(Value::as_u64)
-            .and_then(|id| page_urls.get(&id).copied());
-        let name = page_url
-            .filter(|url| !location.contains(*url))
-            .map_or_else(|| location.to_owned(), |url| format!("{location} ({url})"));
-        stack.push(builder.frame(SpeedscopeFrame::named(name)));
-    }
+    let frame_index = required_index(row, thread.stack_table.schema.frame, "stack frame")?;
+    let frame = thread
+        .frame_table
+        .data
+        .get(frame_index)
+        .context("Firefox CPU profile references a missing frame")?;
+    let location_index =
+        required_index(frame, thread.frame_table.schema.location, "frame location")?;
+    let location = thread
+        .string_table
+        .get(location_index)
+        .context("Firefox CPU profile references a missing location")?;
+    let page_url = thread
+        .frame_table
+        .schema
+        .inner_window_id
+        .and_then(|column| frame.get(column))
+        .and_then(Value::as_u64)
+        .and_then(|id| page_urls.get(&id).copied());
+    let name = page_url
+        .filter(|url| !location.contains(*url))
+        .map_or_else(|| location.to_owned(), |url| format!("{location} ({url})"));
+    stack.push(builder.frame(SpeedscopeFrame::named(name)));
     visiting.remove(&stack_index);
     cache.insert(stack_index, stack.clone());
     Ok(stack)
@@ -1663,7 +1663,7 @@ mod tests {
         .unwrap();
         assert!(thread_samples(&malformed.threads[0]).is_err());
 
-        let profile = parse_profile(
+        let mut profile = parse_profile(
             &json!({
                 "meta": {"interval": 1},
                 "pages": [{
@@ -1693,6 +1693,9 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        assert!(cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").is_err());
+        profile.threads[0].samples.data[1][0] = json!(0);
+        profile.threads[0].stack_table.data[0][1] = json!(1);
         assert!(cpu_active_milliseconds(&profile, "http://127.0.0.1:4317/").is_err());
     }
 
