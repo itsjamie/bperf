@@ -6,7 +6,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -41,6 +42,9 @@ pub(crate) const ADAPTER_PROTOCOL_VERSION: u32 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+// Current manifests are below 300 KiB; raise this with an adapter protocol
+// update if upstream expands the schema substantially.
+const MAX_PRIVATE_PROTOCOL_BYTES: u64 = 4 * 1024 * 1024;
 const REQUIRED_PROTOCOL_COMMANDS: &[&str] = &[
     "Dialog.enable",
     "Emulation.setActiveAndFocused",
@@ -226,11 +230,8 @@ struct ProtocolParameter {
 }
 
 fn validate_private_protocol(path: &Path) -> Result<()> {
-    let domains: Vec<ProtocolDomain> = serde_json::from_slice(
-        &fs::read(path)
-            .with_context(|| format!("failed to read WebKit protocol {}", path.display()))?,
-    )
-    .with_context(|| format!("invalid WebKit protocol {}", path.display()))?;
+    let domains: Vec<ProtocolDomain> = serde_json::from_slice(&read_private_protocol(path)?)
+        .with_context(|| format!("invalid WebKit protocol {}", path.display()))?;
     let mut commands = HashMap::<String, HashSet<String>>::new();
     let mut events = HashMap::<String, HashSet<String>>::new();
     for domain in domains {
@@ -287,6 +288,27 @@ fn validate_private_protocol(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_private_protocol(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect WebKit protocol {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("WebKit protocol is not a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_PRIVATE_PROTOCOL_BYTES {
+        bail!("WebKit protocol exceeds the size limit: {}", path.display());
+    }
+    let mut source = Vec::new();
+    File::open(path)
+        .with_context(|| format!("failed to open WebKit protocol {}", path.display()))?
+        .take(MAX_PRIVATE_PROTOCOL_BYTES + 1)
+        .read_to_end(&mut source)
+        .with_context(|| format!("failed to read WebKit protocol {}", path.display()))?;
+    if source.len() as u64 > MAX_PRIVATE_PROTOCOL_BYTES {
+        bail!("WebKit protocol exceeds the size limit: {}", path.display());
+    }
+    Ok(source)
 }
 
 pub(crate) struct WebKitLane {
@@ -2447,6 +2469,39 @@ mod tests {
             .to_string();
         assert!(error.contains("Page.overrideUserAgent"));
         assert!(error.contains("incompatible"));
+    }
+
+    #[test]
+    fn private_protocol_preflight_requires_a_bounded_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b' '; MAX_PRIVATE_PROTOCOL_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            validate_private_protocol(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = directory.path().join("target.json");
+            let alias = directory.path().join("alias.json");
+            fs::write(&target, b"[]").unwrap();
+            symlink(&target, &alias).unwrap();
+            assert!(
+                validate_private_protocol(&alias)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("regular file")
+            );
+        }
     }
 
     #[test]
