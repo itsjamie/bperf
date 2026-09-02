@@ -33,6 +33,9 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_SNAPSHOT_PREFIX: &str = "Firefox emitted an invalid .fxsnapshot: ";
 const MAX_PROTOBUF_FIELD_NUMBER: u64 = (1 << 29) - 1;
 const MAX_PROTOBUF_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+// Firefox heap snapshots do not use protobuf groups; this accommodates unknown
+// extensions without allowing corrupted input to exhaust the parser stack.
+const MAX_PROTOBUF_GROUP_DEPTH: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const NODE_ID_FIELD: u64 = 1;
 const NODE_SIZE_FIELD: u64 = 4;
@@ -723,6 +726,7 @@ fn node_size(message: &[u8]) -> Result<u64> {
                 message.len(),
                 tag.field_number,
                 tag.wire_type,
+                0,
             )?;
         }
     }
@@ -789,6 +793,7 @@ fn skip_field(
     limit: usize,
     field_number: u64,
     wire_type: u8,
+    group_depth: usize,
 ) -> Result<usize> {
     match wire_type {
         0 => Ok(read_varint(buffer, offset, limit)?.next_offset),
@@ -806,6 +811,11 @@ fn skip_field(
             Ok(encoded.next_offset + length)
         }
         3 => {
+            if group_depth >= MAX_PROTOBUF_GROUP_DEPTH {
+                return Err(invalid_snapshot(
+                    "protobuf group nesting exceeds the parser limit",
+                ));
+            }
             let mut cursor = offset;
             while cursor < limit {
                 let tag = read_tag(buffer, cursor, limit)?;
@@ -816,7 +826,14 @@ fn skip_field(
                     }
                     return Ok(cursor);
                 }
-                cursor = skip_field(buffer, cursor, limit, tag.field_number, tag.wire_type)?;
+                cursor = skip_field(
+                    buffer,
+                    cursor,
+                    limit,
+                    tag.field_number,
+                    tag.wire_type,
+                    group_depth + 1,
+                )?;
             }
             Err(invalid_snapshot("unterminated protobuf group"))
         }
@@ -924,6 +941,16 @@ mod tests {
         assert_eq!(node_size(&[0x08, 0x01, 0x20, 0x50]).unwrap(), 80);
         assert!(node_size(&[0x20, 0x50]).is_err());
         assert!(node_size(&[0x08, 0x01]).is_err());
+    }
+
+    #[test]
+    fn protobuf_groups_cannot_exhaust_the_parser_stack() {
+        let mut message = vec![0x08, 0x01, 0x20, 0x01];
+        message.extend(std::iter::repeat_n(0x13, MAX_PROTOBUF_GROUP_DEPTH + 1));
+        message.extend(std::iter::repeat_n(0x14, MAX_PROTOBUF_GROUP_DEPTH + 1));
+
+        let error = node_size(&message).unwrap_err();
+        assert!(error.to_string().contains("nesting"));
     }
 
     #[test]
