@@ -19,6 +19,8 @@ use bperf_browser::lab::{BrowserTrialConfig, Engine, Viewport};
 const SCHEMA_VERSION: u32 = 1;
 // Schedules are materialized eagerly; raise this only after their representation becomes lazy.
 const MAX_SCHEDULED_TRIALS: u64 = 100_000;
+// Bootstrap retains every estimate; raise this only after quantiles use bounded storage.
+const MAX_BOOTSTRAP_SAMPLES: u32 = 1_000_000;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -354,8 +356,8 @@ impl BenchmarkManifest {
         if !(0.0..1.0).contains(&self.statistics.confidence) {
             bail!("statistics.confidence must be between 0 and 1");
         }
-        if self.statistics.bootstrap_samples < 1_000 {
-            bail!("statistics.bootstrap_samples must be at least 1000");
+        if !(1_000..=MAX_BOOTSTRAP_SAMPLES).contains(&self.statistics.bootstrap_samples) {
+            bail!("statistics.bootstrap_samples must be between 1000 and {MAX_BOOTSTRAP_SAMPLES}");
         }
         if self.statistics.primary_metrics.is_empty() {
             bail!("statistics.primary_metrics must not be empty");
@@ -1028,6 +1030,14 @@ mod tests {
         let changed = BENCHMARK.replace("  max_final_samples: 100", "  max_final_samples: 40000");
         let error = parse_benchmark(&changed).unwrap_err();
         assert!(error.to_string().contains("120039 trials"));
+    }
+
+    #[test]
+    fn rejects_bootstrap_work_too_large_to_materialize() {
+        let changed =
+            BENCHMARK.replace("  bootstrap_samples: 10000", "  bootstrap_samples: 1000001");
+        let error = parse_benchmark(&changed).unwrap_err();
+        assert!(error.to_string().contains("between 1000 and 1000000"));
     }
 
     #[test]
