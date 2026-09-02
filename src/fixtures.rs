@@ -16,6 +16,9 @@ use crate::project_modules::project_file;
 
 const LOCK_SCHEMA_VERSION: u32 = 1;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+// Fixture bodies are fully cached before a run. Raise this only after acquisition
+// enforces an aggregate cache quota across every fixture in a benchmark.
+const MAX_FIXTURE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 // Worker shutdown cannot interrupt a paced response sleep. Raise this only
 // after benchmark-host pacing waits on its shutdown signal.
 const MAX_STREAM_INTERVAL_MS: u64 = 10_000;
@@ -388,6 +391,15 @@ fn copy_body(
     destination: &mut impl Write,
     label: &str,
 ) -> Result<(String, u64)> {
+    copy_body_with_limit(source, destination, label, MAX_FIXTURE_BYTES)
+}
+
+fn copy_body_with_limit(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    label: &str,
+    max_bytes: u64,
+) -> Result<(String, u64)> {
     let mut digest = Sha256::new();
     let mut size = 0_u64;
     let mut chunk = [0_u8; COPY_BUFFER_BYTES];
@@ -401,6 +413,9 @@ fn copy_body(
         size = size
             .checked_add(count as u64)
             .context("benchmark fixture size overflowed")?;
+        if size > max_bytes {
+            bail!("{label} exceeds the {max_bytes} byte fixture size limit");
+        }
         digest.update(&chunk[..count]);
         destination
             .write_all(&chunk[..count])
@@ -718,6 +733,17 @@ mod tests {
             cached.sha256,
             format!("{:x}", Sha256::digest(vec![b'x'; size]))
         );
+    }
+
+    #[test]
+    fn fixture_cache_rejects_bodies_past_its_size_limit() {
+        let mut source = &b"oversized"[..];
+        let mut destination = Vec::new();
+
+        let error = copy_body_with_limit(&mut source, &mut destination, "fixture", 8).unwrap_err();
+
+        assert!(error.to_string().contains("fixture size limit"));
+        assert!(destination.is_empty());
     }
 
     #[cfg(unix)]
