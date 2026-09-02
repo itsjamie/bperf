@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 use bperf_browser::lab::{BrowserTrialConfig, Engine, Viewport};
 
 const SCHEMA_VERSION: u32 = 1;
+// Schedules are materialized eagerly; raise this only after their representation becomes lazy.
+const MAX_SCHEDULED_TRIALS: u64 = 100_000;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -326,6 +328,27 @@ impl BenchmarkManifest {
             }
         } else {
             self.adaptive_final_sample_range()?;
+        }
+        let final_samples = match &self.trials.mode {
+            TrialCount::Count(count) => *count,
+            TrialCount::Label(_) => self.trials.max_final_samples,
+        };
+        let strata = self
+            .workloads
+            .len()
+            .checked_mul(self.browser.engines.len())
+            .and_then(|count| u64::try_from(count).ok())
+            .context("trial schedule size overflowed")?;
+        let samples_per_stratum = u64::from(self.trials.warmup_samples)
+            + u64::from(self.trials.pilot_samples)
+            + u64::from(final_samples);
+        let scheduled_trials = strata
+            .checked_mul(samples_per_stratum)
+            .context("trial schedule size overflowed")?;
+        if scheduled_trials > MAX_SCHEDULED_TRIALS {
+            bail!(
+                "trial schedule contains {scheduled_trials} trials; maximum is {MAX_SCHEDULED_TRIALS}"
+            );
         }
 
         if !(0.0..1.0).contains(&self.statistics.confidence) {
@@ -998,6 +1021,13 @@ mod tests {
         let changed = BENCHMARK.replace("  mode: auto", "  mode: eventually");
         let error = parse_benchmark(&changed).unwrap_err();
         assert!(error.to_string().contains("unsupported trials.mode"));
+    }
+
+    #[test]
+    fn rejects_trial_schedules_too_large_to_materialize() {
+        let changed = BENCHMARK.replace("  max_final_samples: 100", "  max_final_samples: 40000");
+        let error = parse_benchmark(&changed).unwrap_err();
+        assert!(error.to_string().contains("120039 trials"));
     }
 
     #[test]
