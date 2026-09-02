@@ -66,18 +66,7 @@ impl Database {
                 });
             }
         };
-        let data_root = if collection_root.file_name().and_then(|value| value.to_str())
-            == Some(conventional_name)
-        {
-            collection_root.parent().with_context(|| {
-                format!(
-                    "bperf {conventional_name} collection has no data directory: {}",
-                    collection_root.display()
-                )
-            })?
-        } else {
-            &collection_root
-        };
+        let data_root = collection_data_root(&collection_root, conventional_name)?;
         Self::open(data_root)
     }
 
@@ -249,6 +238,26 @@ impl Database {
             .context("failed to configure bperf database durability")?;
         Ok(connection)
     }
+}
+
+fn collection_data_root<'a>(
+    collection_root: &'a Path,
+    conventional_name: &str,
+) -> Result<&'a Path> {
+    if collection_root.file_name().and_then(|value| value.to_str()) != Some(conventional_name) {
+        return Ok(collection_root);
+    }
+    let parent = collection_root.parent().with_context(|| {
+        format!(
+            "bperf {conventional_name} collection has no data directory: {}",
+            collection_root.display()
+        )
+    })?;
+    Ok(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
 }
 
 /// Reusable query-only connection without a long-lived read transaction.
@@ -755,6 +764,14 @@ mod tests {
             fs::canonicalize(directory.path())
                 .unwrap()
                 .join(DATABASE_NAME)
+        );
+    }
+
+    #[test]
+    fn relative_conventional_collection_uses_the_current_directory() {
+        assert_eq!(
+            collection_data_root(Path::new("measurements"), "measurements").unwrap(),
+            Path::new(".")
         );
     }
 
