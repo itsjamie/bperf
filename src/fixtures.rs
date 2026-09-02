@@ -238,10 +238,19 @@ fn acquire(
 ) -> Result<FixtureLockEntry> {
     let fallback_content_type = inferred_content_type(&descriptor.source);
     let (cached, source_url, final_url, content_type) = if let Some(source_uri) =
-        remote_uri(&descriptor.source)
+        remote_uri(&descriptor.source)?
     {
         let source_url = source_uri.to_string();
-        let mut response = match agent.get(&source_url).call() {
+        let https_only = source_uri
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
+        let mut response = match agent
+            .get(&source_url)
+            .config()
+            .https_only(https_only)
+            .build()
+            .call()
+        {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(status)) => {
                 bail!("remote fixture {source_url} returned HTTP {status}")
@@ -437,12 +446,31 @@ fn fixture_key(descriptor: &FixtureDescriptor) -> Result<String> {
     serde_json::to_string(descriptor).context("failed to encode fixture descriptor")
 }
 
-fn remote_uri(source: &str) -> Option<Uri> {
-    let uri = source.parse::<Uri>().ok()?;
-    let scheme = uri.scheme_str()?;
-    (uri.authority().is_some()
-        && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")))
-    .then_some(uri)
+fn remote_uri(source: &str) -> Result<Option<Uri>> {
+    let Ok(uri) = source.parse::<Uri>() else {
+        return Ok(None);
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return Ok(None);
+    };
+    if uri.authority().is_none()
+        || !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+    {
+        return Ok(None);
+    }
+    let host = uri
+        .host()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if scheme.eq_ignore_ascii_case("http") && !loopback {
+        bail!("remote benchmark fixtures require HTTPS outside loopback");
+    }
+    Ok(Some(uri))
 }
 
 fn inferred_content_type(source: &str) -> String {
@@ -634,6 +662,22 @@ mod tests {
                 .to_string()
                 .contains("outside the content-addressed fixture cache"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn remote_fixtures_require_https_outside_loopback() {
+        let error = remote_uri("http://example.com/fixture.bin").unwrap_err();
+        assert!(error.to_string().contains("require HTTPS"));
+        assert!(
+            remote_uri("https://example.com/fixture.bin")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            remote_uri("http://127.0.0.1/fixture.bin")
+                .unwrap()
+                .is_some()
         );
     }
 
