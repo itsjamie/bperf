@@ -2366,6 +2366,25 @@ fn validate_events(
                         path.display()
                     );
                 }
+                if cycle.recorded_at_unix_ms == 0
+                    || [
+                        &cycle.subject_id,
+                        &cycle.benchmark_sha256,
+                        &cycle.candidate_measurement_set,
+                        &cycle.candidate_measurement_path,
+                        &cycle.environment_fingerprint,
+                    ]
+                    .iter()
+                    .any(|value| value.trim().is_empty())
+                    || cycle.message.as_ref().is_some_and(|message| {
+                        message.trim().is_empty() || message.len() > MAX_MESSAGE_BYTES
+                    })
+                {
+                    bail!(
+                        "optimization history {} contains incomplete cycle metadata",
+                        path.display()
+                    );
+                }
                 require_cycle_id(&cycle.cycle_id)?;
                 if let Some(previous_cycle_id) = &cycle.previous_cycle_id {
                     require_cycle_id(previous_cycle_id)?;
@@ -2469,6 +2488,12 @@ fn validate_events(
                         path.display()
                     );
                 }
+                if confirmation.recorded_at_unix_ms == 0 {
+                    bail!(
+                        "optimization history {} contains incomplete confirmation metadata",
+                        path.display()
+                    );
+                }
                 require_hash_id(
                     "confirmation",
                     &confirmation.confirmation_id,
@@ -2529,6 +2554,17 @@ fn validate_events(
                 {
                     bail!(
                         "optimization history {} has incompatible identity",
+                        path.display()
+                    );
+                }
+                if promotion.recorded_at_unix_ms == 0
+                    || promotion
+                        .previous_baseline_measurement_set
+                        .as_ref()
+                        .is_some_and(|measurement| measurement.trim().is_empty())
+                {
+                    bail!(
+                        "optimization history {} contains incomplete promotion metadata",
                         path.display()
                     );
                 }
@@ -4410,6 +4446,32 @@ mod tests {
         assert!(
             error.to_string().contains("non-relative component"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn stored_cycles_must_have_complete_metadata() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let seed = LineageStore::open(&temporary.path().join("seed")).unwrap();
+        let state = seed
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let mut incomplete = seed.append_cycle(cycle(state, "measure-1")).unwrap();
+        incomplete.environment_fingerprint.clear();
+
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        store
+            .append_event("parser", &LineageEvent::Cycle(Box::new(incomplete)))
+            .unwrap();
+
+        let error = store.read_events("parser").unwrap_err();
+        assert!(
+            error.to_string().contains("incomplete cycle metadata"),
+            "unexpected error: {error:#}"
         );
     }
 
