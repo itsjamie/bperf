@@ -474,6 +474,7 @@ mod tests {
         sampling::{BATCH_SIZE_METRIC, TRIAL_ELAPSED_METRIC},
         store::{self as measurement, TrialResult},
     };
+    use bperf_browser::artifacts::expected_artifact_format;
 
     #[test]
     fn completed_measurements_keep_median_representatives() {
@@ -639,7 +640,7 @@ mod tests {
                         path: relative.to_string_lossy().replace('\\', "/"),
                         size_bytes: bytes.len() as u64,
                         sha256: format!("{:x}", Sha256::digest(&bytes)),
-                        format: "synthetic".to_owned(),
+                        format: expected_artifact_format(engine, kind).to_owned(),
                     }
                 })
             })

@@ -95,6 +95,15 @@ fn layout(engine: Engine) -> &'static [ArtifactSpec; 3] {
     }
 }
 
+/// Returns the stable descriptor format required for one engine artifact.
+pub fn expected_artifact_format(engine: Engine, kind: ArtifactKind) -> &'static str {
+    layout(engine)
+        .iter()
+        .find(|spec| spec.kind == kind)
+        .expect("artifact layouts contain every required kind")
+        .format
+}
+
 /// Prepares and completes the three immutable files required for one capture scope.
 ///
 /// Existing files at the engine's expected paths are replaced before capture.
@@ -312,7 +321,7 @@ pub fn validate_artifact_set(engine: Engine, artifacts: &[ArtifactEvidence]) -> 
             );
         }
         if artifact.size_bytes == 0
-            || artifact.format.trim().is_empty()
+            || artifact.format != expected_artifact_format(engine, artifact.kind)
             || !is_sha256(&artifact.sha256)
         {
             bail!("{engine} artifact descriptor is invalid: {}", artifact.path);
@@ -725,6 +734,9 @@ mod tests {
         .unwrap();
         assert!(validate_artifacts(Engine::Webkit, directory.path(), &artifacts).is_err());
 
+        let format = std::mem::replace(&mut artifacts[0].format, "unknown".to_owned());
+        assert!(validate_artifact_set(Engine::Webkit, &artifacts).is_err());
+        artifacts[0].format = format;
         artifacts[0].path = "../outside.json".to_owned();
         assert!(validate_artifact_set(Engine::Webkit, &artifacts).is_err());
     }

@@ -1322,7 +1322,7 @@ mod tests {
         retention as artifact_retention,
         sampling::{self, BATCH_SIZE_METRIC, CAPTURE_ELAPSED_METRIC, TRIAL_ELAPSED_METRIC},
     };
-    use bperf_browser::lab::ArtifactKind;
+    use bperf_browser::{artifacts::expected_artifact_format, lab::ArtifactKind};
 
     #[test]
     fn immutable_write_is_idempotent_but_never_overwrites() {
@@ -1848,7 +1848,7 @@ mod tests {
                 path: relative.to_string_lossy().replace('\\', "/"),
                 size_bytes: bytes.len() as u64,
                 sha256: format!("{:x}", Sha256::digest(&bytes)),
-                format: "synthetic".into(),
+                format: expected_artifact_format(engine, kind).into(),
             }
         })
         .collect()

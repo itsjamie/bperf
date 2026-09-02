@@ -4,6 +4,10 @@ use std::{
     process::Command,
 };
 
+use bperf_browser::{
+    artifacts::expected_artifact_format,
+    lab::{ArtifactKind, Engine},
+};
 use bperf_storage::database::Database;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -135,16 +139,22 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
         .unwrap();
     for trial in schedule["trials"].as_array().unwrap() {
         let trial_id = trial["trial_id"].as_str().unwrap();
+        let engine = match trial["engine"].as_str().unwrap() {
+            "chromium" => Engine::Chromium,
+            "firefox" => Engine::Firefox,
+            "webkit" => Engine::Webkit,
+            _ => unreachable!(),
+        };
         let artifact_dir = root.join("synthetic-artifacts").join(trial_id);
         fs::create_dir_all(&artifact_dir).unwrap();
         let mut artifacts = Vec::new();
-        let artifact_kinds: &[(&str, &str)] = &[
-            ("cpu_profile", "cpu.json"),
-            ("js_heap", "heap.json"),
-            ("flamegraph", "flamegraph.json"),
+        let artifact_kinds: &[(ArtifactKind, &str)] = &[
+            (ArtifactKind::CpuProfile, "cpu.json"),
+            (ArtifactKind::JsHeap, "heap.json"),
+            (ArtifactKind::Flamegraph, "flamegraph.json"),
         ];
         for (kind, name) in artifact_kinds {
-            let bytes = format!("{trial_id}-{kind}").into_bytes();
+            let bytes = format!("{trial_id}-{kind:?}").into_bytes();
             let path = artifact_dir.join(name);
             fs::write(&path, &bytes).unwrap();
             artifacts.push(serde_json::json!({
@@ -161,7 +171,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
                     .replace('\\', "/"),
                 "size_bytes": bytes.len(),
                 "sha256": format!("{:x}", Sha256::digest(&bytes)),
-                "format": "synthetic test evidence"
+                "format": expected_artifact_format(engine, *kind)
             }));
         }
         database

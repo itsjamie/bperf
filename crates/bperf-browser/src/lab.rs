@@ -869,7 +869,7 @@ mod tests {
                 path: name.to_owned(),
                 size_bytes: bytes.len() as u64,
                 sha256: format!("{:x}", Sha256::digest(&bytes)),
-                format: "test".to_owned(),
+                format: crate::artifacts::expected_artifact_format(engine, kind).to_owned(),
             });
         }
         CaptureEvidence {
