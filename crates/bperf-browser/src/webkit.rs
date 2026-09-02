@@ -1173,15 +1173,14 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
                 }
             }
             Some("Network.loadingFinished") | Some("Network.loadingFailed") => {
-                if let Some(request_id) = params.get("requestId").and_then(Value::as_str)
-                    && let Some(target) = self
-                        .pages
-                        .get_mut(page_proxy_id)
-                        .and_then(|page| page.targets.get_mut(target_id))
-                {
-                    target.request_urls.remove(request_id);
-                    target.pending_interceptions.remove(request_id);
-                }
+                let request_id = required_string(&params, "requestId")?;
+                let target = self
+                    .pages
+                    .get_mut(page_proxy_id)
+                    .and_then(|page| page.targets.get_mut(target_id))
+                    .context("network completion belongs to an unknown WebKit target")?;
+                target.request_urls.remove(&request_id);
+                target.pending_interceptions.remove(&request_id);
             }
             Some("Worker.workerCreated") => {
                 let worker_id = required_string(&params, "workerId")?;
@@ -2387,6 +2386,15 @@ mod tests {
         assert!(
             connection
                 .dispatch_page_message("proxy", json!({}))
+                .is_err()
+        );
+        assert!(
+            connection
+                .dispatch_target_event(
+                    "proxy",
+                    "target",
+                    json!({"method": "Network.loadingFinished", "params": {}}),
+                )
                 .is_err()
         );
         assert!(
