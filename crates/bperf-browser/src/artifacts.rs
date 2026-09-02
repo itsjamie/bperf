@@ -329,15 +329,20 @@ pub fn validate_artifact_files(
     let canonical_root = fs::canonicalize(root)?;
     for artifact in artifacts {
         let relative = Path::new(&artifact.path);
-        let canonical_path = fs::canonicalize(canonical_root.join(relative))
+        let path = canonical_root.join(relative);
+        let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("artifact does not exist: {}", artifact.path))?;
+        if !metadata.is_file() {
+            bail!("{engine} artifact is not a regular file: {}", artifact.path);
+        }
+        let canonical_path = fs::canonicalize(path)?;
         if !canonical_path.starts_with(&canonical_root) {
             bail!(
                 "{engine} artifact escaped its artifact directory: {}",
                 artifact.path
             );
         }
-        let actual_size = fs::metadata(&canonical_path)?.len();
+        let actual_size = metadata.len();
         if actual_size == 0 || actual_size != artifact.size_bytes {
             bail!(
                 "{engine} artifact size mismatch for {}: reported {}, actual {}",
@@ -722,6 +727,22 @@ mod tests {
 
         artifacts[0].path = "../outside.json".to_owned();
         assert!(validate_artifact_set(Engine::Webkit, &artifacts).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_rejects_artifact_symlinks_inside_the_capture_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let artifacts = complete_artifacts(directory.path(), Engine::Chromium);
+        let path = directory.path().join(&artifacts[0].path);
+        let target = directory.path().join("moved-profile");
+        fs::rename(&path, &target).unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = validate_artifacts(Engine::Chromium, directory.path(), &artifacts).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]
