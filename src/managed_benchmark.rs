@@ -753,8 +753,12 @@ fn validate_description(description: &ManagedDescription) -> Result<()> {
     if description.cases.is_empty() {
         bail!("managed benchmark contains no cases");
     }
+    let mut case_ids = BTreeSet::new();
     for case in &description.cases {
         validate_workload_id(&case.id)?;
+        if !case_ids.insert(&case.id) {
+            bail!("managed benchmark contains duplicate case {:?}", case.id);
+        }
     }
     if description.source_files.is_empty() {
         bail!("managed benchmark resolved no source files");
@@ -1044,6 +1048,26 @@ mod tests {
 
         let error = validate_description(&description).unwrap_err();
         assert!(error.to_string().contains("workload id"));
+    }
+
+    #[test]
+    fn managed_case_ids_must_be_unique() {
+        let case = || ManagedCase {
+            id: "duplicate".to_owned(),
+            expectation: ManagedExpectation::Exact { value: json!(42) },
+        };
+        let description = ManagedDescription {
+            schema_version: 1,
+            benchmark_id: "benchmark".to_owned(),
+            cases: vec![case(), case()],
+            source_files: vec![PathBuf::from("unreached")],
+            fixture_files: Vec::new(),
+            fixture_lock: PathBuf::from("unreached"),
+        };
+
+        let error = validate_description(&description).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate case"));
     }
 
     #[test]
