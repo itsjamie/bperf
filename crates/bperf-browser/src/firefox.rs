@@ -589,6 +589,9 @@ impl<Transport: JugglerTransport> JugglerConnection<Transport> {
                     ));
                 }
             } else {
+                if self.responses.contains_key(&id) {
+                    bail!("Firefox Juggler returned duplicate response id {id}");
+                }
                 self.responses.insert(id, result);
             }
             return Ok(None);
@@ -1558,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn unissued_response_ids_are_rejected() {
+    fn unissued_and_duplicate_response_ids_are_rejected() {
         let mut connection =
             JugglerConnection::new(ScriptedTransport::default(), PathBuf::from("downloads"));
         let error = connection
@@ -1567,6 +1570,19 @@ mod tests {
             .expect("unissued response was accepted");
         assert!(error.to_string().contains("unissued response id 1"));
         assert!(connection.responses.is_empty());
+
+        connection.next_id = 2;
+        assert!(
+            connection
+                .dispatch(json!({"id": 1, "result": {"value": "first"}}))
+                .is_ok()
+        );
+        assert!(
+            connection
+                .dispatch(json!({"id": 1, "result": {"value": "second"}}))
+                .is_err()
+        );
+        assert_eq!(connection.responses[&1].as_ref().unwrap()["value"], "first");
     }
 
     #[test]

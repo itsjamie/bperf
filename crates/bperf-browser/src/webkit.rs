@@ -904,6 +904,9 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         } else {
             Ok(message.get("result").cloned().unwrap_or(Value::Null))
         };
+        if self.responses.contains_key(&id) {
+            bail!("WebKit inspector returned duplicate response id {id}");
+        }
         self.responses.insert(id, response);
         Ok(())
     }
@@ -2355,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn unissued_response_ids_are_rejected() {
+    fn unissued_and_duplicate_response_ids_are_rejected() {
         let mut connection = InspectorConnection::new(
             FakeTransport::default(),
             default_user_agent("26.5"),
@@ -2366,6 +2369,19 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unissued response id 1"));
         assert!(connection.responses.is_empty());
+
+        connection.next_id = 2;
+        assert!(
+            connection
+                .dispatch_message(json!({"id": 1, "result": {"value": "first"}}))
+                .is_ok()
+        );
+        assert!(
+            connection
+                .dispatch_message(json!({"id": 1, "result": {"value": "second"}}))
+                .is_err()
+        );
+        assert_eq!(connection.responses[&1].as_ref().unwrap()["value"], "first");
     }
 
     #[test]
