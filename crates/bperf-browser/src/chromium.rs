@@ -1346,6 +1346,7 @@ fn parse_cpu_profile(value: &Value) -> Result<ChromiumProfile> {
     if profile.nodes.is_empty()
         || profile.samples.is_empty()
         || profile.samples.len() != profile.time_deltas.len()
+        || profile.time_deltas.iter().any(|delta| *delta < 0)
     {
         bail!("Chromium emitted an invalid CPU profile");
     }
@@ -1648,6 +1649,17 @@ mod tests {
                 }],
                 "samples": [1],
                 "timeDeltas": [1]
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_cpu_profile(&json!({
+                "nodes": [{
+                    "id": 1,
+                    "callFrame": {"lineNumber": 0, "columnNumber": 0}
+                }],
+                "samples": [1],
+                "timeDeltas": [-1]
             }))
             .is_err()
         );
