@@ -2071,6 +2071,9 @@ impl<Transport: InspectorTransport> InspectorConnection<Transport> {
         );
         self.contexts.remove(&page.browser_context_id);
         self.closing_contexts.remove(&page.browser_context_id);
+        // A retained lane runs one context at a time. Track context generations
+        // instead if page lifetimes are ever allowed to overlap.
+        self.closed_pages.clear();
         for page_proxy_id in context_pages {
             self.pages.remove(&page_proxy_id);
             self.closed_pages.insert(page_proxy_id.clone());
@@ -3029,6 +3032,36 @@ mod tests {
                 .fatal_error
                 .as_deref()
                 .is_some_and(|error| error.contains("unexpected"))
+        );
+    }
+
+    #[test]
+    fn closing_a_context_discards_older_page_tombstones() {
+        let mut transport = ScriptedTransport::default();
+        transport
+            .incoming
+            .get_mut()
+            .push_back(json!({"id": 1, "result": {}}));
+        let mut connection = InspectorConnection::new(
+            transport,
+            default_user_agent("26.5"),
+            PathBuf::from("downloads"),
+        );
+        connection.closed_pages.insert("older".to_owned());
+        connection
+            .pages
+            .insert("current".to_owned(), route("target", None));
+
+        connection
+            .close_page(OpenPage {
+                browser_context_id: "context".to_owned(),
+                page_proxy_id: "current".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            connection.closed_pages,
+            HashSet::from(["current".to_owned()])
         );
     }
 
