@@ -143,11 +143,25 @@ pub(crate) fn is_allowed_adapter_url(value: &str) -> bool {
 }
 
 pub(crate) fn is_allowed_trial_url(value: &str) -> bool {
-    if ["data:", "blob:", "about:"]
-        .iter()
-        .any(|prefix| value.starts_with(prefix))
-    {
+    let Some((scheme, remainder)) = value.split_once(':') else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("data") {
         return true;
+    }
+    if scheme.eq_ignore_ascii_case("about") {
+        return matches!(remainder.split(['?', '#']).next(), Some("blank" | "srcdoc"));
+    }
+    if scheme.eq_ignore_ascii_case("blob") {
+        return remainder
+            .strip_prefix("null/")
+            .is_some_and(|identifier| !identifier.is_empty())
+            || split_url(remainder).is_some_and(|(scheme, host)| {
+                ["http", "https"]
+                    .iter()
+                    .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+                    && is_loopback_host(host)
+            });
     }
     split_url(value).is_some_and(|(scheme, host)| {
         ["http", "https", "ws", "wss"]
@@ -237,11 +251,15 @@ mod tests {
             "http://user@127.0.0.1/",
             "http://127.0.0.1:invalid/",
             "ws://192.168.1.2/",
+            "blob:https://example.com/worker-id",
+            "blob:file:///tmp/worker-id",
+            "about:config",
             "file:///tmp/a",
             "javascript:alert(1)",
         ] {
             assert!(!is_allowed_trial_url(url), "{url}");
         }
+        assert!(is_allowed_trial_url("blob:null/worker-id"));
         assert!(is_allowed_adapter_url("http://127.0.0.1:4317/"));
         assert!(!is_allowed_adapter_url("https://127.0.0.1:4317/"));
     }
