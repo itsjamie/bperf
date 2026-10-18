@@ -459,6 +459,7 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         bail!("browser archive contains too many entries");
     }
     let mut total_size = 0_u64;
+    let mut symlinks = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         total_size = total_size
@@ -480,7 +481,12 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         if entry.is_symlink() {
-            install_symlink(&mut entry, destination, &relative, declared_size)?;
+            symlinks.push(install_symlink(
+                &mut entry,
+                destination,
+                &relative,
+                declared_size,
+            )?);
             continue;
         }
         let parent = create_archive_directory(
@@ -506,16 +512,31 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         }
         set_mode(&target, entry.unix_mode())?;
     }
+    // Archives may list a symlink before the entries its target passes
+    // through, such as a macOS framework's `Versions/Current`. Targets are
+    // contained once everything exists; until then, every extracted path is
+    // checked against the canonical root before it is written.
+    let canonical_root = fs::canonicalize(destination)?;
+    for symlink in symlinks {
+        let parent = symlink
+            .parent()
+            .context("browser archive symlink has no parent")?;
+        let link = fs::read_link(&symlink)
+            .with_context(|| format!("failed to read symlink {}", symlink.display()))?;
+        validate_archive_symlink_target(&canonical_root, parent, &link)?;
+    }
     Ok(())
 }
 
+/// Creates an archive symlink and returns its path. The caller must contain
+/// its target with `validate_archive_symlink_target` after extraction.
 #[cfg(unix)]
 fn install_symlink(
     entry: &mut impl Read,
     root: &Path,
     relative: &Path,
     declared_size: u64,
-) -> Result<()> {
+) -> Result<PathBuf> {
     use std::os::unix::fs::symlink;
 
     if declared_size > MAX_SYMLINK_TARGET_BYTES as u64 {
@@ -538,14 +559,14 @@ fn install_symlink(
         .parent()
         .context("browser archive symlink has no parent")?;
     let parent = create_archive_directory(root, relative_parent)?;
-    let canonical_root = fs::canonicalize(root)?;
-    validate_archive_symlink_target(&canonical_root, &parent, link)?;
     let target = parent.join(
         relative
             .file_name()
             .context("browser archive symlink has no file name")?,
     );
-    symlink(link, &target).with_context(|| format!("failed to create symlink {}", target.display()))
+    symlink(link, &target)
+        .with_context(|| format!("failed to create symlink {}", target.display()))?;
+    Ok(target)
 }
 
 #[cfg(not(unix))]
@@ -554,7 +575,7 @@ fn install_symlink(
     _root: &Path,
     relative: &Path,
     _declared_size: u64,
-) -> Result<()> {
+) -> Result<PathBuf> {
     bail!(
         "browser archive contains unsupported symlink {}",
         relative.display()
@@ -1161,6 +1182,66 @@ mod tests {
         let error = extract_zip(&archive_path, &destination).unwrap_err();
         assert!(error.to_string().contains("escapes its installation"));
         assert!(!outside.join("owned").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_archive_symlinks_may_precede_their_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("browser.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        archive
+            .add_symlink(
+                "WebCore.framework/PrivateHeaders",
+                "Versions/Current/PrivateHeaders",
+                options,
+            )
+            .unwrap();
+        archive
+            .add_symlink("WebCore.framework/Versions/Current", "A", options)
+            .unwrap();
+        archive
+            .start_file(
+                "WebCore.framework/Versions/A/PrivateHeaders/WebCore.h",
+                options,
+            )
+            .unwrap();
+        archive.write_all(b"header").unwrap();
+        archive.finish().unwrap();
+        let destination = directory.path().join("staged");
+        fs::create_dir(&destination).unwrap();
+
+        extract_zip(&archive_path, &destination).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("WebCore.framework/PrivateHeaders/WebCore.h")).unwrap(),
+            b"header"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_browser_archive_symlinks_cannot_point_outside() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("browser.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        archive
+            .add_symlink(
+                "later",
+                "pending/../../outside",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .add_directory("pending", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.finish().unwrap();
+        let destination = directory.path().join("staged");
+        fs::create_dir(&destination).unwrap();
+
+        let error = extract_zip(&archive_path, &destination).unwrap_err();
+        assert!(error.to_string().contains("escapes its installation"));
     }
 
     #[cfg(unix)]
