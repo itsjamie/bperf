@@ -749,25 +749,7 @@ fn detected_host_platform() -> Result<HostPlatform> {
             .context("macOS kernel release is empty")?
             .parse()
             .context("macOS kernel release has no numeric major version")?;
-        let mac_major = if kernel_major < 18 {
-            "10.13".to_owned()
-        } else if kernel_major == 18 {
-            "10.14".to_owned()
-        } else if kernel_major == 19 {
-            "10.15".to_owned()
-        } else if kernel_major < 25 {
-            (kernel_major - 9).to_string()
-        } else {
-            (kernel_major + 1).min(26).to_string()
-        };
-        let apple_silicon = cfg!(target_arch = "aarch64");
-        Ok(HostPlatform {
-            browser_artifact: format!(
-                "mac{mac_major}{}",
-                if apple_silicon { "-arm64" } else { "" }
-            ),
-            native_dependencies: native_dependencies::Capability::NotRequired,
-        })
+        mac_host_platform(kernel_major, std::env::consts::ARCH)
     }
     #[cfg(target_os = "linux")]
     {
@@ -785,6 +767,30 @@ fn detected_host_platform() -> Result<HostPlatform> {
     {
         bail!("Playwright browser builds are unsupported on this Unix platform")
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_host_platform(kernel_major: u32, arch: &str) -> Result<HostPlatform> {
+    let mac_major = if kernel_major < 18 {
+        "10.13".to_owned()
+    } else if kernel_major == 18 {
+        "10.14".to_owned()
+    } else if kernel_major == 19 {
+        "10.15".to_owned()
+    } else if kernel_major < 25 {
+        (kernel_major - 9).to_string()
+    } else {
+        (kernel_major + 1).min(26).to_string()
+    };
+    let suffix = match arch {
+        "aarch64" => "-arm64",
+        "x86_64" => "",
+        _ => bail!("Playwright browsers are unsupported on this macOS architecture"),
+    };
+    Ok(HostPlatform {
+        browser_artifact: format!("mac{mac_major}{suffix}"),
+        native_dependencies: native_dependencies::Capability::NotRequired,
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1031,6 +1037,12 @@ mod tests {
                 registry_platform: "ubuntu24.04-arm64".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn unknown_macos_architectures_are_rejected() {
+        let error = mac_host_platform(24, "x86").unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
     }
 
     #[test]
