@@ -14,10 +14,18 @@ pub(crate) const RUNTIME_ANCHOR_EXPRESSION: &str = "globalThis.__bperfHarness.ru
 pub(crate) const DOCTOR_PROBE_EXPRESSION: &str = "globalThis.__bperfHarness.doctorProbe()";
 pub(crate) const SETTLE_EXPRESSION: &str =
     "(async () => await globalThis.__bperfHarness.settle())()";
-pub(crate) const WORKLOAD_READY_EXPRESSION: &str =
-    "typeof globalThis.__bperf?.run === \"function\"";
-pub(crate) const BENCHMARK_READY_EXPRESSION: &str =
-    "Boolean(globalThis.__bperfDescription && globalThis.__bperf)";
+// A page that records `__bperfLoadError` failed to load its benchmark module;
+// throwing it ends readiness polling with the page's own error.
+pub(crate) const WORKLOAD_READY_EXPRESSION: &str = "(() => { \
+    if (globalThis.__bperfLoadError !== undefined) \
+      { const error = new Error(`benchmark module failed to load: ${globalThis.__bperfLoadError}`); \
+      delete error.stack; throw error; } \
+    return typeof globalThis.__bperf?.run === \"function\"; })()";
+pub(crate) const BENCHMARK_READY_EXPRESSION: &str = "(() => { \
+    if (globalThis.__bperfLoadError !== undefined) \
+      { const error = new Error(`benchmark module failed to load: ${globalThis.__bperfLoadError}`); \
+      delete error.stack; throw error; } \
+    return Boolean(globalThis.__bperfDescription && globalThis.__bperf); })()";
 pub(crate) const BENCHMARK_DESCRIPTION_EXPRESSION: &str = "globalThis.__bperfDescription";
 
 const SOURCE: &str = include_str!("browser-workload.js");

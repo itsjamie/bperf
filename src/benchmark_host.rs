@@ -32,11 +32,19 @@ const PAGE_DOCUMENT: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <title>bperf managed benchmark</title>
 <script type="module">
-const benchmark = await import("/__bperf/benchmark.js");
-if (benchmark.default !== globalThis.__bperfDefinition) {
-  throw new Error(
-    "default export must be created with defineBrowserBenchmark",
-  );
+// Adapters poll for readiness; a recorded failure lets them report the
+// authoring error instead of timing out.
+try {
+  const benchmark = await import("/__bperf/benchmark.js");
+  if (benchmark.default !== globalThis.__bperfDefinition) {
+    throw new Error(
+      "default export must be created with defineBrowserBenchmark",
+    );
+  }
+} catch (error) {
+  globalThis.__bperfLoadError = error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : String(error);
 }
 </script>"#;
 
