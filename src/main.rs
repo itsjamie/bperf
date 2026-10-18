@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use bperf_browser::lab::Engine;
+use bperf_browser::lab::{Engine, GpuApi};
 use bperf_decision::{baseline, comparison, lineage};
 use bperf_measurement::{sampling, store as measurement};
 use bperf_runtime::installation::{BrowserInstallation, BrowserName};
@@ -112,6 +112,23 @@ enum EngineSelection {
     All,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GpuSelection {
+    Webgl,
+    Webgl2,
+    Webgpu,
+}
+
+impl From<GpuSelection> for GpuApi {
+    fn from(value: GpuSelection) -> Self {
+        match value {
+            GpuSelection::Webgl => Self::Webgl,
+            GpuSelection::Webgl2 => Self::Webgl2,
+            GpuSelection::Webgpu => Self::Webgpu,
+        }
+    }
+}
+
 impl EngineSelection {
     fn engines(self) -> Vec<Engine> {
         match self {
@@ -167,6 +184,11 @@ struct DoctorArgs {
 
     #[arg(long, hide = true)]
     artifact_dir: Option<PathBuf>,
+
+    /// Also prove a GPU lane for this API: hardware-accelerated launch, the
+    /// adapter each engine renders with, and a fixed GPU anchor workload.
+    #[arg(long, value_enum)]
+    gpu: Option<GpuSelection>,
 
     /// Emit the complete summary JSON to stdout.
     #[arg(short, long)]
@@ -504,6 +526,7 @@ fn main() -> Result<ExitCode> {
         Command::Doctor(args) => {
             let options = doctor::DoctorOptions {
                 engines: args.engine.engines(),
+                gpu: args.gpu.map(GpuApi::from),
                 artifact_root: data.doctor(args.artifact_dir),
                 runtime: BrowserInstallation::discover()?,
                 json: args.json,

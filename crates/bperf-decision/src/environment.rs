@@ -10,7 +10,8 @@ use std::fs;
 
 use anyhow::{Context, Result, bail};
 use bperf_browser::lab::{
-    AdapterEvidence, BrowserLab, CaptureEvidence, Engine, PROTOCOL_VERSION, RuntimeAnchorEvidence,
+    AdapterEvidence, BrowserLab, CaptureEvidence, Engine, GpuAnchorEvidence, GpuApi, GpuEvidence,
+    PROTOCOL_VERSION, RuntimeAnchorEvidence,
 };
 use bperf_measurement::store::MeasurementSet;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,21 @@ struct EnvironmentIdentity {
     host: HostIdentity,
     adapters: BTreeMap<String, AdapterEvidence>,
     browsers: BTreeMap<String, BrowserBuild>,
+    /// The GPU each engine rendered with. Present only for GPU benchmarks, so
+    /// hardware and software adapters, or different drivers, never share a
+    /// fingerprint.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gpus: BTreeMap<String, GpuIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GpuIdentity {
+    api: GpuApi,
+    vendor: String,
+    renderer: String,
+    software: bool,
+    devices: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -54,6 +70,8 @@ pub(crate) struct EnvironmentRecord {
     fingerprint: String,
     identity: EnvironmentIdentity,
     anchors: BTreeMap<String, RuntimeAnchorEvidence>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gpu_anchors: BTreeMap<String, GpuAnchorEvidence>,
 }
 
 /// Stable host and browser identity suitable for human-facing evidence views.
@@ -69,9 +87,17 @@ pub struct EnvironmentSummary {
     pub arch: String,
     pub os_release: String,
     pub browser_versions: BTreeMap<Engine, String>,
+    /// For GPU benchmarks, the adapter each engine rendered with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gpus: BTreeMap<Engine, String>,
 }
 
 impl EnvironmentSummary {
+    /// The engines the measurement set covered, in canonical order.
+    pub fn engine_scope(&self) -> Vec<Engine> {
+        self.browser_versions.keys().copied().collect()
+    }
+
     pub(crate) fn validate(&self, expected_fingerprint: &str) -> Result<()> {
         if self.recorded_at_unix_ms == 0
             || self.fingerprint != expected_fingerprint
@@ -101,6 +127,12 @@ impl EnvironmentRecord {
             .map(|anchor| anchor.wall_ms.as_slice())
             .with_context(|| format!("environment record has no {engine} runtime anchor"))
     }
+
+    pub(crate) fn gpu_anchor(&self, engine: Engine) -> Option<&[f64]> {
+        self.gpu_anchors
+            .get(engine.as_str())
+            .map(|anchor| anchor.wall_ms.as_slice())
+    }
 }
 
 pub fn summary(measurement: &MeasurementSet) -> Result<EnvironmentSummary> {
@@ -128,6 +160,18 @@ pub fn summary(measurement: &MeasurementSet) -> Result<EnvironmentSummary> {
         arch: record.identity.host.arch,
         os_release: record.identity.host.os_release,
         browser_versions,
+        gpus: record
+            .identity
+            .gpus
+            .iter()
+            .filter_map(|(engine, gpu)| {
+                let engine = Engine::ALL
+                    .into_iter()
+                    .find(|candidate| candidate.as_str() == engine)?;
+                let class = if gpu.software { "software" } else { "hardware" };
+                Some((engine, format!("{} {} ({class})", gpu.api, gpu.renderer)))
+            })
+            .collect(),
     })
 }
 
@@ -137,6 +181,7 @@ pub(crate) struct EnvironmentPair {
 }
 
 pub fn capture(browser_lab: &mut BrowserLab, measurement: &MeasurementSet) -> Result<String> {
+    browser_lab.configure_gpu(measurement.benchmark().gpu())?;
     let run_root = measurement.preflight_run_root(&unique_id("run")?)?;
     let mut captures = Vec::new();
     for engine in measurement.benchmark().engines() {
@@ -150,12 +195,22 @@ pub fn capture(browser_lab: &mut BrowserLab, measurement: &MeasurementSet) -> Re
         .iter()
         .map(|capture| (capture.engine.as_str().to_owned(), capture.anchor.clone()))
         .collect();
+    let gpu_anchors = captures
+        .iter()
+        .filter_map(|capture| {
+            capture
+                .gpu
+                .as_ref()
+                .map(|gpu| (capture.engine.as_str().to_owned(), gpu.anchor.clone()))
+        })
+        .collect();
     let record = EnvironmentRecord {
         schema_version: SCHEMA_VERSION,
         recorded_at_unix_ms: unix_time_ms()?,
         fingerprint,
         identity,
         anchors,
+        gpu_anchors,
     };
     validate_record(&record)?;
 
@@ -308,6 +363,29 @@ fn validate_record(record: &EnvironmentRecord) -> Result<()> {
             .validate()
             .with_context(|| format!("{engine} runtime anchor is invalid"))?;
     }
+    let gpu_engines: BTreeSet<_> = record.identity.gpus.keys().collect();
+    let gpu_anchor_engines: BTreeSet<_> = record.gpu_anchors.keys().collect();
+    if gpu_engines != gpu_anchor_engines || !gpu_engines.is_subset(&actual) {
+        bail!("GPU identities and GPU anchors do not match the recorded engines");
+    }
+    let mut apis = record.identity.gpus.values().map(|gpu| gpu.api);
+    if let Some(api) = apis.next()
+        && apis.any(|other| other != api)
+    {
+        bail!("environment record mixes GPU APIs");
+    }
+    for (engine, gpu) in &record.identity.gpus {
+        GpuEvidence {
+            api: gpu.api,
+            vendor: gpu.vendor.clone(),
+            renderer: gpu.renderer.clone(),
+            software: gpu.software,
+            devices: gpu.devices.clone(),
+            anchor: record.gpu_anchors[engine].clone(),
+        }
+        .validate(gpu.api)
+        .with_context(|| format!("{engine} GPU evidence is invalid"))?;
+    }
     Ok(())
 }
 
@@ -317,6 +395,7 @@ fn environment_identity(captures: &[CaptureEvidence]) -> Result<EnvironmentIdent
     }
     let mut browsers = BTreeMap::new();
     let mut adapters = BTreeMap::new();
+    let mut gpus = BTreeMap::new();
     for capture in captures {
         let engine = capture.engine.as_str().to_owned();
         if browsers
@@ -331,6 +410,18 @@ fn environment_identity(captures: &[CaptureEvidence]) -> Result<EnvironmentIdent
         {
             bail!("preflight returned duplicate {} evidence", capture.engine);
         }
+        if let Some(gpu) = &capture.gpu {
+            gpus.insert(
+                engine.clone(),
+                GpuIdentity {
+                    api: gpu.api,
+                    vendor: gpu.vendor.clone(),
+                    renderer: gpu.renderer.clone(),
+                    software: gpu.software,
+                    devices: gpu.devices.clone(),
+                },
+            );
+        }
         adapters.insert(engine, capture.adapter.clone());
     }
     Ok(EnvironmentIdentity {
@@ -339,6 +430,7 @@ fn environment_identity(captures: &[CaptureEvidence]) -> Result<EnvironmentIdent
         host: host_identity()?,
         adapters,
         browsers,
+        gpus,
     })
 }
 
@@ -600,6 +692,7 @@ mod tests {
     #[test]
     fn environment_summaries_accept_requested_engine_subsets() {
         EnvironmentSummary {
+            gpus: BTreeMap::new(),
             recorded_at_unix_ms: 1,
             fingerprint: "environment".to_owned(),
             platform: "linux".to_owned(),
@@ -624,10 +717,12 @@ mod tests {
         let measurement = MeasurementSet::open(&root).unwrap();
         measurement
             .write_environment_record(&EnvironmentRecord {
+                gpu_anchors: BTreeMap::new(),
                 schema_version: SCHEMA_VERSION - 1,
                 recorded_at_unix_ms: 1,
                 fingerprint: "obsolete".to_owned(),
                 identity: EnvironmentIdentity {
+                    gpus: BTreeMap::new(),
                     bperf_version: "test".to_owned(),
                     browser_lab_protocol_version: PROTOCOL_VERSION,
                     host: HostIdentity {
@@ -665,6 +760,7 @@ mod tests {
         let measurement = MeasurementSet::open(&root).unwrap();
         let engine = Engine::Chromium;
         let identity = EnvironmentIdentity {
+            gpus: BTreeMap::new(),
             bperf_version: "test".to_owned(),
             browser_lab_protocol_version: PROTOCOL_VERSION,
             host: HostIdentity {
@@ -696,6 +792,7 @@ mod tests {
         let fingerprint = environment_fingerprint(&identity).unwrap();
         measurement
             .write_environment_record(&EnvironmentRecord {
+                gpu_anchors: BTreeMap::new(),
                 schema_version: SCHEMA_VERSION,
                 recorded_at_unix_ms: 1,
                 fingerprint,

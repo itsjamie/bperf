@@ -121,6 +121,19 @@ A missing engine capability fails preflight. A child realm exposed in an
 incompatible form fails the trial before evidence is accepted. The caller never
 receives a successful three-engine result with one browser or artifact omitted.
 
+A benchmark's **engine scope** is all three engines unless the benchmark
+declares `engines` explicitly. The scope is part of benchmark identity.
+Discovery, preflight, runtime anchors, comparison, and the verdict cover
+exactly the engines in scope, and every engine in scope satisfies the complete
+table above. Reports name a narrowed scope. A capability that only some
+adapters implement, such as GPU lanes, is available only to benchmarks whose
+scope stays within those adapters; requesting it elsewhere fails before
+measurement and names the engine. bperf never narrows a scope on its own.
+
+Discovery reads the description in the first installed engine to learn the
+scope, then requires every in-scope engine to describe the benchmark
+identically. Engines outside the scope run no case.
+
 Each capture scope contains all three native artifact kinds. Chromium and
 WebKit can expose workers as separately profiled realms, while Firefox's native
 profiler and heap actor cover the browser context. The public evidence preserves
@@ -329,7 +342,8 @@ invalidates the attempt and closes the lane. A retry launches a new browser
 instead of continuing with uncertain engine state.
 
 Baseline, candidate, and confirmation measurement sets never share browser
-processes. [ADR 0004](adr/0004-retained-browser-lanes.md) records the measured
+processes. A GPU benchmark's lanes are launched with GPU flags; a lane is never
+reused across GPU configurations. [ADR 0004](adr/0004-retained-browser-lanes.md) records the measured
 tradeoff behind this lifecycle.
 
 ## Trial and capture boundary
@@ -430,6 +444,39 @@ engine.
 
 [ADR 0007](adr/0007-rust-browser-adapters.md) records the unified Rust
 ownership decision and retirement of the former TypeScript capture path.
+
+## GPU lanes
+
+A benchmark may declare `gpu: "webgl" | "webgl2" | "webgpu"`. Only the
+Chromium adapter implements GPU lanes, so a GPU benchmark declares
+`engines: ["chromium"]`.
+
+A GPU lane routes ANGLE to the platform GPU (`gl-egl` on Linux, `metal` on
+macOS, `d3d11` on Windows), enables Vulkan for Dawn and unsafe WebGPU, and
+keeps SwiftShader as the fallback. Preflight collects GPU evidence on a
+loopback page, because WebGPU exists only in secure contexts and `about:blank`
+is not one:
+
+- the adapter vendor and renderer the page sees, classified as hardware or
+  software;
+- the host GPU devices and drivers from `SystemInfo.getInfo`;
+- a fixed GPU anchor: a fragment-shader fill for WebGL and an integer compute
+  dispatch for WebGPU, each read back to wait for completion, 31 samples of at
+  least 75 ms.
+
+The adapter identity joins the environment fingerprint, so hardware and
+software adapters, or different drivers, are never compared. The GPU anchor
+is judged by the same ±5% drift rule as the runtime anchor, and either anchor
+drifting or remaining inconclusive makes that engine inconclusive.
+
+bperf inserts no fences. A GPU case returns a readback digest
+(`readPixelsDigest`, `readBufferDigest`), which waits for the GPU and is the
+correctness evidence. The authoring module watches for lost WebGL contexts and
+WebGPU devices and invalidates the attempt, because calls on a lost context
+silently do nothing.
+
+[ADR 0016](adr/0016-gpu-workloads.md) records the engine-scope and GPU
+decisions.
 [ADR 0008](adr/0008-child-execution-realms.md) records why child realms use
 native artifact scopes rather than becoming benchmark cases.
 
@@ -545,7 +592,9 @@ Every measurement set carries:
 - exact per-engine adapter identity: executable digest, Playwright version,
   pinned revision, and adapter protocol version for Chromium, Firefox, and
   WebKit;
-- 31 fresh observations of a versioned JavaScript CPU anchor in every engine.
+- 31 fresh observations of a versioned JavaScript CPU anchor in every engine;
+- for GPU benchmarks, the GPU adapter identity and 31 observations of a
+  versioned GPU anchor.
 
 The comparator bootstraps the historical-to-fresh median anchor change for each
 engine. The anchor is stable only when its 95% interval is wholly inside ±5%.
@@ -767,7 +816,7 @@ measurement records from earlier capture shapes require remeasurement.
 The common interface is:
 
 ```text
-bperf doctor [--engine chromium|firefox|webkit|all]
+bperf doctor [--engine chromium|firefox|webkit|all] [--gpu webgl|webgl2|webgpu]
 bperf browsers install [--engine chromium|firefox|webkit|all] [--with-deps]
 bperf run [<benchmark.ts|directory>] [--budget <duration>] [--message <text>] [--json]
 bperf confirm <benchmark.ts> [<cycle-selector>] [--budget <duration>] [--json]

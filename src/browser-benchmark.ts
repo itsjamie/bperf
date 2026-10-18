@@ -7,6 +7,10 @@ export type JsonValue =
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue };
 
+export type EngineId = "chromium" | "firefox" | "webkit";
+
+export type GpuApi = "webgl" | "webgl2" | "webgpu";
+
 export interface FixtureResponse {
   contentType?: string;
   stream?: {
@@ -40,6 +44,12 @@ export interface BrowserBenchmarkDefinition<
   States extends readonly unknown[] = readonly unknown[],
 > {
   id: string;
+  // Omitting the scope selects every engine. A narrower scope is part of the
+  // benchmark's identity, and its results say nothing about excluded engines.
+  engines?: readonly EngineId[];
+  // Launches GPU-enabled lanes for this API and records the adapter each
+  // engine rendered with. Every engine in scope must implement it.
+  gpu?: GpuApi;
   cases: {
     readonly [Index in keyof States]: BrowserBenchmarkCase<States[Index]>;
   };
@@ -52,6 +62,8 @@ export interface FixtureDescriptor {
 
 export interface BrowserBenchmarkDescription {
   id: string;
+  engines: EngineId[];
+  gpu: GpuApi | null;
   cases: Array<{
     id: string;
     expectation: ExactExpectation;
@@ -71,6 +83,8 @@ interface BenchmarkPageAdapter {
 
 interface RegisteredBenchmark {
   id: string;
+  engines: EngineId[];
+  gpu: GpuApi | null;
   cases: Map<string, BrowserBenchmarkCase<unknown>>;
   fixtures: FixtureDescriptor[];
 }
@@ -81,6 +95,8 @@ declare global {
   var __bperfDefinition: object | undefined;
 }
 
+const ENGINES: readonly EngineId[] = ["chromium", "firefox", "webkit"];
+const GPU_APIS: readonly GpuApi[] = ["webgl", "webgl2", "webgpu"];
 const fixtureDescriptors = new Map<string, FixtureDescriptor>();
 const exactExpectations = new WeakSet<object>();
 
@@ -99,6 +115,38 @@ function requireIdentifier(label: string, value: unknown): string {
     );
   }
   return value;
+}
+
+function engineScope(value: unknown): EngineId[] {
+  if (value === undefined) return [...ENGINES];
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("benchmark engines must be a non-empty array");
+  }
+  const selected = new Set<EngineId>();
+  for (const engine of value) {
+    if (!ENGINES.includes(engine)) {
+      throw new Error(
+        `benchmark engines contains unknown engine ${JSON.stringify(engine)}`,
+      );
+    }
+    if (selected.has(engine)) {
+      throw new Error(
+        `benchmark engines contains duplicate engine ${JSON.stringify(engine)}`,
+      );
+    }
+    selected.add(engine);
+  }
+  return ENGINES.filter((engine) => selected.has(engine));
+}
+
+function gpuRequirement(value: unknown): GpuApi | null {
+  if (value === undefined) return null;
+  if (!GPU_APIS.includes(value as GpuApi)) {
+    throw new Error(
+      `benchmark gpu must be one of ${GPU_APIS.join(", ")}`,
+    );
+  }
+  return value as GpuApi;
 }
 
 function requireJson(value: unknown, path = "value"): asserts value is JsonValue {
@@ -271,6 +319,8 @@ export function defineBrowserBenchmark<const States extends readonly unknown[]>(
   definition: BrowserBenchmarkDefinition<States>,
 ): BrowserBenchmarkDefinition<States> {
   const benchmarkId = requireIdentifier("benchmark id", definition?.id);
+  const engines = engineScope(definition?.engines);
+  const gpu = gpuRequirement(definition?.gpu);
   if (!Array.isArray(definition?.cases) || definition.cases.length === 0) {
     throw new Error("browser benchmark must define at least one case");
   }
@@ -316,9 +366,12 @@ export function defineBrowserBenchmark<const States extends readonly unknown[]>(
   }
 
   Object.freeze(definition.cases);
+  if (definition.engines) Object.freeze(definition.engines);
   Object.freeze(definition);
   installPageAdapter(definition, {
     id: benchmarkId,
+    engines,
+    gpu,
     cases,
     fixtures: [...fixtureDescriptors.values()],
   });
@@ -331,10 +384,13 @@ function installPageAdapter(
   registered: RegisteredBenchmark,
 ): void {
   globalThis.__bperfDefinition = definition;
+  const gpuLoss = registered.gpu ? watchGpuLoss() : undefined;
   const prepared = new Map<string, unknown>();
   const measured = new Set<string>();
   globalThis.__bperfDescription = {
     id: registered.id,
+    engines: registered.engines,
+    gpu: registered.gpu,
     cases: [...registered.cases].map(([id, candidate]) => ({
       id,
       expectation: candidate.expect,
@@ -364,6 +420,10 @@ function installPageAdapter(
         );
       }
       const result = await candidate.measure(prepared.get(caseId));
+      const lost = gpuLoss?.();
+      if (lost) {
+        throw new Error(`GPU ${lost} was lost during benchmark case ${caseId}`);
+      }
       requireJson(result, `benchmark case ${caseId} result`);
       measured.add(caseId);
       return result;
@@ -376,4 +436,158 @@ function installPageAdapter(
       }
     },
   };
+}
+
+// A lost context or device silently turns later GPU calls into no-ops, so a
+// trial that loses one would look faster without doing the work. The returned
+// function reports the first loss since the page loaded.
+function watchGpuLoss(): () => string | undefined {
+  let lost: string | undefined;
+  const observe = (target: EventTarget) =>
+    target.addEventListener("webglcontextlost", () => {
+      lost ??= "context";
+    });
+  for (const Canvas of [globalThis.HTMLCanvasElement, globalThis.OffscreenCanvas]) {
+    const prototype = Canvas?.prototype as
+      | { getContext(this: EventTarget, ...args: unknown[]): unknown }
+      | undefined;
+    if (!prototype) continue;
+    const getContext = prototype.getContext;
+    prototype.getContext = function (this: EventTarget, ...args: unknown[]) {
+      const context = getContext.apply(this, args);
+      if (typeof args[0] === "string" && args[0].startsWith("webgl")) {
+        observe(this);
+      }
+      return context;
+    };
+  }
+  const adapter = (globalThis as { GPUAdapter?: { prototype: GpuAdapterLike } })
+    .GPUAdapter?.prototype;
+  if (adapter) {
+    const requestDevice = adapter.requestDevice;
+    adapter.requestDevice = async function (this: GpuAdapterLike, ...args: unknown[]) {
+      const device = await requestDevice.apply(this, args);
+      device.lost.then((info) => {
+        if (info.reason !== "destroyed") lost ??= "device";
+      });
+      return device;
+    };
+  }
+  return () => lost;
+}
+
+interface GpuAdapterLike {
+  requestDevice(...args: unknown[]): Promise<GpuDeviceLike>;
+}
+
+interface GpuDeviceLike {
+  readonly lost: Promise<{ reason: string }>;
+  readonly queue: {
+    submit(commands: unknown[]): void;
+  };
+  createBuffer(descriptor: { size: number; usage: number }): GpuBufferLike;
+  createCommandEncoder(): {
+    copyBufferToBuffer(
+      source: unknown,
+      sourceOffset: number,
+      destination: unknown,
+      destinationOffset: number,
+      size: number,
+    ): void;
+    finish(): unknown;
+  };
+}
+
+interface GpuBufferLike {
+  readonly size: number;
+  mapAsync(mode: number): Promise<void>;
+  getMappedRange(): ArrayBuffer;
+  unmap(): void;
+  destroy(): void;
+}
+
+/**
+ * Returns a 64-bit digest of `bytes` as 16 hex digits. It is a correctness
+ * fingerprint for `exact()`, not a cryptographic hash.
+ */
+export function digestBytes(bytes: ArrayBufferView | ArrayBuffer): string {
+  const view = bytes instanceof ArrayBuffer
+    ? new Uint8Array(bytes)
+    : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let low = 0x811c9dc5;
+  let high = 0x01000193;
+  for (let index = 0; index < view.length; index += 1) {
+    low = Math.imul(low ^ view[index], 0x01000193) >>> 0;
+    high = Math.imul(high ^ view[index] ^ (low >>> 7), 0x5bd1e995) >>> 0;
+  }
+  return high.toString(16).padStart(8, "0") + low.toString(16).padStart(8, "0");
+}
+
+export interface PixelRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Reads back RGBA pixels from the current WebGL framebuffer and digests them.
+ * `readPixels` waits for every queued draw, so a case that returns this value
+ * measures completed GPU work. Defaults to the whole drawing buffer; a small
+ * region keeps the hashing cost out of throughput measurements.
+ */
+export function readPixelsDigest(
+  gl: WebGLRenderingContext | WebGL2RenderingContext,
+  region: PixelRegion = {
+    x: 0,
+    y: 0,
+    width: gl.drawingBufferWidth,
+    height: gl.drawingBufferHeight,
+  },
+): string {
+  const pixels = new Uint8Array(region.width * region.height * 4);
+  gl.readPixels(
+    region.x,
+    region.y,
+    region.width,
+    region.height,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    pixels,
+  );
+  if (gl.isContextLost()) {
+    throw new Error("WebGL context was lost before readback");
+  }
+  return digestBytes(pixels);
+}
+
+/**
+ * Copies a WebGPU buffer to a mappable staging buffer, waits for the queue to
+ * reach the copy, and digests the bytes. The source buffer needs
+ * `GPUBufferUsage.COPY_SRC`.
+ */
+export async function readBufferDigest(
+  device: GpuDeviceLike,
+  buffer: GpuBufferLike,
+  size: number = buffer.size,
+): Promise<string> {
+  const usage = globalThis as unknown as {
+    GPUBufferUsage: { MAP_READ: number; COPY_DST: number };
+    GPUMapMode: { READ: number };
+  };
+  const staging = device.createBuffer({
+    size,
+    usage: usage.GPUBufferUsage.MAP_READ | usage.GPUBufferUsage.COPY_DST,
+  });
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, staging, 0, size);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(usage.GPUMapMode.READ);
+    const digest = digestBytes(new Uint8Array(staging.getMappedRange()));
+    staging.unmap();
+    return digest;
+  } finally {
+    staging.destroy();
+  }
 }

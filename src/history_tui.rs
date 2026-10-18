@@ -1114,6 +1114,25 @@ fn render_engines(frame: &mut Frame<'_>, area: Rect, cycle: &HistoryCycle) {
 }
 
 fn render_engine(frame: &mut Frame<'_>, area: Rect, cycle: &HistoryCycle, engine: Engine) {
+    if !cycle.environment.browser_versions.contains_key(&engine) {
+        let block = chrome_block().title(Line::from(vec![
+            Span::styled(
+                format!(" {} ", engine),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("not in scope ", Style::default().fg(MUTED)),
+        ]));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("This benchmark does not measure {engine}."),
+                Style::default().fg(FAINT),
+            ))),
+            inner,
+        );
+        return;
+    }
     let summary = cycle
         .comparison
         .as_ref()
@@ -1243,6 +1262,13 @@ fn render_engine(frame: &mut Frame<'_>, area: Rect, cycle: &HistoryCycle, engine
 }
 
 fn compact_engine_line(cycle: &HistoryCycle, engine: Engine) -> Line<'static> {
+    if !cycle.environment.browser_versions.contains_key(&engine) {
+        return Line::from(vec![
+            Span::styled(format!("{engine:<8}"), Style::default().fg(TEXT)),
+            Span::raw("  "),
+            Span::styled("not in scope", Style::default().fg(MUTED)),
+        ]);
+    }
     let summary = cycle
         .comparison
         .as_ref()
@@ -2417,6 +2443,7 @@ mod tests {
 
     fn environment(now: u64) -> EnvironmentSummary {
         EnvironmentSummary {
+            gpus: std::collections::BTreeMap::new(),
             recorded_at_unix_ms: now,
             fingerprint: "1a7fabcdeffedcba".to_owned(),
             platform: "macos".to_owned(),
@@ -2449,6 +2476,7 @@ mod tests {
                         verdict: "positive".to_owned(),
                         correctness: "pass".to_owned(),
                         anchor: Some(AnchorSummary {
+                            gpu: None,
                             status: "stable".to_owned(),
                             drift_pct: Some(0.8),
                             ci_pct: Some([-1.9, 3.4]),

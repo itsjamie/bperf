@@ -44,6 +44,16 @@ Chromium, Firefox, and WebKit are one contract:
 - Historical comparisons check a fresh runtime anchor in every engine before
   trusting the old baseline.
 
+A benchmark can narrow its engines explicitly, for example
+`engines: ["chromium"]` for code that only ships in Chromium-based TV browsers.
+Every engine in that scope still meets the full contract, and reports name the
+scope.
+
+GPU benchmarks declare `gpu: "webgl"`, `"webgl2"`, or `"webgpu"` and run in a
+hardware-accelerated Chromium lane. bperf records the adapter each run rendered
+with, checks a GPU drift anchor, and keeps software-rendered evidence separate
+from hardware evidence. See [Writing a benchmark](docs/AUTHORING.md#gpu-benchmarks).
+
 `webkit` means Playwright's pinned, patched WebKit build. It does not automate
 the Safari application installed by macOS.
 

@@ -76,10 +76,19 @@ designing and reviewing this repository.
 
 ## Non-negotiable browser contract
 
-- Chromium, Firefox, and WebKit are first-class engines.
+- Chromium, Firefox, and WebKit are first-class engines. A benchmark's
+  **engine scope** is all three unless the benchmark explicitly declares a
+  narrower one.
+- Every engine in scope satisfies the complete common capture contract: wall,
+  native CPU, flamegraph, and native heap evidence.
 - Do not introduce a shared abstraction that silently supports only one or two
-  engines.
-- Requested captures must either succeed on every requested engine or fail
+  engines. A capability beyond the common contract may be implemented by some
+  engines only when it is available solely to benchmarks whose declared scope
+  is within those engines.
+- Never narrow an engine scope implicitly. A requested capability that an
+  in-scope engine does not implement fails before measurement and names the
+  engine.
+- Requested captures must either succeed on every in-scope engine or fail
   preflight explicitly. Never silently downgrade or omit an artifact.
 - Keep engine-protocol knowledge inside its adapter. Core modules must not expose
   CDP, Firefox RDP, Gecko Profiler, Web Inspector, or Playwright private objects.

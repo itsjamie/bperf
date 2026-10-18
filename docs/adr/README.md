@@ -20,6 +20,7 @@ decisions whose alternatives and tradeoffs still matter.
 | [0013](0013-rust-browser-distribution.md) | Generate an authenticated static Playwright registry and install browser archives entirely in Rust, removing Node.js from bperf. |
 | [0014](0014-crash-safe-local-persistence.md) | Publish local files atomically and make append-only histories recoverable without moving domain schemas into shared storage code. |
 | [0015](0015-canonical-sqlite-storage.md) | Use one canonical SQLite database for structured state while retaining large native payloads as validated files. |
+| [0016](0016-gpu-workloads.md) | Let benchmarks declare an explicit engine scope and offer GPU evidence, starting with Chromium, only within that scope. |
 
 Accepted records are not edited to make an old decision look current. If the
 decision changes, add a new ADR that supersedes the old one and update

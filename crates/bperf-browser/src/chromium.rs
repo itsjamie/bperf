@@ -25,15 +25,17 @@ use crate::{
     browser_process::BrowserProcess,
     browser_workload::{
         BENCHMARK_DESCRIPTION_EXPRESSION, BENCHMARK_READY_EXPRESSION, DOCTOR_PROBE_EXPRESSION,
-        RUNTIME_ANCHOR_EXPRESSION, SETTLE_EXPRESSION, VERSION as BROWSER_WORKLOAD_VERSION,
-        WORKLOAD_READY_EXPRESSION, WorkloadScript, bootstrap_source, decode_batch_size,
-        decode_runtime_anchor, decode_workload, default_browser_config, installed_expression,
-        is_allowed_adapter_url, is_allowed_trial_url, is_benchmark_code_url,
+        RUNTIME_ANCHOR_EXPRESSION, SETTLE_EXPRESSION, SecureProbePage,
+        VERSION as BROWSER_WORKLOAD_VERSION, WORKLOAD_READY_EXPRESSION, WorkloadScript,
+        bootstrap_source, decode_batch_size, decode_gpu_anchor, decode_gpu_probe,
+        decode_runtime_anchor, decode_workload, default_browser_config, gpu_anchor_expression,
+        gpu_probe_expression, installed_expression, is_allowed_adapter_url, is_allowed_trial_url,
+        is_benchmark_code_url,
     },
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
-        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, ProbeCapture,
-        TrialCapture,
+        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, GpuApi,
+        GpuEvidence, ProbeCapture, TrialCapture,
     },
 };
 
@@ -50,7 +52,6 @@ pub(crate) struct ChromiumAdapter {
     browser_version: String,
     playwright_version: String,
     executable_sha256: String,
-    launch_arguments: Vec<String>,
 }
 
 impl EngineAdapter for ChromiumAdapter {
@@ -86,12 +87,11 @@ impl EngineAdapter for ChromiumAdapter {
             revision: chromium.revision().to_owned(),
             browser_version: chromium.browser_version().to_owned(),
             playwright_version: installation.playwright_version().to_owned(),
-            launch_arguments: chromium_launch_arguments(),
         })
     }
 
-    fn launch(&self) -> Result<Self::Lane> {
-        ChromiumLane::launch(self)
+    fn launch(&self, gpu: Option<GpuApi>) -> Result<Self::Lane> {
+        ChromiumLane::launch(self, gpu)
     }
 }
 
@@ -107,8 +107,11 @@ impl ChromiumAdapter {
     }
 }
 
-fn chromium_launch_arguments() -> Vec<String> {
-    [
+/// Headless Chromium rasterizes WebGL with SwiftShader unless ANGLE is pointed
+/// at the platform GPU. SwiftShader stays enabled as the fallback, so a host
+/// without a usable GPU still runs, and the probe reports a software adapter.
+fn chromium_launch_arguments(gpu: Option<GpuApi>) -> Vec<String> {
+    let mut arguments: Vec<String> = [
         "--disable-field-trial-config",
         "--disable-background-networking",
         "--disable-background-timer-throttling",
@@ -156,23 +159,88 @@ fn chromium_launch_arguments() -> Vec<String> {
     ]
     .into_iter()
     .map(str::to_owned)
-    .collect()
+    .collect();
+    if gpu.is_some() {
+        for argument in &mut arguments {
+            if argument == "--enable-features=CDPScreenshotNewSurface" {
+                // Dawn requires Vulkan for WebGPU on Linux.
+                *argument = "--enable-features=CDPScreenshotNewSurface,Vulkan".to_owned();
+            }
+        }
+        let angle = if cfg!(target_os = "macos") {
+            "--use-angle=metal"
+        } else if cfg!(windows) {
+            "--use-angle=d3d11"
+        } else {
+            "--use-angle=gl-egl"
+        };
+        arguments.extend(
+            [
+                "--use-gl=angle",
+                angle,
+                "--ignore-gpu-blocklist",
+                "--enable-unsafe-webgpu",
+            ]
+            .map(str::to_owned),
+        );
+    }
+    arguments
 }
 
 pub(crate) struct ChromiumLane {
     connection: CdpConnection<BrowserProcess>,
+    gpu: Option<GpuApi>,
     browser: BrowserEvidence,
     adapter: AdapterEvidence,
     closed: bool,
 }
 
 impl ChromiumLane {
-    fn launch(installation: &ChromiumAdapter) -> Result<Self> {
+    fn gpu_evidence(&mut self, api: GpuApi) -> Result<GpuEvidence> {
+        let server = SecureProbePage::start()?;
+        let page = self.connection.open_page(&default_browser_config())?;
+        let result = (|| {
+            self.connection.navigate(&page.session_id, server.url())?;
+            self.gpu_evidence_on(&page.session_id, api)
+        })();
+        combine_page_close(result, self.connection.close_page(page))
+    }
+
+    fn gpu_evidence_on(&mut self, session_id: &str, api: GpuApi) -> Result<GpuEvidence> {
+        let probe = decode_gpu_probe(
+            self.connection
+                .evaluate(session_id, &gpu_probe_expression(api))
+                .with_context(|| format!("Chromium could not provide {api}"))?,
+        )?;
+        if probe.api != api {
+            bail!("Chromium probed {} while {api} was requested", probe.api);
+        }
+        let anchor = decode_gpu_anchor(
+            self.connection
+                .evaluate(session_id, &gpu_anchor_expression(api))
+                .with_context(|| format!("Chromium {api} anchor failed"))?,
+        )?;
+        let system = self
+            .connection
+            .send_root("SystemInfo.getInfo", json!({}), REQUEST_TIMEOUT)
+            .context("Chromium rejected SystemInfo.getInfo")?;
+        Ok(GpuEvidence {
+            api,
+            vendor: probe.vendor,
+            renderer: probe.renderer,
+            software: probe.software,
+            devices: gpu_devices(&system),
+            anchor,
+        })
+    }
+
+    fn launch(installation: &ChromiumAdapter, gpu: Option<GpuApi>) -> Result<Self> {
+        let launch_arguments = chromium_launch_arguments(gpu);
         let process = BrowserProcess::spawn(
             "bperf-chromium-",
             "rust-chromium",
             &installation.executable,
-            &installation.launch_arguments,
+            &launch_arguments,
         )?;
         let download_directory = process.working_directory().join("downloads");
         fs::create_dir(&download_directory)
@@ -199,10 +267,11 @@ impl ChromiumLane {
             root_pid,
             executable_path: installation.executable.to_string_lossy().into_owned(),
             version: actual_version,
-            launch_args: installation.launch_arguments.clone(),
+            launch_args: launch_arguments,
         };
         Ok(Self {
             connection,
+            gpu,
             browser,
             adapter: installation.adapter_evidence(),
             closed: false,
@@ -253,11 +322,13 @@ impl ChromiumLane {
                 .capture_heap_snapshot(&page.session_id, &heap_path)?;
             parse_live_heap_bytes(&heap_path)?;
             let artifacts = finish_capture_artifacts(artifacts, &profile, &parsed, None)?;
+            let gpu = self.gpu.map(|api| self.gpu_evidence(api)).transpose()?;
             Ok(ProbeCapture {
                 adapter: self.adapter.clone(),
                 browser: self.browser.clone(),
                 anchor,
                 artifacts,
+                gpu,
             })
         })();
         combine_page_close(result, self.connection.close_page(page))
@@ -1356,6 +1427,52 @@ struct ChromiumProfile {
     time_deltas: Vec<i64>,
 }
 
+/// Physical GPUs and drivers from `SystemInfo.getInfo`, ignoring the empty
+/// placeholder entries Chromium reports when a field is unknown.
+fn gpu_devices(system: &Value) -> Vec<String> {
+    system
+        .pointer("/gpu/devices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|device| {
+            let field = |name| {
+                device
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            };
+            let name = [field("vendorString"), field("deviceString")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let driver = [field("driverVendor"), field("driverVersion")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ids = format!(
+                "{:04x}:{:04x}",
+                device.get("vendorId").and_then(Value::as_u64).unwrap_or(0),
+                device.get("deviceId").and_then(Value::as_u64).unwrap_or(0)
+            );
+            (ids != "0000:0000" || !name.is_empty()).then(|| {
+                let mut label = if name.is_empty() {
+                    ids.clone()
+                } else {
+                    format!("{name} ({ids})")
+                };
+                if !driver.is_empty() {
+                    label.push_str(&format!(" driver {driver}"));
+                }
+                label
+            })
+        })
+        .collect()
+}
+
 fn parse_cpu_profile(value: &Value) -> Result<ChromiumProfile> {
     let mut profile: ChromiumProfile =
         serde_json::from_value(value.clone()).context("Chromium emitted an invalid CPU profile")?;
@@ -1895,5 +2012,51 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.description["fresh"], true);
         browser_lab.finish().unwrap();
+    }
+
+    #[test]
+    fn gpu_lanes_route_angle_to_the_platform_gpu_and_keep_the_software_fallback() {
+        let plain = chromium_launch_arguments(None);
+        assert!(
+            !plain
+                .iter()
+                .any(|argument| argument.starts_with("--use-angle"))
+        );
+        assert!(!plain.contains(&"--enable-unsafe-webgpu".to_owned()));
+
+        let gpu = chromium_launch_arguments(Some(GpuApi::Webgpu));
+        assert!(gpu.contains(&"--use-gl=angle".to_owned()));
+        assert!(gpu.contains(&"--enable-unsafe-webgpu".to_owned()));
+        assert!(gpu.contains(&"--enable-unsafe-swiftshader".to_owned()));
+        assert_eq!(
+            gpu.iter()
+                .filter(|argument| argument.starts_with("--enable-features="))
+                .collect::<Vec<_>>(),
+            ["--enable-features=CDPScreenshotNewSurface,Vulkan"]
+        );
+    }
+
+    #[test]
+    fn system_info_devices_name_the_gpu_and_driver_and_skip_placeholders() {
+        let devices = gpu_devices(&json!({
+            "gpu": {
+                "devices": [
+                    {
+                        "vendorId": 32902,
+                        "deviceId": 42880,
+                        "vendorString": "Intel",
+                        "deviceString": "Raptor Lake",
+                        "driverVendor": "Mesa",
+                        "driverVersion": "26.2.4"
+                    },
+                    {"vendorId": 0, "deviceId": 0, "vendorString": "", "deviceString": ""}
+                ]
+            }
+        }));
+        assert_eq!(
+            devices,
+            ["Intel Raptor Lake (8086:a780) driver Mesa 26.2.4"]
+        );
+        assert!(gpu_devices(&json!({})).is_empty());
     }
 }

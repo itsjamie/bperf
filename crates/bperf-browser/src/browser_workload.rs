@@ -1,12 +1,24 @@
 //! Browser-side benchmark harness and network policy shared by Rust adapters.
 
-use std::net::IpAddr;
+use std::{
+    io::{Read, Write},
+    net::{IpAddr, TcpListener},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use serde::Deserialize;
+
 use crate::lab::{
-    BrowserTrialConfig, RuntimeAnchorEvidence, TrialBatchConfig, Viewport, WorkloadEvidence,
+    BrowserTrialConfig, GpuAnchorEvidence, GpuApi, RuntimeAnchorEvidence, TrialBatchConfig,
+    Viewport, WorkloadEvidence,
 };
 
 pub(crate) const VERSION: u32 = 2;
@@ -119,6 +131,96 @@ impl WorkloadScript {
 
 pub(crate) fn decode_runtime_anchor(value: Value) -> Result<RuntimeAnchorEvidence> {
     serde_json::from_value(value).context("browser runtime anchor returned invalid evidence")
+}
+
+/// Serves an empty document from a loopback origin. WebGPU and some WebGL
+/// extensions exist only in secure contexts, which `about:blank` is not, so
+/// GPU evidence is collected on this page instead.
+pub(crate) struct SecureProbePage {
+    url: String,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl SecureProbePage {
+    pub(crate) fn start() -> Result<Self> {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).context("failed to bind the GPU probe page")?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure the GPU probe page")?;
+        let url = format!("http://{}/", listener.local_addr()?);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            const BODY: &str =
+                "<!doctype html><meta charset=\"utf-8\"><title>bperf GPU probe</title>";
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                            BODY.len()
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            url,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl Drop for SecureProbePage {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub(crate) fn gpu_probe_expression(api: GpuApi) -> String {
+    format!("globalThis.__bperfHarness.gpuProbe({:?})", api.as_str())
+}
+
+pub(crate) fn gpu_anchor_expression(api: GpuApi) -> String {
+    format!("globalThis.__bperfHarness.gpuAnchor({:?})", api.as_str())
+}
+
+/// The page-visible half of `GpuEvidence`; the adapter adds engine-reported
+/// devices.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GpuProbe {
+    pub(crate) api: GpuApi,
+    pub(crate) vendor: String,
+    pub(crate) renderer: String,
+    pub(crate) software: bool,
+}
+
+pub(crate) fn decode_gpu_probe(value: Value) -> Result<GpuProbe> {
+    serde_json::from_value(value).context("browser GPU probe returned invalid evidence")
+}
+
+pub(crate) fn decode_gpu_anchor(value: Value) -> Result<GpuAnchorEvidence> {
+    serde_json::from_value(value).context("browser GPU anchor returned invalid evidence")
 }
 
 pub(crate) fn decode_batch_size(value: Value) -> Result<u32> {

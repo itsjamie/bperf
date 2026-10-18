@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bperf_browser::lab::{BenchmarkInspection, BrowserLab, Engine};
+use bperf_browser::lab::{BenchmarkInspection, BrowserLab, Engine, GpuApi};
 use bperf_decision::{
     baseline,
     comparison::{self, ComparisonOutcome, ComparisonReport},
@@ -463,6 +463,8 @@ struct MaterializedInputs {
 struct ManagedDescription {
     schema_version: u32,
     benchmark_id: String,
+    engines: Vec<Engine>,
+    gpu: Option<GpuApi>,
     cases: Vec<ManagedCase>,
     source_files: Vec<PathBuf>,
     fixture_files: Vec<PathBuf>,
@@ -584,6 +586,8 @@ fn describe(
 #[serde(deny_unknown_fields)]
 struct BrowserDescription {
     id: String,
+    engines: Vec<Engine>,
+    gpu: Option<GpuApi>,
     cases: Vec<ManagedCase>,
     fixtures: Vec<FixtureDescriptor>,
 }
@@ -604,8 +608,7 @@ fn discover_managed_benchmark(
 
     let (unresolved_description, mut source_files) = {
         let host = BenchmarkHost::start(project.bundle, &unresolved_lock, object_root)?;
-        let description =
-            inspect_description_in_every_engine(browser_lab, host.url(), "unresolved")?;
+        let description = inspect_description_in_scope(browser_lab, host.url(), "unresolved")?;
         let source_files = BTreeSet::from_iter(host.source_files().iter().cloned());
         host.close()
             .context("unresolved benchmark host failed to close")?;
@@ -626,7 +629,7 @@ fn discover_managed_benchmark(
         let host = BenchmarkHost::start(project.bundle, fixture_lock, object_root)?;
         source_files.extend(host.source_files().iter().cloned());
         let resolved_description =
-            inspect_description_in_every_engine(browser_lab, host.url(), "resolved")?;
+            inspect_description_in_scope(browser_lab, host.url(), "resolved")?;
         if resolved_description != unresolved_description {
             bail!("fixture resolution changed the managed benchmark description");
         }
@@ -642,6 +645,7 @@ fn discover_managed_benchmark(
             browser_lab,
             host.url(),
             &resolved_description,
+            &parsed.engines,
             &parsed.cases,
         )?;
         host.close()
@@ -649,6 +653,8 @@ fn discover_managed_benchmark(
         Ok(ManagedDescription {
             schema_version: 1,
             benchmark_id: parsed.id,
+            engines: parsed.engines,
+            gpu: parsed.gpu,
             cases: parsed.cases,
             source_files: source_files.into_iter().collect(),
             fixture_files: resolved.fixture_files,
@@ -657,24 +663,104 @@ fn discover_managed_benchmark(
     }
 }
 
-fn inspect_description_in_every_engine(
+/// Reads the description in one installed engine to learn the benchmark's
+/// engine scope, then requires every in-scope engine to describe it
+/// identically. Engines outside the scope never run benchmark code beyond that
+/// first description.
+fn inspect_description_in_scope(
     browser_lab: &mut BrowserLab,
     target_url: &str,
     pass: &str,
 ) -> Result<Value> {
-    let mut common: Option<(Engine, Value)> = None;
-    for engine in Engine::ALL {
-        let inspection = browser_lab
-            .inspect_benchmark(engine, target_url, None)
-            .with_context(|| format!("{engine} failed the {pass} managed discovery pass"))?;
-        if inspection.result.is_some() {
-            bail!("{engine} returned a case result during the {pass} description pass");
+    let first = browser_lab.first_installed_engine()?;
+    let description = inspect_description(browser_lab, first, target_url, pass)?;
+    let scope = engine_scope(&description)
+        .with_context(|| format!("{first} returned an invalid managed benchmark engine scope"))?;
+    let gpu = gpu_requirement(&description, &scope)?;
+    browser_lab.configure_gpu(gpu)?;
+    let mut common = Some((first, description));
+    for engine in scope {
+        if engine != first {
+            let description = inspect_description(browser_lab, engine, target_url, pass)?;
+            merge_description(&mut common, engine, description, pass)?;
         }
-        merge_description(&mut common, engine, inspection.description, pass)?;
     }
     common
         .map(|(_, description)| description)
         .context("managed discovery inspected no engines")
+}
+
+fn inspect_description(
+    browser_lab: &mut BrowserLab,
+    engine: Engine,
+    target_url: &str,
+    pass: &str,
+) -> Result<Value> {
+    let inspection = browser_lab
+        .inspect_benchmark(engine, target_url, None)
+        .with_context(|| format!("{engine} failed the {pass} managed discovery pass"))?;
+    if inspection.result.is_some() {
+        bail!("{engine} returned a case result during the {pass} description pass");
+    }
+    Ok(inspection.description)
+}
+
+fn engine_scope(description: &Value) -> Result<Vec<Engine>> {
+    let engines: Vec<Engine> = serde_json::from_value(
+        description
+            .get("engines")
+            .cloned()
+            .context("managed benchmark description has no engine scope")?,
+    )
+    .context("managed benchmark engine scope names an unknown engine")?;
+    validate_engine_scope(&engines)?;
+    Ok(engines)
+}
+
+fn gpu_requirement(description: &Value, scope: &[Engine]) -> Result<Option<GpuApi>> {
+    let gpu: Option<GpuApi> = serde_json::from_value(
+        description
+            .get("gpu")
+            .cloned()
+            .context("managed benchmark description has no GPU requirement")?,
+    )
+    .context("managed benchmark requires an unknown GPU API")?;
+    if let Some(api) = gpu {
+        validate_gpu_scope(api, scope)?;
+    }
+    Ok(gpu)
+}
+
+fn validate_gpu_scope(api: GpuApi, scope: &[Engine]) -> Result<()> {
+    let unsupported: Vec<_> = scope
+        .iter()
+        .filter(|engine| !engine.supports_gpu(api))
+        .map(|engine| engine.as_str())
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    let supported: Vec<_> = Engine::ALL
+        .into_iter()
+        .filter(|engine| engine.supports_gpu(api))
+        .map(|engine| format!("{:?}", engine.as_str()))
+        .collect();
+    bail!(
+        "gpu: {:?} is not implemented for {}; declare engines: [{}] to measure it",
+        api.as_str(),
+        unsupported.join(", "),
+        supported.join(", ")
+    )
+}
+
+fn validate_engine_scope(engines: &[Engine]) -> Result<()> {
+    if engines.is_empty() {
+        bail!("managed benchmark engine scope is empty");
+    }
+    if !engines.windows(2).all(|pair| pair[0] < pair[1]) {
+        bail!("managed benchmark engine scope must list unique engines in canonical order");
+    }
+    Ok(())
 }
 
 fn merge_description(
@@ -699,10 +785,11 @@ fn exercise_every_case(
     browser_lab: &mut BrowserLab,
     target_url: &str,
     description: &Value,
+    engines: &[Engine],
     cases: &[ManagedCase],
 ) -> Result<()> {
     for case in cases {
-        for engine in Engine::ALL {
+        for &engine in engines {
             let inspection = browser_lab
                 .inspect_benchmark(engine, target_url, Some(&case.id))
                 .with_context(|| {
@@ -749,6 +836,10 @@ fn validate_description(description: &ManagedDescription) -> Result<()> {
             "unsupported managed benchmark schema {}; expected 1",
             description.schema_version
         );
+    }
+    validate_engine_scope(&description.engines)?;
+    if let Some(api) = description.gpu {
+        validate_gpu_scope(api, &description.engines)?;
     }
     if description.cases.is_empty() {
         bail!("managed benchmark contains no cases");
@@ -830,6 +921,22 @@ fn write_inputs(
         }));
     }
 
+    let mut browser = json!({
+        "engines": description.engines,
+        "mode": "headless",
+        "viewport": { "width": 1440, "height": 900 },
+        "locale": "en-US",
+        "timezone": "UTC",
+        "color_scheme": "light",
+        "cache": "cold",
+        "network": { "policy": "local-only" },
+        "fresh_profile_per_trial": true,
+    });
+    // Only GPU benchmarks carry the key, so existing definitions keep their
+    // identity.
+    if let Some(api) = description.gpu {
+        browser["gpu"] = json!(api);
+    }
     let benchmark = json!({
         "schema_version": 1,
         "benchmark": {
@@ -837,17 +944,7 @@ fn write_inputs(
             "subject": description.benchmark_id,
         },
         "workloads": workloads,
-        "browser": {
-            "engines": Engine::ALL,
-            "mode": "headless",
-            "viewport": { "width": 1440, "height": 900 },
-            "locale": "en-US",
-            "timezone": "UTC",
-            "color_scheme": "light",
-            "cache": "cold",
-            "network": { "policy": "local-only" },
-            "fresh_profile_per_trial": true,
-        },
+        "browser": browser,
         "captures": {
             "cpu_profile": true,
             "js_heap": true,
@@ -1037,6 +1134,8 @@ mod tests {
         let description = ManagedDescription {
             schema_version: 1,
             benchmark_id: "benchmark".to_owned(),
+            engines: Engine::ALL.to_vec(),
+            gpu: None,
             cases: vec![ManagedCase {
                 id: "../../escaped".to_owned(),
                 expectation: ManagedExpectation::Exact { value: json!(42) },
@@ -1051,6 +1150,33 @@ mod tests {
     }
 
     #[test]
+    fn engine_scopes_must_be_nonempty_unique_and_canonical() {
+        assert_eq!(
+            engine_scope(&json!({"engines": ["chromium", "webkit"]})).unwrap(),
+            [Engine::Chromium, Engine::Webkit]
+        );
+        for (description, message) in [
+            (json!({}), "no engine scope"),
+            (json!({"engines": ["safari"]}), "unknown engine"),
+            (json!({"engines": []}), "empty"),
+            (
+                json!({"engines": ["chromium", "chromium"]}),
+                "canonical order",
+            ),
+            (
+                json!({"engines": ["webkit", "chromium"]}),
+                "canonical order",
+            ),
+        ] {
+            let error = engine_scope(&description).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{description}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn managed_case_ids_must_be_unique() {
         let case = || ManagedCase {
             id: "duplicate".to_owned(),
@@ -1059,6 +1185,8 @@ mod tests {
         let description = ManagedDescription {
             schema_version: 1,
             benchmark_id: "benchmark".to_owned(),
+            engines: Engine::ALL.to_vec(),
+            gpu: None,
             cases: vec![case(), case()],
             source_files: vec![PathBuf::from("unreached")],
             fixture_files: Vec::new(),
@@ -1129,6 +1257,129 @@ mod tests {
         assert_eq!(receipt["outcome"], "negative");
         assert_eq!(receipt["measurement_set_id"], "measure-v5-test");
         assert_eq!(receipt["comparison_id"], "compare-later");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Playwright Chromium browser"]
+    fn managed_benchmark_measures_only_its_declared_engine_scope() {
+        let temporary = tempdir().unwrap();
+        let benchmark = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("chromium-scope.bench.ts");
+        let installation = BrowserInstallation::discover().unwrap();
+        let host_executable = build_bperf_executable();
+        let inputs = materialize(
+            &benchmark,
+            &temporary.path().join("managed"),
+            &temporary.path().join("objects"),
+            &installation,
+            &host_executable,
+            TrialPolicy {
+                warmup_samples: 0,
+                pilot_samples: 2,
+                min_final_samples: 1,
+                max_final_samples: 2,
+            },
+        )
+        .unwrap();
+        let definition: Value =
+            serde_json::from_str(&fs::read_to_string(&inputs.benchmark).unwrap()).unwrap();
+        assert_eq!(definition["browser"]["engines"], json!(["chromium"]));
+
+        let measurement_root = temporary.path().join("measurements");
+        runner::run(MeasureOptions {
+            benchmark: inputs.benchmark,
+            variant: inputs.variant,
+            sampling: SamplingMode::Adaptive {
+                budget: "1m".parse().unwrap(),
+                cohort: None,
+            },
+            artifact_root: measurement_root.clone(),
+            runtime: installation,
+        })
+        .unwrap();
+
+        let root = fs::read_dir(&measurement_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        assert!(measurement.final_is_complete());
+        assert_eq!(measurement.sampling_decision().unwrap().strata.len(), 1);
+        assert!(
+            measurement
+                .schedule()
+                .trials
+                .iter()
+                .all(|trial| trial.engine == Engine::Chromium)
+        );
+        assert_eq!(
+            bperf_decision::environment::summary(&measurement)
+                .unwrap()
+                .engine_scope(),
+            [Engine::Chromium]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Playwright Chromium browser"]
+    fn gpu_benchmarks_measure_on_a_gpu_lane_and_record_its_adapter() {
+        let temporary = tempdir().unwrap();
+        let benchmark = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("gpu")
+            .join("tile-renderer.bench.ts");
+        let installation = BrowserInstallation::discover().unwrap();
+        let host_executable = build_bperf_executable();
+        let inputs = materialize(
+            &benchmark,
+            &temporary.path().join("managed"),
+            &temporary.path().join("objects"),
+            &installation,
+            &host_executable,
+            TrialPolicy {
+                warmup_samples: 0,
+                pilot_samples: 2,
+                min_final_samples: 1,
+                max_final_samples: 2,
+            },
+        )
+        .unwrap();
+        let definition: Value =
+            serde_json::from_str(&fs::read_to_string(&inputs.benchmark).unwrap()).unwrap();
+        assert_eq!(definition["browser"]["gpu"], "webgl");
+        assert_eq!(definition["browser"]["engines"], json!(["chromium"]));
+
+        let measurement_root = temporary.path().join("measurements");
+        runner::run(MeasureOptions {
+            benchmark: inputs.benchmark,
+            variant: inputs.variant,
+            sampling: SamplingMode::Adaptive {
+                budget: "1m".parse().unwrap(),
+                cohort: None,
+            },
+            artifact_root: measurement_root.clone(),
+            runtime: installation,
+        })
+        .unwrap();
+
+        let root = fs::read_dir(&measurement_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let measurement = MeasurementSet::open(&root).unwrap();
+        assert!(measurement.final_is_complete());
+        let results = measurement.final_results(Engine::Chromium);
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|result| result.valid && result.success));
+        let environment = bperf_decision::environment::summary(&measurement).unwrap();
+        let gpu = &environment.gpus[&Engine::Chromium];
+        assert!(gpu.starts_with("webgl "), "{gpu}");
     }
 
     #[test]
@@ -1398,5 +1649,24 @@ mod tests {
         let executable = profile_root.join(if cfg!(windows) { "bperf.exe" } else { "bperf" });
         assert!(executable.is_file(), "{}", executable.display());
         executable
+    }
+
+    #[test]
+    fn gpu_requirements_name_the_scope_that_would_be_accepted() {
+        assert_eq!(
+            gpu_requirement(&json!({"gpu": null}), &Engine::ALL).unwrap(),
+            None
+        );
+        assert_eq!(
+            gpu_requirement(&json!({"gpu": "webgl2"}), &[Engine::Chromium]).unwrap(),
+            Some(GpuApi::Webgl2)
+        );
+        let error = gpu_requirement(&json!({"gpu": "webgl"}), &Engine::ALL).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "gpu: \"webgl\" is not implemented for firefox, webkit; declare engines: [\"chromium\"] to measure it"
+        );
+        assert!(gpu_requirement(&json!({"gpu": "vulkan"}), &Engine::ALL).is_err());
+        assert!(gpu_requirement(&json!({}), &Engine::ALL).is_err());
     }
 }

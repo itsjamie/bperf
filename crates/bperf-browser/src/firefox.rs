@@ -34,8 +34,8 @@ use crate::{
     firefox_rdp::{FirefoxDebugSession, FirefoxHeapSnapshotFiles, free_port},
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
-        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, ProbeCapture,
-        TrialCapture,
+        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, GpuApi,
+        ProbeCapture, TrialCapture,
     },
 };
 
@@ -97,7 +97,10 @@ impl EngineAdapter for FirefoxAdapter {
         })
     }
 
-    fn launch(&self) -> Result<Self::Lane> {
+    fn launch(&self, gpu: Option<GpuApi>) -> Result<Self::Lane> {
+        if let Some(api) = gpu {
+            bail!("the Firefox adapter does not implement {api} lanes");
+        }
         FirefoxLane::launch(self)
     }
 }
@@ -240,6 +243,7 @@ impl FirefoxLane {
                 browser: self.browser.clone(),
                 anchor,
                 artifacts,
+                gpu: None,
             })
         })();
         combine_page_close(result, self.connection.close_page(page))

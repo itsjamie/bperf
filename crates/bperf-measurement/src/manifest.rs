@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use bperf_browser::lab::{BrowserTrialConfig, Engine, Viewport};
+use bperf_browser::lab::{BrowserTrialConfig, Engine, GpuApi, Viewport};
 
 const SCHEMA_VERSION: u32 = 1;
 // Schedules are materialized eagerly; raise this only after their representation becomes lazy.
@@ -119,6 +119,11 @@ impl BenchmarkManifest {
 
     pub fn engines(&self) -> &[Engine] {
         &self.browser.engines
+    }
+
+    /// The GPU API every trial lane must provide, if the benchmark requires one.
+    pub fn gpu(&self) -> Option<GpuApi> {
+        self.browser.gpu
     }
 
     pub fn browser_trial_config(&self) -> BrowserTrialConfig {
@@ -291,6 +296,21 @@ impl BenchmarkManifest {
         let engine_set: HashSet<_> = self.browser.engines.iter().copied().collect();
         if engine_set.len() != self.browser.engines.len() {
             bail!("browser.engines contains a duplicate engine");
+        }
+        if let Some(api) = self.browser.gpu {
+            let unsupported: Vec<_> = self
+                .browser
+                .engines
+                .iter()
+                .filter(|engine| !engine.supports_gpu(api))
+                .map(|engine| engine.as_str())
+                .collect();
+            if !unsupported.is_empty() {
+                bail!(
+                    "browser.gpu {api} is not implemented for {}; scope browser.engines to engines that support it",
+                    unsupported.join(", ")
+                );
+            }
         }
         require_nonempty("browser mode", &self.browser.mode)?;
         require_nonempty("browser locale", &self.browser.locale)?;
@@ -737,6 +757,8 @@ struct ReadySpec {
 #[serde(deny_unknown_fields)]
 struct BrowserSpec {
     engines: Vec<Engine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu: Option<GpuApi>,
     mode: String,
     viewport: ViewportSpec,
     locale: String,
@@ -1108,5 +1130,29 @@ mod tests {
         let error = VariantDescriptor::load_resolved_bytes(&serde_json::to_vec(&resolved).unwrap())
             .unwrap_err();
         assert!(error.to_string().contains("invalid source SHA-256"));
+    }
+
+    #[test]
+    fn gpu_benchmarks_must_scope_engines_to_gpu_capable_adapters() {
+        let error = parse_benchmark(
+            &BENCHMARK.replace("  mode: headless", "  gpu: webgl\n  mode: headless"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not implemented for firefox, webkit")
+        );
+
+        let scoped = BENCHMARK
+            .replace("    - firefox\n    - webkit\n", "")
+            .replace("  mode: headless", "  gpu: webgpu\n  mode: headless");
+        let benchmark = parse_benchmark(&scoped).unwrap();
+        assert_eq!(benchmark.engines(), [Engine::Chromium]);
+        assert_eq!(benchmark.gpu(), Some(GpuApi::Webgpu));
+
+        let plain = parse_benchmark(BENCHMARK).unwrap();
+        assert_eq!(plain.gpu(), None);
+        assert!(!plain.resolved_json().unwrap().contains("\"gpu\""));
     }
 }

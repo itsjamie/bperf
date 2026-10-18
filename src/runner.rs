@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, bail};
-use bperf_browser::lab::{BrowserLab, Engine};
+use bperf_browser::lab::BrowserLab;
 use bperf_decision::environment;
 use bperf_measurement::{
     MEASUREMENT_SCHEMA_VERSION,
@@ -246,7 +246,7 @@ impl MeasurementOutcome {
 
     pub(crate) fn report_engine_results(&self) -> Result<()> {
         let measurement = MeasurementSet::open(&self.measurement_root)?;
-        for engine in Engine::ALL {
+        for &engine in measurement.benchmark().engines() {
             let expected = measurement.expected_final_trials(engine);
             let results = measurement.final_results(engine);
             let successful = results.iter().filter(|result| result.success).count();

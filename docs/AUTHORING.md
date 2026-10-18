@@ -120,6 +120,133 @@ scalars within each engine.
 Shared workers and service workers are not part of the common capture contract.
 Use the advanced protocol when a subject requires either lifecycle.
 
+## Engine scope
+
+A benchmark runs in Chromium, Firefox, and WebKit unless it declares a
+narrower scope:
+
+```ts
+export default defineBrowserBenchmark({
+  id: "tv-renderer",
+  engines: ["chromium"],
+  cases: [/* ... */],
+});
+```
+
+Every engine in scope still produces wall, CPU, flamegraph, and heap evidence.
+Engines outside the scope are never measured, and reports name the scope
+(`engine scope: chromium`) so the result isn't mistaken for a three-engine one.
+The scope is part of the benchmark's identity: changing it starts a new
+baseline.
+
+## GPU benchmarks
+
+Declare the GPU API a benchmark needs with `gpu`:
+
+```ts
+import {
+  defineBrowserBenchmark,
+  exact,
+  readPixelsDigest,
+} from "bperf/browser";
+
+import { createTileRenderer } from "./tile-renderer.ts";
+
+export default defineBrowserBenchmark({
+  id: "webgl-tile-renderer",
+  engines: ["chromium"],
+  gpu: "webgl",
+
+  cases: [
+    {
+      id: "grid-64",
+
+      setup() {
+        const gl = new OffscreenCanvas(256, 256)
+          .getContext("webgl", { antialias: false });
+        if (!gl) throw new Error("WebGL is unavailable");
+        return createTileRenderer(gl, 64);
+      },
+
+      measure(renderer) {
+        renderer.draw();
+        return readPixelsDigest(renderer.gl);
+      },
+
+      expect: exact("b912e7e5f3bbc625"),
+    },
+  ],
+});
+```
+
+`gpu` accepts `"webgl"`, `"webgl2"`, or `"webgpu"`. Only the Chromium adapter
+implements GPU lanes today, so a GPU benchmark must declare
+`engines: ["chromium"]`; any other scope fails before measurement and names the
+scope that would be accepted.
+
+A GPU benchmark runs in a browser launched for hardware acceleration. bperf
+records the adapter it actually rendered with, including the host GPU and
+driver, and whether it is a software rasterizer such as SwiftShader or
+llvmpipe. A software adapter still satisfies the requirement, but it never
+shares an environment fingerprint with a hardware one, so a baseline measured
+on one is not compared with a candidate measured on the other. Each GPU
+measurement also records a fixed GPU anchor workload; GPU clock, thermal, or
+driver drift between a baseline and a fresh run makes the comparison
+inconclusive, just like the JavaScript runtime anchor.
+
+Check a machine before writing a benchmark:
+
+```text
+bperf doctor --engine chromium --gpu webgl
+```
+
+### Measure finished GPU work
+
+GPU calls return before the GPU has done the work. A case whose `measure()`
+returns without reading results back measures command submission, not
+rendering. End `measure()` with a readback, which both waits for the GPU and
+proves the work happened:
+
+- `readPixelsDigest(gl, region?)` reads RGBA pixels from the current WebGL
+  framebuffer and returns a 16-digit digest. Pass a small region when the
+  hashing cost would otherwise dominate a throughput measurement.
+- `readBufferDigest(device, buffer, size?)` copies a WebGPU buffer (created
+  with `GPUBufferUsage.COPY_SRC`) to a staging buffer, maps it, and digests it.
+- `digestBytes(bytes)` digests any bytes you read back yourself.
+
+Create contexts, devices, pipelines, and resources in `setup()` unless their
+creation is the subject. Shader compilation and upload cost belong in
+`measure()` only when that is what the benchmark is about; release what you
+create there, because `measure()` runs many times per trial.
+
+### Keep results exact
+
+`exact()` compares the same value on every adapter, so GPU output must be
+deterministic across hardware and software rasterizers:
+
+- integer compute results are exact;
+- rendering is exact with flat colors, integer channel values,
+  pixel-aligned geometry, and `antialias: false`;
+- blending, filtering, antialiasing, and transcendental shader math are not.
+
+The tile-renderer example produces the same digest on the Intel GPU and on
+SwiftShader.
+
+### Rendering rules
+
+- Render to an `OffscreenCanvas` or a canvas that isn't displayed.
+- Don't pace work with `requestAnimationFrame`. Headless frame scheduling and
+  vsync are not part of the subject.
+- A lost WebGL context or WebGPU device during a trial invalidates that
+  attempt, because later GPU calls on a lost context silently do nothing.
+
+CPU profiles cover JavaScript, including the cost of issuing GPU commands.
+Work in Chromium's separate GPU process and GPU memory are not in the CPU
+profile or heap snapshot.
+
+See [`examples/gpu`](../examples/gpu) for a WebGL renderer and a WebGPU compute
+kernel.
+
 ## Choose the measurement boundary
 
 The most important authoring decision is what belongs in `measure()`.

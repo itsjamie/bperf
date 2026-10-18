@@ -167,8 +167,19 @@ impl App {
             KeyCode::Char('b' | 'B') => self.open_editor(EditorKind::Budget),
             KeyCode::Char('d' | 'D') => self.open_editor(EditorKind::Directory),
             KeyCode::Char('e' | 'E') => {
-                self.notice =
-                    Some("managed runs capture chromium, firefox, and webkit together".to_owned());
+                self.notice = Some(match self.selected_module().map(|module| &module.engines) {
+                    Some(EnginePreview::Declared(engines)) => format!(
+                        "this module declares engines: {}; edit `engines` to change its scope",
+                        engines.join(", ")
+                    ),
+                    Some(EnginePreview::Dynamic) => {
+                        "this module computes `engines`; discovery reports its scope".to_owned()
+                    }
+                    Some(EnginePreview::All) | None => {
+                        "managed runs measure chromium, firefox, and webkit unless the module declares `engines`"
+                            .to_owned()
+                    }
+                });
             }
             _ => {}
         }
@@ -455,6 +466,7 @@ struct BenchmarkModule {
     path: PathBuf,
     relative_path: String,
     id: String,
+    engines: EnginePreview,
     cases: Vec<CasePreview>,
     fixtures: Vec<FixturePreview>,
     file_size: u64,
@@ -498,6 +510,7 @@ impl BenchmarkModule {
             path,
             relative_path,
             id,
+            engines: parsed.engines,
             cases: parsed.cases,
             fixtures,
             metadata_note,
@@ -567,6 +580,7 @@ fn benchmark_paths(root: &Path) -> Result<Vec<PathBuf>> {
 
 struct ParsedBenchmark {
     id: Option<String>,
+    engines: EnginePreview,
     cases: Vec<CasePreview>,
     fixtures: Vec<String>,
     literal_definition: bool,
@@ -599,6 +613,7 @@ fn parse_benchmark_source(source: &str) -> ParsedBenchmark {
     }) else {
         return ParsedBenchmark {
             id: None,
+            engines: EnginePreview::Dynamic,
             cases: Vec::new(),
             fixtures,
             literal_definition: false,
@@ -608,6 +623,7 @@ fn parse_benchmark_source(source: &str) -> ParsedBenchmark {
     let Some(close) = matching_delimiter(&tokens, open, '{', '}') else {
         return ParsedBenchmark {
             id: None,
+            engines: EnginePreview::Dynamic,
             cases: Vec::new(),
             fixtures,
             literal_definition: false,
@@ -617,12 +633,79 @@ fn parse_benchmark_source(source: &str) -> ParsedBenchmark {
     let cases = array_property(&tokens, open + 1, close, "cases")
         .map(|(start, end)| parse_cases(&tokens, start, end))
         .unwrap_or_default();
+    let engines = engine_preview(&tokens, open + 1, close);
     ParsedBenchmark {
         literal_definition: id.is_some(),
         id,
+        engines,
         cases,
         fixtures,
     }
+}
+
+/// The engine scope a module declares, as far as its source shows without
+/// running it. Discovery remains authoritative.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EnginePreview {
+    All,
+    Declared(Vec<String>),
+    Dynamic,
+}
+
+impl EnginePreview {
+    fn label(&self) -> String {
+        match self {
+            Self::All => "chromium firefox webkit".to_owned(),
+            Self::Declared(engines) => engines.join(" "),
+            Self::Dynamic => "set at runtime".to_owned(),
+        }
+    }
+}
+
+fn engine_preview(tokens: &[Token], start: usize, end: usize) -> EnginePreview {
+    if property_value_index(tokens, start, end, "engines").is_none() {
+        return if shorthand_property(tokens, start, end, "engines") {
+            EnginePreview::Dynamic
+        } else {
+            EnginePreview::All
+        };
+    }
+    let Some((open, close)) = array_property(tokens, start, end, "engines") else {
+        return EnginePreview::Dynamic;
+    };
+    let mut engines = Vec::new();
+    for token in &tokens[open..close] {
+        match token {
+            Token::String(engine) => engines.push(engine.clone()),
+            Token::Punct(',') => {}
+            _ => return EnginePreview::Dynamic,
+        }
+    }
+    EnginePreview::Declared(engines)
+}
+
+/// Whether `{ name, ... }` names a top-level shorthand property.
+fn shorthand_property(tokens: &[Token], start: usize, end: usize, name: &str) -> bool {
+    let mut depths = [0_i32; 3];
+    for index in start..end {
+        match tokens[index] {
+            Token::Punct('{') => depths[0] += 1,
+            Token::Punct('}') => depths[0] -= 1,
+            Token::Punct('[') => depths[1] += 1,
+            Token::Punct(']') => depths[1] -= 1,
+            Token::Punct('(') => depths[2] += 1,
+            Token::Punct(')') => depths[2] -= 1,
+            _ => {}
+        }
+        if depths == [0, 0, 0]
+            && token_name(&tokens[index]) == Some(name)
+            && (index == start || tokens[index - 1] == Token::Punct(','))
+            && (index + 1 == end || tokens[index + 1] == Token::Punct(','))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_cases(tokens: &[Token], start: usize, end: usize) -> Vec<CasePreview> {
@@ -926,7 +1009,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::styled("  │  engines  ", Style::default().fg(FAINT)),
         Span::styled(
-            "chromium firefox webkit",
+            app.selected_module().map_or_else(
+                || EnginePreview::All.label(),
+                |module| module.engines.label(),
+            ),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -1394,11 +1480,9 @@ fn median_lines(comparison: &ComparisonSummary, width: usize) -> Vec<Line<'stati
         "wall       cpu       heap",
         width,
     ))];
-    for engine in Engine::ALL {
-        let summary = comparison
-            .engines
-            .iter()
-            .find(|summary| summary.engine == engine);
+    for summary in &comparison.engines {
+        let engine = summary.engine;
+        let summary = Some(summary);
         let wall = summary
             .and_then(|summary| candidate_metric(summary.metrics.get("workload.wall_ms")))
             .map(format_milliseconds)
@@ -1678,14 +1762,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _app: &App) {
 }
 
 fn compact_wall_values(comparison: &ComparisonSummary) -> String {
-    let values = Engine::ALL
-        .into_iter()
-        .map(|engine| {
-            comparison
-                .engines
-                .iter()
-                .find(|summary| summary.engine == engine)
-                .and_then(|summary| summary.metrics.get("workload.wall_ms"))
+    let values = comparison
+        .engines
+        .iter()
+        .map(|summary| {
+            summary
+                .metrics
+                .get("workload.wall_ms")
                 .and_then(|metric| metric.candidate_value)
                 .map(format_number)
                 .unwrap_or_else(|| "n/a".to_owned())
@@ -1951,6 +2034,31 @@ export default defineBrowserBenchmark({
         assert!(parsed.cases[0].exact);
         assert!(parsed.cases[1].setup);
         assert!(parsed.literal_definition);
+        assert_eq!(parsed.engines, EnginePreview::All);
+    }
+
+    #[test]
+    fn static_preview_reads_a_literal_engine_scope_and_flags_computed_ones() {
+        let declared = parse_benchmark_source(
+            r#"export default defineBrowserBenchmark({ id: "gpu", engines: ["chromium"], cases: [] });"#,
+        );
+        assert_eq!(
+            declared.engines,
+            EnginePreview::Declared(vec!["chromium".to_owned()])
+        );
+        assert_eq!(declared.engines.label(), "chromium");
+
+        for source in [
+            r#"defineBrowserBenchmark({ id: "a", engines: SCOPE, cases: [] });"#,
+            r#"defineBrowserBenchmark({ id: "a", engines: [...SCOPE], cases: [] });"#,
+            r#"defineBrowserBenchmark({ id: "a", engines, cases: [] });"#,
+        ] {
+            assert_eq!(
+                parse_benchmark_source(source).engines,
+                EnginePreview::Dynamic,
+                "{source}"
+            );
+        }
     }
 
     #[test]

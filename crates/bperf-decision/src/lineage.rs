@@ -1,7 +1,7 @@
 //! Append-only measured source, confirmation, and baseline-acceptance history.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt::Write as FmtWrite,
     fs,
     io::Write as IoWrite,
@@ -638,9 +638,17 @@ pub fn show(options: ShowOptions) -> Result<()> {
     let promotion_readiness = promotion_readiness(&cycle, &events);
     let reader = store.database.reader()?;
     let evidence_contract = cycle.evidence_contract();
-    let artifacts = store
-        .read_cycle_evidence(&reader, &cycle.cycle_id, &evidence_contract)?
-        .map(|evidence| evidence.artifacts);
+    let evidence = store.read_cycle_evidence(&reader, &cycle.cycle_id, &evidence_contract)?;
+    let artifacts = evidence
+        .as_ref()
+        .map(|evidence| evidence.artifacts.as_slice());
+    let engines = evidence
+        .as_ref()
+        .map(|evidence| evidence.environment.engine_scope());
+    let gpus = evidence
+        .as_ref()
+        .map(|evidence| &evidence.environment.gpus)
+        .filter(|gpus| !gpus.is_empty());
     let diff = options
         .diff
         .then(|| store.render_change(&cycle.change_id))
@@ -658,13 +666,16 @@ pub fn show(options: ShowOptions) -> Result<()> {
                 promotions: &promotions,
                 confirmations: &confirmations,
                 promotion_readiness: &promotion_readiness,
-                artifacts: artifacts.as_deref(),
+                artifacts,
                 change,
                 diff,
             })?
         );
     } else {
-        print!("{}", render_cycle(&cycle));
+        print!("{}", render_cycle(&cycle, engines.as_deref()));
+        for (engine, gpu) in gpus.into_iter().flatten() {
+            println!("  gpu: {engine} {gpu}");
+        }
         println!(
             "  promotion readiness: {}",
             if !cycle.promotable() {
@@ -690,8 +701,8 @@ pub fn show(options: ShowOptions) -> Result<()> {
                 confirmation.outcome
             )?;
         }
-        if let Some(artifacts) = &artifacts {
-            print!("{}", render_artifacts(artifacts));
+        if let (Some(artifacts), Some(engines)) = (artifacts, &engines) {
+            print!("{}", render_artifacts(artifacts, engines));
         }
         if promotions.is_empty()
             && let Some(next) = cycle.next_command(&promotion_readiness)
@@ -1837,6 +1848,16 @@ impl LineageStore {
             "bperf history: {benchmark_id} ({} runs)\n",
             measurements.len()
         );
+        let scopes: BTreeSet<_> = measurements
+            .iter()
+            .map(|item| item.measurement.benchmark().engines().to_vec())
+            .collect();
+        let uniform_scope = scopes.len() == 1;
+        if uniform_scope
+            && let Some(scope) = scopes.first().and_then(|engines| narrowed_scope(engines))
+        {
+            writeln!(output, "engine scope: {scope}")?;
+        }
         for case_id in history_case_ids(&measurements) {
             writeln!(output, "\ncase: {case_id}")?;
             writeln!(output, "  {:<20}  message", "cycle")?;
@@ -1855,9 +1876,16 @@ impl LineageStore {
                 } else {
                     ""
                 };
+                let scope = if uniform_scope {
+                    None
+                } else {
+                    narrowed_scope(item.measurement.benchmark().engines())
+                }
+                .map(|scope| format!(" [{scope}]"))
+                .unwrap_or_default();
                 writeln!(
                     output,
-                    "  {:<20}  {message}{baseline}",
+                    "  {:<20}  {message}{baseline}{scope}",
                     item.cycle.selector()
                 )?;
             }
@@ -1887,6 +1915,15 @@ impl LineageStore {
             )?;
             if let Some(message) = &cycle.message {
                 writeln!(output, "\nHypothesis: {message}")?;
+            }
+            let measurement = open_cycle_measurement(cycle).with_context(|| {
+                format!(
+                    "failed to read measurement for history cycle {}",
+                    cycle.selector()
+                )
+            })?;
+            if let Some(scope) = narrowed_scope(measurement.benchmark().engines()) {
+                writeln!(output, "\nEngine scope: {scope}")?;
             }
             output.push('\n');
             output.push_str(&render_engine_results(cycle));
@@ -2957,8 +2994,11 @@ fn require_measurement_path(label: &str, measurement_set_id: &str, path: &str) -
     Ok(())
 }
 
-fn render_cycle(cycle: &CycleRecord) -> String {
+fn render_cycle(cycle: &CycleRecord, engines: Option<&[Engine]>) -> String {
     let mut output = render_cycle_heading(cycle);
+    if let Some(scope) = engines.and_then(narrowed_scope) {
+        let _ = writeln!(output, "  engine scope: {scope}");
+    }
     let _ = writeln!(
         output,
         "  source: {} -> {}",
@@ -2983,15 +3023,28 @@ fn render_cycle_heading(cycle: &CycleRecord) -> String {
     output
 }
 
-/// Renders retained artifact descriptors grouped by engine. Every engine
-/// appears even when it retained nothing; paths are listed as recorded and
-/// never checked for existence.
-fn render_artifacts(artifacts: &[HistoryArtifact]) -> String {
+/// Names a scope narrower than every engine; the default scope needs no label.
+fn narrowed_scope(engines: &[Engine]) -> Option<String> {
+    (engines != Engine::ALL).then(|| render_engine_list(engines))
+}
+
+fn render_engine_list(engines: &[Engine]) -> String {
+    engines
+        .iter()
+        .map(|engine| engine.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Renders retained artifact descriptors grouped by engine. Every engine in
+/// the measured scope appears even when it retained nothing; paths are listed
+/// as recorded and never checked for existence.
+fn render_artifacts(artifacts: &[HistoryArtifact], engines: &[Engine]) -> String {
     if artifacts.is_empty() {
         return "  artifacts: (none retained)\n".to_owned();
     }
     let mut output = String::from("  artifacts:\n");
-    for engine in Engine::ALL {
+    for &engine in engines {
         let retained = artifacts
             .iter()
             .filter(|artifact| artifact.engine == Some(engine))
@@ -3170,6 +3223,7 @@ mod tests {
             variant_id: "worktree".to_owned(),
             case_ids: vec!["parse".to_owned()],
             environment: EnvironmentSummary {
+                gpus: BTreeMap::new(),
                 recorded_at_unix_ms: 1,
                 fingerprint: cycle.environment_fingerprint.clone(),
                 platform: "windows".to_owned(),
@@ -3287,6 +3341,7 @@ mod tests {
                         verdict: verdict.to_owned(),
                         correctness: "pass".to_owned(),
                         anchor: Some(crate::comparison::AnchorSummary {
+                            gpu: None,
                             status: "stable".to_owned(),
                             drift_pct: Some(0.0),
                             ci_pct: Some([-1.0, 1.0]),
@@ -3449,6 +3504,7 @@ mod tests {
                     variant_id: "worktree".to_owned(),
                     case_ids: vec!["parse".to_owned()],
                     environment: EnvironmentSummary {
+                        gpus: BTreeMap::new(),
                         recorded_at_unix_ms: 1,
                         fingerprint: "environment".to_owned(),
                         platform: "windows".to_owned(),
@@ -3546,6 +3602,7 @@ mod tests {
         let lineage_root = temporary.path().join("lineages");
         let store = LineageStore::open(&lineage_root).unwrap();
         let environment = EnvironmentSummary {
+            gpus: BTreeMap::new(),
             recorded_at_unix_ms: 1,
             fingerprint: "environment".to_owned(),
             platform: "windows".to_owned(),
@@ -4301,6 +4358,31 @@ mod tests {
     }
 
     #[test]
+    fn render_cycle_names_only_a_narrowed_engine_scope() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("parser.ts");
+        fs::write(&source, "export const value = 1;\n").unwrap();
+        let store = LineageStore::open(&temporary.path().join("lineages")).unwrap();
+        let state = store
+            .capture_state(&workspace, std::slice::from_ref(&source))
+            .unwrap();
+        let record = store.append_cycle(cycle(state, "measure-1")).unwrap();
+
+        assert!(
+            !render_cycle(&record, Some(&Engine::ALL)).contains("engine scope"),
+            "the default scope needs no annotation"
+        );
+        assert!(!render_cycle(&record, None).contains("engine scope"));
+        assert!(
+            render_cycle(&record, Some(&[Engine::Chromium]))
+                .lines()
+                .any(|line| line == "  engine scope: chromium")
+        );
+    }
+
+    #[test]
     fn cycle_records_without_benchmark_module_still_load_and_fall_back() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -4770,6 +4852,7 @@ mod tests {
                     variant_id: "worktree".to_owned(),
                     case_ids: vec!["parse".to_owned()],
                     environment: EnvironmentSummary {
+                        gpus: BTreeMap::new(),
                         recorded_at_unix_ms: 1,
                         fingerprint: "environment".to_owned(),
                         platform: "windows".to_owned(),
@@ -4804,7 +4887,10 @@ mod tests {
 
     #[test]
     fn artifact_listing_groups_three_engines_without_pooling() {
-        assert_eq!(render_artifacts(&[]), "  artifacts: (none retained)\n");
+        assert_eq!(
+            render_artifacts(&[], &Engine::ALL),
+            "  artifacts: (none retained)\n"
+        );
 
         let artifacts = vec![
             HistoryArtifact {
@@ -4820,7 +4906,7 @@ mod tests {
                 path: PathBuf::from("/evidence/webkit-heap.json"),
             },
         ];
-        let listing = render_artifacts(&artifacts);
+        let listing = render_artifacts(&artifacts, &Engine::ALL);
         let lines = listing.lines().collect::<Vec<_>>();
         assert_eq!(
             lines,
@@ -4831,6 +4917,25 @@ mod tests {
                 "    firefox: (none)",
                 "    webkit:",
                 "      heap_snapshot: /evidence/webkit-heap.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_listing_omits_engines_outside_the_measured_scope() {
+        let artifacts = vec![HistoryArtifact {
+            kind: HistoryArtifactKind::CpuProfile,
+            engine: Some(Engine::Chromium),
+            capture_scope: Some("page".to_owned()),
+            path: PathBuf::from("/evidence/chromium-cpu.json"),
+        }];
+        let listing = render_artifacts(&artifacts, &[Engine::Chromium]);
+        assert_eq!(
+            listing.lines().collect::<Vec<_>>(),
+            [
+                "  artifacts:",
+                "    chromium:",
+                "      cpu_profile page: /evidence/chromium-cpu.json",
             ]
         );
     }

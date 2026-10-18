@@ -136,11 +136,7 @@ impl ComparisonOutcome {
                     engine: engine.engine,
                     verdict: engine.verdict.as_str().to_owned(),
                     correctness: engine.correctness.gate.as_str().to_owned(),
-                    anchor: Some(AnchorSummary {
-                        status: engine.anchor.status.as_str().to_owned(),
-                        drift_pct: engine.anchor.drift_pct,
-                        ci_pct: engine.anchor.ci_pct,
-                    }),
+                    anchor: Some(AnchorSummary::from_analysis(&engine.anchor)),
                     metrics: engine
                         .effects
                         .iter()
@@ -240,15 +236,10 @@ impl ComparisonSummary {
     pub(crate) fn render_decision_summary(&self) -> String {
         let mut output = String::new();
         for engine in &self.engines {
-            let anchor = engine.anchor.as_ref().map_or_else(
-                || "unreported".to_owned(),
-                |anchor| {
-                    anchor.drift_pct.map_or_else(
-                        || anchor.status.clone(),
-                        |drift| format!("{} ({drift:+.2}%)", anchor.status),
-                    )
-                },
-            );
+            let anchor = engine
+                .anchor
+                .as_ref()
+                .map_or_else(|| "unreported".to_owned(), AnchorSummary::render);
             let _ = writeln!(
                 output,
                 "  {}: {} correctness={} anchor={anchor}",
@@ -313,10 +304,7 @@ impl EngineSummary {
             return Ok("negative");
         }
         if self.correctness == "inconclusive"
-            || self
-                .anchor
-                .as_ref()
-                .is_none_or(|anchor| anchor.status != "stable")
+            || self.anchor.as_ref().is_none_or(|anchor| !anchor.stable())
         {
             return Ok("inconclusive");
         }
@@ -380,9 +368,41 @@ pub struct AnchorSummary {
     pub status: String,
     pub drift_pct: Option<f64>,
     pub ci_pct: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<Box<AnchorSummary>>,
 }
 
 impl AnchorSummary {
+    fn from_analysis(analysis: &AnchorAnalysis) -> Self {
+        Self {
+            status: analysis.status.as_str().to_owned(),
+            drift_pct: analysis.drift_pct,
+            ci_pct: analysis.ci_pct,
+            gpu: analysis
+                .gpu
+                .as_deref()
+                .map(|gpu| Box::new(Self::from_analysis(gpu))),
+        }
+    }
+
+    /// Whether every recorded anchor, runtime and GPU, is stable.
+    pub fn stable(&self) -> bool {
+        self.status == "stable" && self.gpu.as_ref().is_none_or(|gpu| gpu.stable())
+    }
+
+    fn render(&self) -> String {
+        let status = |anchor: &Self| {
+            anchor.drift_pct.map_or_else(
+                || anchor.status.clone(),
+                |drift| format!("{} ({drift:+.2}%)", anchor.status),
+            )
+        };
+        match &self.gpu {
+            Some(gpu) => format!("{} gpu-anchor={}", status(self), status(gpu)),
+            None => status(self),
+        }
+    }
+
     fn validate(&self, engine: Engine) -> Result<()> {
         if !matches!(
             self.status.as_str(),
@@ -414,6 +434,12 @@ impl AnchorSummary {
                 "{engine} runtime-anchor status {:?} contradicts its confidence interval ({derived:?})",
                 self.status
             );
+        }
+        if let Some(gpu) = &self.gpu {
+            if gpu.gpu.is_some() {
+                bail!("{engine} GPU anchor cannot carry another GPU anchor");
+            }
+            gpu.validate(engine)?;
         }
         Ok(())
     }
@@ -617,6 +643,17 @@ fn compare(
                 anchor.status.as_str()
             ));
         }
+        if let Some(gpu) = anchor
+            .gpu
+            .as_ref()
+            .filter(|gpu| gpu.status != AnchorStatus::Stable)
+        {
+            warnings.push(format!(
+                "{} GPU anchor is {}; historical performance comparison is inconclusive",
+                anchor.engine,
+                gpu.status.as_str()
+            ));
+        }
     }
     if stability.baseline_age_ms > BASELINE_AGE_WARNING_MS {
         warnings.push(format!(
@@ -700,23 +737,38 @@ fn stability_analysis(
     let analyses: Vec<_> = engines
         .iter()
         .map(|engine| {
-            Ok(analyze_anchor(
+            let mut analysis = analyze_anchor(
                 *engine,
                 environments.baseline.anchor(*engine)?,
                 environments.candidate.anchor(*engine)?,
                 confidence,
                 derived_seed(seed, &format!("{engine}:runtime-anchor")),
-            ))
+            );
+            analysis.gpu = match (
+                environments.baseline.gpu_anchor(*engine),
+                environments.candidate.gpu_anchor(*engine),
+            ) {
+                (Some(baseline), Some(candidate)) => Some(Box::new(analyze_anchor(
+                    *engine,
+                    baseline,
+                    candidate,
+                    confidence,
+                    derived_seed(seed, &format!("{engine}:gpu-anchor")),
+                ))),
+                (None, None) => None,
+                _ => bail!("{engine} GPU anchor evidence is missing from one measurement set"),
+            };
+            Ok(analysis)
         })
         .collect::<Result<_>>()?;
     let status = if analyses
         .iter()
-        .all(|analysis| analysis.status == AnchorStatus::Stable)
+        .all(|analysis| analysis.combined_status() == AnchorStatus::Stable)
     {
         AnchorStatus::Stable
     } else if analyses
         .iter()
-        .any(|analysis| analysis.status == AnchorStatus::Drifted)
+        .any(|analysis| analysis.combined_status() == AnchorStatus::Drifted)
     {
         AnchorStatus::Drifted
     } else {
@@ -772,6 +824,7 @@ fn analyze_anchor(
         candidate_median_ms: Some(candidate_median_ms),
         drift_pct: Some(drift_pct),
         ci_pct: Some(ci_pct),
+        gpu: None,
     }
 }
 
@@ -813,7 +866,7 @@ fn analyze_engine(
     let metric_verdict = engine_verdict(complete, correctness.gate, effects.values());
     let verdict = if correctness.gate == Gate::Fail {
         Verdict::Negative
-    } else if anchor.status != AnchorStatus::Stable {
+    } else if anchor.combined_status() != AnchorStatus::Stable {
         Verdict::Inconclusive
     } else {
         metric_verdict
@@ -1291,9 +1344,36 @@ struct AnchorAnalysis {
     candidate_median_ms: Option<f64>,
     drift_pct: Option<f64>,
     ci_pct: Option<[f64; 2]>,
+    /// The GPU anchor of a GPU benchmark, judged by the same drift rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu: Option<Box<AnchorAnalysis>>,
 }
 
 impl AnchorAnalysis {
+    /// Stable only when every anchor the environment recorded is stable.
+    fn combined_status(&self) -> AnchorStatus {
+        let statuses = [Some(self.status), self.gpu.as_ref().map(|gpu| gpu.status)];
+        let statuses = statuses.into_iter().flatten();
+        if statuses
+            .clone()
+            .all(|status| status == AnchorStatus::Stable)
+        {
+            AnchorStatus::Stable
+        } else if statuses
+            .clone()
+            .any(|status| status == AnchorStatus::Drifted)
+        {
+            AnchorStatus::Drifted
+        } else if statuses
+            .clone()
+            .any(|status| status == AnchorStatus::Inconclusive)
+        {
+            AnchorStatus::Inconclusive
+        } else {
+            AnchorStatus::Unproven
+        }
+    }
+
     fn unproven(engine: Engine) -> Self {
         Self {
             engine,
@@ -1304,6 +1384,7 @@ impl AnchorAnalysis {
             candidate_median_ms: None,
             drift_pct: None,
             ci_pct: None,
+            gpu: None,
         }
     }
 }
@@ -1743,6 +1824,7 @@ mod tests {
                 verdict: "negative".to_owned(),
                 correctness: "pass".to_owned(),
                 anchor: Some(AnchorSummary {
+                    gpu: None,
                     status: "stable".to_owned(),
                     drift_pct: Some(0.25),
                     ci_pct: Some([-0.5, 1.0]),
@@ -1789,6 +1871,7 @@ mod tests {
                     verdict: "equivalent".to_owned(),
                     correctness: "pass".to_owned(),
                     anchor: Some(AnchorSummary {
+                        gpu: None,
                         status: "stable".to_owned(),
                         drift_pct: Some(0.0),
                         ci_pct: Some([-1.0, 1.0]),
@@ -1880,6 +1963,7 @@ mod tests {
         );
 
         let mut anchor = AnchorSummary {
+            gpu: None,
             status: "stable".to_owned(),
             drift_pct: Some(0.5),
             ci_pct: Some([-1.0, 2.0]),
@@ -1902,5 +1986,38 @@ mod tests {
                 .to_string()
                 .contains("incomplete runtime-anchor evidence")
         );
+    }
+
+    #[test]
+    fn a_drifted_gpu_anchor_makes_an_otherwise_stable_engine_inconclusive() {
+        let stable = |drift: f64, ci: [f64; 2]| AnchorSummary {
+            status: if ci[0] >= -ANCHOR_MAX_DRIFT_PCT && ci[1] <= ANCHOR_MAX_DRIFT_PCT {
+                "stable"
+            } else if ci[0] > ANCHOR_MAX_DRIFT_PCT || ci[1] < -ANCHOR_MAX_DRIFT_PCT {
+                "drifted"
+            } else {
+                "inconclusive"
+            }
+            .to_owned(),
+            drift_pct: Some(drift),
+            ci_pct: Some(ci),
+            gpu: None,
+        };
+        let mut anchor = stable(0.1, [-1.0, 1.0]);
+        anchor.gpu = Some(Box::new(stable(-2.0, [-3.0, -1.0])));
+        anchor.validate(Engine::Chromium).unwrap();
+        assert!(anchor.stable());
+        assert_eq!(
+            anchor.render(),
+            "stable (+0.10%) gpu-anchor=stable (-2.00%)"
+        );
+
+        anchor.gpu = Some(Box::new(stable(9.0, [7.0, 11.0])));
+        anchor.validate(Engine::Chromium).unwrap();
+        assert!(!anchor.stable());
+
+        let mut nested = stable(0.1, [-1.0, 1.0]);
+        nested.gpu = Some(Box::new(anchor.clone()));
+        assert!(nested.validate(Engine::Chromium).is_err());
     }
 }

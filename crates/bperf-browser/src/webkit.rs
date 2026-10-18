@@ -32,8 +32,8 @@ use crate::{
     },
     lab::{
         AdapterEvidence, AdapterTrialRequest, ArtifactEvidence, BenchmarkInspection,
-        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, ProbeCapture,
-        TrialCapture,
+        BrowserEvidence, BrowserTrialConfig, Engine, EngineAdapter, EngineLane, GpuApi,
+        ProbeCapture, TrialCapture,
     },
 };
 
@@ -191,7 +191,10 @@ impl EngineAdapter for WebKitAdapter {
         })
     }
 
-    fn launch(&self) -> Result<Self::Lane> {
+    fn launch(&self, gpu: Option<GpuApi>) -> Result<Self::Lane> {
+        if let Some(api) = gpu {
+            bail!("the WebKit adapter does not implement {api} lanes");
+        }
         WebKitLane::launch(self)
     }
 }
@@ -408,6 +411,7 @@ impl WebKitLane {
                 browser: self.browser.clone(),
                 anchor,
                 artifacts,
+                gpu: None,
             })
         })();
         combine_page_close(result, self.connection.close_page(page))

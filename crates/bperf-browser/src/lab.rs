@@ -23,6 +23,7 @@ pub const PROTOCOL_VERSION: u32 = 13;
 const RUNTIME_ANCHOR_WORKLOAD: &str = "javascript_cpu_v1";
 const RUNTIME_ANCHOR_SAMPLES: usize = 31;
 const RUNTIME_ANCHOR_MAX_BATCH_SIZE: u32 = 64;
+const GPU_ANCHOR_SAMPLES: usize = 31;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +45,49 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Whether this engine's adapter implements GPU lanes for `api`. A
+    /// benchmark that requires `api` may only be scoped to engines that do.
+    pub const fn supports_gpu(self, _api: GpuApi) -> bool {
+        matches!(self, Self::Chromium)
+    }
+}
+
+/// A GPU API a benchmark requires. Lanes launched for it enable hardware
+/// acceleration and that API; a software adapter still satisfies it and is
+/// reported in `GpuEvidence`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuApi {
+    Webgl,
+    Webgl2,
+    Webgpu,
+}
+
+impl GpuApi {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Webgl => "webgl",
+            Self::Webgl2 => "webgl2",
+            Self::Webgpu => "webgpu",
+        }
+    }
+
+    const fn anchor_workload(self) -> &'static str {
+        match self {
+            Self::Webgl => "webgl_fill_v1",
+            Self::Webgl2 => "webgl2_fill_v1",
+            Self::Webgpu => "webgpu_compute_v1",
+        }
+    }
+}
+
+impl fmt::Display for GpuApi {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl fmt::Display for Engine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -58,6 +102,7 @@ pub struct BrowserLab {
     chromium: RetainedAdapter<ChromiumAdapter>,
     firefox: RetainedAdapter<FirefoxAdapter>,
     webkit: RetainedAdapter<WebKitAdapter>,
+    gpu: Option<GpuApi>,
 }
 
 impl BrowserLab {
@@ -66,7 +111,22 @@ impl BrowserLab {
             chromium: RetainedAdapter::new(installation.clone()),
             firefox: RetainedAdapter::new(installation.clone()),
             webkit: RetainedAdapter::new(installation),
+            gpu: None,
         })
+    }
+
+    /// Selects the GPU API that every lane used from now on must provide.
+    /// Launch flags cannot change on a running browser, so lanes launched
+    /// under another configuration are closed first.
+    pub fn configure_gpu(&mut self, gpu: Option<GpuApi>) -> Result<()> {
+        if self.gpu == gpu {
+            return Ok(());
+        }
+        for engine in Engine::ALL {
+            self.adapter(engine).configure_gpu(gpu)?;
+        }
+        self.gpu = gpu;
+        Ok(())
     }
 
     /// Runs one operation with a managed browser session and always attempts to
@@ -89,11 +149,17 @@ impl BrowserLab {
         let engine_root = fs::canonicalize(&engine_root)
             .with_context(|| format!("failed to resolve {}", engine_root.display()))?;
 
+        if let Some(api) = self.gpu
+            && !engine.supports_gpu(api)
+        {
+            bail!("{engine} does not implement {api} lanes");
+        }
         let evidence = self
             .adapter(engine)
             .probe(&engine_root)?
             .into_evidence(engine);
         validate_evidence(engine, &engine_root, &evidence)?;
+        validate_gpu(engine, self.gpu, evidence.gpu.as_ref())?;
         Ok(evidence)
     }
 
@@ -123,6 +189,23 @@ impl BrowserLab {
         let evidence = timed_capture.into_evidence();
         validate_trial_evidence(engine, &artifact_root, operations.len(), batches, &evidence)?;
         Ok(evidence)
+    }
+
+    /// Returns the first engine, in canonical order, whose pinned installation
+    /// is usable. Launching no browser, it lets callers read an engine-neutral
+    /// benchmark description before they know which engines it selects.
+    pub fn first_installed_engine(&mut self) -> Result<Engine> {
+        let mut failures = Vec::new();
+        for engine in Engine::ALL {
+            match self.adapter(engine).installation() {
+                Ok(()) => return Ok(engine),
+                Err(error) => failures.push(format!("{engine}: {error:#}")),
+            }
+        }
+        bail!(
+            "no pinned browser is installed; run `bperf browsers install` ({})",
+            failures.join("; ")
+        )
     }
 
     pub fn inspect_benchmark(
@@ -180,6 +263,8 @@ fn combine_operation_and_shutdown<Value>(
 }
 
 trait BrowserAdapter {
+    fn installation(&mut self) -> Result<()>;
+    fn configure_gpu(&mut self, gpu: Option<GpuApi>) -> Result<()>;
     fn probe(&mut self, artifact_directory: &Path) -> Result<ProbeCapture>;
     fn measure_trial(&mut self, request: AdapterTrialRequest<'_>) -> Result<TimedTrialCapture>;
     fn inspect_benchmark(
@@ -194,7 +279,7 @@ pub(crate) trait EngineAdapter: Sized {
     type Lane: EngineLane;
 
     fn discover(installation: &BrowserInstallation) -> Result<Self>;
-    fn launch(&self) -> Result<Self::Lane>;
+    fn launch(&self, gpu: Option<GpuApi>) -> Result<Self::Lane>;
 }
 
 /// One retained browser process. Each capture creates and closes isolated page state.
@@ -214,6 +299,7 @@ struct RetainedAdapter<A: EngineAdapter> {
     installation: BrowserInstallation,
     adapter: Option<A>,
     lane: Option<A::Lane>,
+    gpu: Option<GpuApi>,
 }
 
 impl<A: EngineAdapter> RetainedAdapter<A> {
@@ -222,6 +308,7 @@ impl<A: EngineAdapter> RetainedAdapter<A> {
             installation,
             adapter: None,
             lane: None,
+            gpu: None,
         }
     }
 
@@ -237,7 +324,8 @@ impl<A: EngineAdapter> RetainedAdapter<A> {
 
     fn lane(&mut self) -> Result<&mut A::Lane> {
         if self.lane.is_none() {
-            let lane = self.adapter()?.launch()?;
+            let gpu = self.gpu;
+            let lane = self.adapter()?.launch(gpu)?;
             self.lane = Some(lane);
         }
         Ok(self.lane.as_mut().expect("browser lane was initialized"))
@@ -270,6 +358,18 @@ impl<A: EngineAdapter> RetainedAdapter<A> {
 }
 
 impl<A: EngineAdapter> BrowserAdapter for RetainedAdapter<A> {
+    fn installation(&mut self) -> Result<()> {
+        self.adapter().map(|_| ())
+    }
+
+    fn configure_gpu(&mut self, gpu: Option<GpuApi>) -> Result<()> {
+        if self.gpu != gpu {
+            self.finish()?;
+            self.gpu = gpu;
+        }
+        Ok(())
+    }
+
     fn probe(&mut self, artifact_directory: &Path) -> Result<ProbeCapture> {
         self.with_lane(|lane| lane.probe(artifact_directory))
     }
@@ -473,6 +573,55 @@ pub struct CaptureEvidence {
     pub anchor: RuntimeAnchorEvidence,
     pub capabilities: CaptureCapabilities,
     pub artifacts: Vec<ArtifactEvidence>,
+    /// Present exactly when the lane was configured for a GPU API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuEvidence>,
+}
+
+/// The GPU a lane actually rendered with, and a fixed GPU workload observed
+/// on it. Engines may report coarse adapter strings; `devices` carries the
+/// host GPU and driver when the engine exposes them.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuEvidence {
+    pub api: GpuApi,
+    pub vendor: String,
+    pub renderer: String,
+    pub software: bool,
+    pub devices: Vec<String>,
+    pub anchor: GpuAnchorEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuAnchorEvidence {
+    pub workload: String,
+    pub wall_ms: Vec<f64>,
+    pub batch_size: u32,
+    pub checksum: u32,
+}
+
+impl GpuEvidence {
+    pub fn validate(&self, api: GpuApi) -> Result<()> {
+        if self.api != api {
+            bail!("GPU evidence describes {}, expected {api}", self.api);
+        }
+        if self.vendor.trim().is_empty() || self.renderer.trim().is_empty() {
+            bail!("{api} adapter identity is incomplete");
+        }
+        let anchor = &self.anchor;
+        if anchor.workload != api.anchor_workload()
+            || anchor.wall_ms.len() != GPU_ANCHOR_SAMPLES
+            || anchor.batch_size == 0
+            || anchor
+                .wall_ms
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            bail!("{api} GPU anchor evidence is incomplete or uses another workload");
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ProbeCapture {
@@ -480,6 +629,7 @@ pub(crate) struct ProbeCapture {
     pub(crate) browser: BrowserEvidence,
     pub(crate) anchor: RuntimeAnchorEvidence,
     pub(crate) artifacts: Vec<ArtifactEvidence>,
+    pub(crate) gpu: Option<GpuEvidence>,
 }
 
 impl ProbeCapture {
@@ -491,6 +641,7 @@ impl ProbeCapture {
             anchor: self.anchor,
             capabilities: CaptureCapabilities::required(),
             artifacts: self.artifacts,
+            gpu: self.gpu,
         }
     }
 }
@@ -674,6 +825,20 @@ fn validate_evidence(
     validate_artifacts(expected_engine, root, &evidence.artifacts)
 }
 
+fn validate_gpu(engine: Engine, api: Option<GpuApi>, gpu: Option<&GpuEvidence>) -> Result<()> {
+    match (api, gpu) {
+        (None, None) => Ok(()),
+        (Some(api), Some(gpu)) => gpu
+            .validate(api)
+            .with_context(|| format!("{engine} returned invalid {api} evidence")),
+        (Some(api), None) => bail!("{engine} returned no {api} evidence from a GPU lane"),
+        (None, Some(gpu)) => bail!(
+            "{engine} returned {} evidence from a lane without a GPU",
+            gpu.api
+        ),
+    }
+}
+
 fn validate_anchor(engine: Engine, anchor: &RuntimeAnchorEvidence) -> Result<()> {
     anchor
         .validate()
@@ -792,7 +957,7 @@ mod tests {
             Ok(Self)
         }
 
-        fn launch(&self) -> Result<Self::Lane> {
+        fn launch(&self, _gpu: Option<GpuApi>) -> Result<Self::Lane> {
             Ok(FakeLane {
                 id: LAUNCHES.fetch_add(1, Ordering::SeqCst) + 1,
             })
@@ -873,6 +1038,7 @@ mod tests {
             });
         }
         CaptureEvidence {
+            gpu: None,
             engine,
             adapter: match engine {
                 Engine::Chromium => AdapterEvidence::Chromium {
@@ -1103,5 +1269,58 @@ mod tests {
         let evidence = valid_evidence(directory.path(), Engine::Chromium);
         let error = validate_evidence(Engine::Firefox, directory.path(), &evidence).unwrap_err();
         assert!(error.to_string().contains("while firefox was requested"));
+    }
+
+    fn gpu_evidence(api: GpuApi) -> GpuEvidence {
+        GpuEvidence {
+            api,
+            vendor: "Intel".to_owned(),
+            renderer: "ANGLE (Intel)".to_owned(),
+            software: false,
+            devices: Vec::new(),
+            anchor: GpuAnchorEvidence {
+                workload: api.anchor_workload().to_owned(),
+                wall_ms: vec![0.1; GPU_ANCHOR_SAMPLES],
+                batch_size: 64,
+                checksum: 7,
+            },
+        }
+    }
+
+    #[test]
+    fn gpu_lanes_are_limited_to_engines_that_implement_them() {
+        for api in [GpuApi::Webgl, GpuApi::Webgl2, GpuApi::Webgpu] {
+            assert!(Engine::Chromium.supports_gpu(api));
+            assert!(!Engine::Firefox.supports_gpu(api));
+            assert!(!Engine::Webkit.supports_gpu(api));
+        }
+    }
+
+    #[test]
+    fn gpu_evidence_must_match_the_configured_api_and_anchor_contract() {
+        gpu_evidence(GpuApi::Webgl).validate(GpuApi::Webgl).unwrap();
+        assert!(
+            gpu_evidence(GpuApi::Webgl)
+                .validate(GpuApi::Webgpu)
+                .is_err()
+        );
+
+        let mut short = gpu_evidence(GpuApi::Webgpu);
+        short.anchor.wall_ms.pop();
+        assert!(short.validate(GpuApi::Webgpu).is_err());
+
+        let mut renamed = gpu_evidence(GpuApi::Webgl2);
+        renamed.anchor.workload = "webgl_fill_v1".to_owned();
+        assert!(renamed.validate(GpuApi::Webgl2).is_err());
+
+        let mut anonymous = gpu_evidence(GpuApi::Webgl);
+        anonymous.renderer = " ".to_owned();
+        assert!(anonymous.validate(GpuApi::Webgl).is_err());
+
+        let evidence = gpu_evidence(GpuApi::Webgl);
+        validate_gpu(Engine::Chromium, None, None).unwrap();
+        validate_gpu(Engine::Chromium, Some(GpuApi::Webgl), Some(&evidence)).unwrap();
+        assert!(validate_gpu(Engine::Chromium, Some(GpuApi::Webgl), None).is_err());
+        assert!(validate_gpu(Engine::Chromium, None, Some(&evidence)).is_err());
     }
 }
