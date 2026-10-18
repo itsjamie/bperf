@@ -516,6 +516,15 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
     // through, such as a macOS framework's `Versions/Current`. Targets are
     // contained once everything exists; until then, every extracted path is
     // checked against the canonical root before it is written.
+    #[cfg(unix)]
+    contain_archive_symlinks(destination, symlinks)?;
+    #[cfg(not(unix))]
+    debug_assert!(symlinks.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn contain_archive_symlinks(destination: &Path, symlinks: Vec<PathBuf>) -> Result<()> {
     let canonical_root = fs::canonicalize(destination)?;
     for symlink in symlinks {
         let parent = symlink
