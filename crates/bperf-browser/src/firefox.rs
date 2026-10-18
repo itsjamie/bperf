@@ -577,11 +577,14 @@ impl<Transport: JugglerTransport> JugglerConnection<Transport> {
             if id == 0 || id >= self.next_id {
                 bail!("Firefox Juggler returned unissued response id {id}");
             }
+            // Juggler serializes `{id, sessionId, result}`, so a method with no
+            // return value produces a success response without `result`.
             let result = match (message.get("result"), message.get("error")) {
                 (Some(result), None) => Ok(result.clone()),
+                (None, None) => Ok(json!({})),
                 (None, Some(error)) => Err(protocol_error(error)),
-                _ => bail!(
-                    "Firefox Juggler response id {id} must contain exactly one result or error"
+                (Some(_), Some(_)) => bail!(
+                    "Firefox Juggler response id {id} must not contain both a result and an error"
                 ),
             };
             if self.ignored_responses.remove(&id) {
@@ -1587,12 +1590,13 @@ mod tests {
         assert_eq!(connection.responses[&1].as_ref().unwrap()["value"], "first");
 
         connection.next_id = 4;
-        for malformed in [
-            json!({"id": 2}),
-            json!({"id": 3, "result": {}, "error": {}}),
-        ] {
-            assert!(connection.dispatch(malformed).is_err());
-        }
+        assert!(connection.dispatch(json!({"id": 2})).is_ok());
+        assert_eq!(connection.responses[&2].as_ref().unwrap(), &json!({}));
+        assert!(
+            connection
+                .dispatch(json!({"id": 3, "result": {}, "error": {}}))
+                .is_err()
+        );
     }
 
     #[test]
