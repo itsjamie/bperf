@@ -1357,17 +1357,52 @@ struct ChromiumProfile {
 }
 
 fn parse_cpu_profile(value: &Value) -> Result<ChromiumProfile> {
-    let profile: ChromiumProfile =
+    let mut profile: ChromiumProfile =
         serde_json::from_value(value.clone()).context("Chromium emitted an invalid CPU profile")?;
-    if profile.nodes.is_empty()
-        || profile.samples.is_empty()
-        || profile.samples.len() != profile.time_deltas.len()
-        || profile.time_deltas.iter().any(|delta| *delta < 0)
-    {
-        bail!("Chromium emitted an invalid CPU profile");
+    if profile.nodes.is_empty() {
+        bail!("Chromium emitted an invalid CPU profile: it has no nodes");
     }
+    if profile.samples.is_empty() {
+        bail!("Chromium emitted an invalid CPU profile: it has no samples");
+    }
+    if profile.samples.len() != profile.time_deltas.len() {
+        bail!(
+            "Chromium emitted an invalid CPU profile: {} samples but {} time deltas",
+            profile.samples.len(),
+            profile.time_deltas.len()
+        );
+    }
+    order_samples_by_time(&mut profile)?;
     validate_profile_graph(&profile)?;
     Ok(profile)
+}
+
+/// V8 occasionally records a sample a microsecond before its predecessor,
+/// which appears as a negative time delta. Like DevTools, restore timestamp
+/// order so every delta again measures the time since the previous sample;
+/// total sampled time is unchanged.
+fn order_samples_by_time(profile: &mut ChromiumProfile) -> Result<()> {
+    if profile.time_deltas.iter().all(|delta| *delta >= 0) {
+        return Ok(());
+    }
+    let mut elapsed = 0_i64;
+    let mut timed = Vec::with_capacity(profile.samples.len());
+    for (sample, delta) in profile.samples.iter().zip(&profile.time_deltas) {
+        elapsed = elapsed
+            .checked_add(*delta)
+            .context("Chromium CPU sample timestamps overflowed")?;
+        timed.push((elapsed, *sample));
+    }
+    timed.sort_by_key(|(timestamp, _)| *timestamp);
+    let mut previous = 0_i64;
+    profile.samples.clear();
+    profile.time_deltas.clear();
+    for (timestamp, sample) in timed {
+        profile.samples.push(sample);
+        profile.time_deltas.push((timestamp - previous).max(0));
+        previous = previous.max(timestamp);
+    }
+    Ok(())
 }
 
 fn validate_profile_graph(profile: &ChromiumProfile) -> Result<()> {
@@ -1725,6 +1760,22 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_samples_are_restored_to_timestamp_order() {
+        let parsed = parse_cpu_profile(&json!({
+            "nodes": [
+                {"id": 1, "callFrame": {"lineNumber": 0, "columnNumber": 0}, "children": [2]},
+                {"id": 2, "callFrame": {"lineNumber": 0, "columnNumber": 0}}
+            ],
+            "samples": [1, 2, 1],
+            "timeDeltas": [10, 5, -2]
+        }))
+        .unwrap();
+        assert_eq!(parsed.samples, [1, 1, 2]);
+        assert_eq!(parsed.time_deltas, [10, 3, 2]);
+        assert_eq!(parsed.time_deltas.iter().sum::<i64>(), 15);
+    }
+
+    #[test]
     fn malformed_chromium_captures_fail_explicitly() {
         assert!(parse_cpu_profile(&json!({})).is_err());
         assert!(
@@ -1746,7 +1797,7 @@ mod tests {
                     "callFrame": {"lineNumber": 0, "columnNumber": 0}
                 }],
                 "samples": [1],
-                "timeDeltas": [-1]
+                "timeDeltas": [1, 2]
             }))
             .is_err()
         );
