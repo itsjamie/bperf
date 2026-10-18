@@ -49,7 +49,7 @@ fn complete_measurement(root: &Path, value: f64, environment: &str) {
     let identity_source = format!(
         concat!(
             "{{",
-            "\"bperf_version\":\"0.1.1\",",
+            "\"bperf_version\":\"0.2.0\",",
             "\"browser_lab_protocol_version\":13,",
             "\"host\":{{",
             "\"platform\":\"windows\",",
